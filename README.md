@@ -145,7 +145,16 @@ cmake --build build-qwen --target knivesysl-forward-qwen -j
 requires an sm120 blackwell part (rtx 5090 / rtx pro 6000), cuda 12.8+, and python 3.10+
 with `torch`, `transformers`, `numpy`, `safetensors` for the converter.
 
-## convert
+## get the weights
+
+either pull our conversion:
+
+```bash
+huggingface-cli download srswti/axe-strada-knivesysl-27b --local-dir ./model
+# 22.6 gb .tqf + tokenizer + chat template; --model-dir points at this same dir
+```
+
+or convert an hf checkpoint yourself:
 
 ```bash
 TQ_EMIT_MTP=1 TQ_GPU_PACK=1 python3 tools/convert_qwen_tqf.py /path/to/qwen3.8-27b \
