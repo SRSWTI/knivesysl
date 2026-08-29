@@ -174,9 +174,48 @@ the paged path is instead: the per-projection numeric gate above (1.11e-07 on re
 weights, same GEMM the paged loop calls), the full-forward argmax agreement below, and
 clean 20-step runs at N=1/8/32. No paged-specific code was touched by this work.
 
-**Not re-run: the vLLM head-to-head.** vLLM cannot be resident on 32 GB alongside this
-engine and is currently down. The CUTLASS comparison above is a kernel-level number
-against the library vLLM's NVFP4 path is built on, not against vLLM serving.
+#### vLLM head-to-head, run
+
+vLLM 0.27.1 serving `unsloth/Qwen3.8-27B-NVFP4` vs this engine at `TQ_W_NVFP4=all`,
+**driven by the same HTTP client** (`/tmp/gembench/vll.py`), prefix caching ON in both.
+TTFT with `max_tokens=1` is the prefill number; decode is N concurrent streams measured
+after the last TTFT. Two prompt regimes, because they answer different questions and
+conflating them is how engines get mis-marketed: `unique` = a distinct random 4096-token
+window per request so nothing can be reused (raw kernel speed); `shared` = one prompt
+reused (multi-turn / system-prompt / retry traffic, i.e. most real load).
+
+|  | unique: vLLM | ksl | | shared: vLLM | ksl | |
+|---|--:|--:|--:|--:|--:|--:|
+| prefill cold tok/s | 7985 | 2678 | 0.34x | 8557 | 2679 | 0.31x |
+| prefill warm tok/s | 9206 | 2788 | 0.30x | 35324 | **176590** | **5.00x** |
+| decode N=1 tok/s | 29.2 | **63.3** | **2.17x** | 29.1 | **63.2** | **2.17x** |
+| decode N=8 tok/s | 171 | 151 | 0.89x | 220 | **447** | **2.03x** |
+| decode N=32 tok/s | 309 | 179 | 0.58x | 409 | **1079** | **2.64x** |
+
+**We win decode and cached prefill; we lose cold prefill by ~3x.** On shared-prefix
+traffic decode is 2.0-2.6x ahead and cached prefill 5x ahead (our prefix cache replays a
+whole prefix; vLLM's Mamba `align` mode is experimental and only reached a 13.6% block
+hit rate). On cold unique prefill vLLM is 3.2x faster, which is the same story the
+kernel-level table tells -- we trail CUTLASS at N=256/512, the prefill regime.
+
+Two separate losses, worth not conflating:
+
+1. **Kernel**: we are at 49% of the 2051 TFLOP/s instruction roof vs CUTLASS's 68%. The
+   remaining term is the CTA-wide barrier per stage; the fix is TMA (see above).
+2. **Scheduler**: engine-level prefill is 5281 tok/s but only 2679 through our own
+   server, and engine-level paged decode at N=32 is 1216 tok/s but 179 through the
+   server on unique prompts (1079 on shared). So on a cold mixed load our scheduler
+   gives back about half the prefill and most of the decode by starving decode while it
+   prefills. That is a `serve_batched.py` scheduling problem, not a kernel problem, and
+   it is the larger of the two levers on this workload.
+
+Caveats, all in vLLM's disfavour and none of them fabricated away: it needed
+`--enforce-eager` on this box (its cudagraph memory profiling OOMs -- the checkpoint
+loads as multimodal + hybrid-mamba, so vLLM picks a 1568-token attention block to match
+the mamba page size and then cannot fit even a minimal profiling KV cache in 32 GB), so
+its decode runs without CUDA graphs; and it ran at `--max-model-len 8192` where we ran
+`TQ_CTX=16384`. Its prefill numbers are unaffected by both.
+
 
 ### Hot kernels: prefill GEMM, DeltaNet scan, paged decode attention
 
