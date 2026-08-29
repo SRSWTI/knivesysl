@@ -16,8 +16,8 @@ import argparse, ctypes, os, sys
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-KINDS = ["mlp_gate", "mlp_up", "mlp_down", "q_proj", "o_proj", "linear_in_qkv", "linear_in_z"]
-
+KINDS = ["mlp_gate", "mlp_up", "mlp_down", "q_proj", "o_proj", "linear_in_qkv",
+         "linear_in_z", "k_proj", "v_proj", "linear_in_b", "linear_in_a", "linear_out"]
 
 def main() -> int:
     ap = argparse.ArgumentParser()

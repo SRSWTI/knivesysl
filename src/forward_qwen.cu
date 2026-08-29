@@ -12518,7 +12518,9 @@ static int launch_nvf4_gemm(float *out, const tq_qmma_weight_t *w, const uint32_
     if (ks > 1) {
         size_t need = (size_t)ks * nvar * M;
         if (need > g_nvf4_part_floats) {
-            if (g_nvf4_part) cudaFree(g_nvf4_part);
+            // same hazard as g_nvf4_b: the split-K reduce of a previously queued GEMM
+            // may still be reading this slab, so drain before releasing it.
+            if (g_nvf4_part) { cudaStreamSynchronize(st); cudaFree(g_nvf4_part); }
             if (cudaMalloc(&g_nvf4_part, need * sizeof(float)) != cudaSuccess) {
                 g_nvf4_part = NULL; g_nvf4_part_floats = 0; return -91;
             }
@@ -12575,7 +12577,13 @@ static int nvf4_quant_ensure(const float *d_x, int K, int N, cudaStream_t st) {
     const size_t Gtot = (size_t)ntiles * (TQ_NVF4_TILE / 8);
     const size_t bw = Gtot * Kt64 * TQ_NVF4_BW;
     if (bw > g_nvf4_b_words) {
-        if (g_nvf4_b) cudaFree(g_nvf4_b);
+        // The buffer being freed is still the operand of GEMMs already queued on st (a
+        // wave issues every projection back-to-back without a sync), so it MUST be
+        // drained before the free or those loads read a dead allocation. This is the
+        // whole reason a fully-converted model faulted where a partly-converted one did
+        // not: with every weight NVFP4 the growth lands mid-wave with the most work in
+        // flight. Growth happens a handful of times per process, so the drain is free.
+        if (g_nvf4_b) { cudaStreamSynchronize(st); cudaFree(g_nvf4_b); }
         if (cudaMalloc(&g_nvf4_b, bw * sizeof(uint32_t)) != cudaSuccess) {
             g_nvf4_b = NULL; g_nvf4_b_words = 0; return -92;
         }
@@ -12661,18 +12669,26 @@ __global__ void k_tq_nvf4_ref(float *out, const uint32_t *a, const uint32_t *b,
     out[(size_t)ci * Mr + ri] = (float)(acc * gs);
 }
 
-// Pull the layer's NVFP4 weight by index, mirroring wide_gemm_pick's ordering.
+// Every weight the TQ_W_NVFP4 selectors can convert, so the gate has no coverage hole.
+// linear_in_b (M=96) and linear_in_a (M=48) matter most: their Mt is 6 and 3, well under
+// the kernel's 8-m16-tile block, so they are the only shapes that exercise the
+// partial-block zero-fill and the epilogue row guard.
 static const tq_qmma_weight_t *tq_nvf4_pick(int layer, int which) {
     if (layer < 0 || layer >= g_qwen.L) return NULL;
     tq_layer_t *l = &g_qwen.layers[layer];
     switch (which) {
-        case 0: return &l->mlp_gate;
-        case 1: return &l->mlp_up;
-        case 2: return &l->mlp_down;
-        case 3: return &l->q_proj;
-        case 4: return &l->o_proj;
-        case 5: return &l->linear_in_qkv;
-        case 6: return &l->linear_in_z;
+        case 0:  return &l->mlp_gate;
+        case 1:  return &l->mlp_up;
+        case 2:  return &l->mlp_down;
+        case 3:  return &l->q_proj;
+        case 4:  return &l->o_proj;
+        case 5:  return &l->linear_in_qkv;
+        case 6:  return &l->linear_in_z;
+        case 7:  return &l->k_proj;
+        case 8:  return &l->v_proj;
+        case 9:  return &l->linear_in_b;
+        case 10: return &l->linear_in_a;
+        case 11: return &l->linear_out;
         default: return NULL;
     }
 }
@@ -12685,7 +12701,8 @@ extern "C" int qwn_nvf4_check(int layer, int which, int N, float *max_rel) {
     const tq_qmma_weight_t *w = tq_nvf4_pick(layer, which);
     if (!w) return -2;
     if (!w->nvf4 || !w->d_nvf4_a) return -3;
-    if (N < 8) N = 8;
+    if (N < 1) N = 1;   // sub-8 column counts are the decode/short-prompt regime and
+                        // MUST be covered: a T=2 wave is what a 2-token prompt produces
     if (N > TQ_NVF4_TILE) N = TQ_NVF4_TILE;
     const int M = w->M, K = w->K, Kt64 = w->Kt64;
     float *d_x = NULL, *d_out = NULL, *d_ref = NULL;
@@ -20645,7 +20662,16 @@ static const float *g_wq_pend_x = NULL;
 static int g_wq_pend_K = 0, g_wq_pend_N = 0, g_wq_fp6_done = 0;
 
 static int wide_quant_input_fp6(const float *d_x, int K, int N) {
-    int Kt = (K + 31) / 32, G = wide_ng(N), nblocks = (K + 127) / 128;  // NG groups (pow2); extras zeroed
+    // The tiled FP6 dispatch (launch_fp6_gemm_mma_tile) has NO NG=1 instantiation:
+    // `case 1: case 2:` both run the NG=2 kernel, which reads TWO activation groups. So
+    // sizing this buffer at wide_ng(N) under-allocates by a whole group whenever N <= 8,
+    // and the GEMM reads past the end. It stayed hidden because some earlier call with
+    // more columns had always grown the buffer first -- until every weight became NVFP4
+    // and the single-column lm_head became the FIRST allocator of the process.
+    // Round up to what the kernel can actually touch: the extra group is memset to zero
+    // and the kernel masks columns >= nvar, so the numerics are unchanged.
+    int Kt = (K + 31) / 32, nblocks = (K + 127) / 128;
+    int G = wide_ng(N); if (G < 2) G = 2;
     size_t need_b = (size_t)G * Kt * 256;
     if (need_b > g_wproj_b_bytes) {
         if (g_wproj_b) cudaFree(g_wproj_b);
@@ -20676,12 +20702,30 @@ static int wide_quant_input(const float *d_x, int K, int N) {
 
 // run one wide projection from the prepared activation (call wide_quant_input first).
 // Weight format decides which activation quantization is materialised here.
+// TQ_NVFP4_DEBUG=1 syncs after every wide projection and names the one that faults.
+// Worth keeping: a wave issues ~700 projections and the surrounding code only reports a
+// stream-sync failure, so without this the fault is attributed to whatever synced next.
+static int g_wide_dbg = -1;
+static int wide_dbg(void) {
+    if (g_wide_dbg < 0) { const char *e = getenv("TQ_NVFP4_DEBUG"); g_wide_dbg = (e && atoi(e)) ? 1 : 0; }
+    return g_wide_dbg;
+}
+
 static int wide_proj(const tq_qmma_weight_t *w, float *out, int N) {
     if (w->nvf4) {
         if (!g_wq_pend_x || g_wq_pend_N != N || g_wq_pend_K != w->K) return -94;
         int rc = nvf4_quant_ensure(g_wq_pend_x, g_wq_pend_K, N, g_qwen.stream);
         if (rc != 0) return rc;
-        return nvf4_gemm_tiled(w, out, N, g_qwen.stream);
+        rc = nvf4_gemm_tiled(w, out, N, g_qwen.stream);
+        if (rc == 0 && wide_dbg()) {
+            cudaError_t e = cudaStreamSynchronize(g_qwen.stream);
+            if (e != cudaSuccess) {
+                fprintf(stderr, "wide_proj NVFP4 M=%d K=%d Mt=%d Kt64=%d N=%d: %s\n",
+                        w->M, w->K, w->Mt, w->Kt64, N, cudaGetErrorString(e));
+                return -95;
+            }
+        }
+        return rc;
     }
     if (!tq_wide_fmt_ok(w)) return -90;
     if (!g_wq_fp6_done) {
@@ -22871,6 +22915,15 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
     for (int j = 0; j < T; j++)
         k_tq_embed_lookup<<<(H + 255) / 256, 256, 0, g_qwen.stream>>>(
             g_wide_h + (size_t)j * H, g_qwen.d_embed, tokens[j], H);
+    // TQ_NVFP4_DEBUG=1: name the phase that faults. A wave queues ~700 launches and only
+    // syncs at the end, so the bare error names whatever synced next, not the culprit.
+    #define TQ_WV_CK(tag) do { if (wide_dbg()) {                                        \
+        cudaError_t e_ = cudaStreamSynchronize(g_qwen.stream);                          \
+        if (e_ != cudaSuccess) {                                                        \
+            fprintf(stderr, "wave L=%d T=%d phase=%s: %s\n", L, T, tag,                 \
+                    cudaGetErrorString(e_));                                            \
+            return -119;                                                                \
+        } } } while (0)
     for (int L = 0; L < g_qwen.L; L++) {
         tq_layer_t *l = &g_qwen.layers[L];
         if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION) {
@@ -22881,6 +22934,7 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
             if ((ret = wide_proj(&l->q_proj, g_wide_q, T)) != 0) return -93;
             if ((ret = wide_proj(&l->k_proj, g_wide_k, T)) != 0) return -93;
             if ((ret = wide_proj(&l->v_proj, g_wide_v, T)) != 0) return -93;
+            TQ_WV_CK("qkv_proj");
             // FUSED WAVES: the scheduler emits decode rows as leading 1-column segments.
             // Sending each through the per-segment MMA path costs one k_tq_wide_attn_mma
             // launch per row per attention layer (grid nh x 1 x S: 32 rows x 16 layers =
@@ -22906,10 +22960,13 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
                                      g_pool_k4[L], g_pool_kq4s[L], g_pool_v8[L], g_pool_vscale[L],
                                      g_wide_pos, g_pf_colslot, g_block_table, g_pg_maxblk, g_pg_page, g_pg_plog,
                                      T, pf_maxpos, g_qwen.stream) != 0) return -94;
+            TQ_WV_CK("attention");
             if ((ret = wide_quant_input(g_wide_core, attn_m, T)) != 0) return -95;
             if ((ret = wide_proj(&l->o_proj, g_wide_o, T)) != 0) return -95;
             k_tq_add_vec<<<((size_t)T * H + 255) / 256, 256, 0, g_qwen.stream>>>(g_wide_resid, g_wide_h, g_wide_o, (size_t)T * H);
+            TQ_WV_CK("o_proj+resid");
             if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, T)) != 0) return -96;
+            TQ_WV_CK("mlp");
         } else {
             if (!(tq_wide_fmt_ok(&l->linear_in_qkv) && tq_wide_fmt_ok(&l->linear_in_z) &&
                   tq_wide_fmt_ok(&l->linear_in_b) && tq_wide_fmt_ok(&l->linear_in_a) &&
@@ -22921,6 +22978,7 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
             if ((ret = wide_proj(&l->linear_in_z, g_wide_z, T)) != 0) return -98;
             if ((ret = wide_proj(&l->linear_in_b, g_wide_b, T)) != 0) return -98;
             if ((ret = wide_proj(&l->linear_in_a, g_wide_a, T)) != 0) return -98;
+            TQ_WV_CK("delta_in_proj");
             for (int k = 0; k < K; k++) {     // per-client conv + chunkwise DeltaNet over the segment
                 int off = seg_off[k], n = seg_len[k], slot = seg_slot[k];
                 k_tq_linear_conv_chunk<<<(conv_dim + 255) / 256, 256, 0, g_qwen.stream>>>(
@@ -22932,10 +22990,13 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
                         l->d_linear_A_log, l->d_linear_dt_bias, l->d_linear_norm, n, lvh, lkh, ld,
                         g_qwen.eps, g_qwen.stream) != 0) return -99;
             }
+            TQ_WV_CK("delta_conv_scan");
             if ((ret = wide_quant_input(g_wide_lcore, value_dim, T)) != 0) return -100;
             if ((ret = wide_proj(&l->linear_out, g_wide_o, T)) != 0) return -100;
             k_tq_add_vec<<<((size_t)T * H + 255) / 256, 256, 0, g_qwen.stream>>>(g_wide_resid, g_wide_h, g_wide_o, (size_t)T * H);
+            TQ_WV_CK("delta_out+resid");
             if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, T)) != 0) return -101;
+            TQ_WV_CK("delta_mlp");
         }
     }
     // seeds: gather each final client's last-token hidden -> final norm -> wide lm_head -> argmax.
@@ -22956,6 +23017,14 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
             !g_qwen.lm_head.word_major && can_use_qmma_sf_weight(&g_qwen.lm_head) && !g_qwen.lm_head.row_major) {
             if ((ret = wide_quant_input(g_wide_norm, H, Kf)) != 0) return -102;
             if ((ret = wide_proj(&g_qwen.lm_head, g_pg_logits, Kf)) != 0) return -102;
+            if (wide_dbg()) {
+                cudaError_t e_ = cudaStreamSynchronize(g_qwen.stream);
+                if (e_ != cudaSuccess) {
+                    fprintf(stderr, "wave seeds: Kf=%d lm_head M=%d K=%d: %s\n", Kf,
+                            g_qwen.lm_head.M, g_qwen.lm_head.K, cudaGetErrorString(e_));
+                    return -119;
+                }
+            }
             k_tq_batched_argmax<<<Kf, 256, 0, g_qwen.stream>>>(g_pg_argmax, g_pg_logits, g_qwen.V, Kf);
         } else {
             for (int f = 0; f < Kf; f++) {
@@ -22971,7 +23040,13 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
         cudaStreamSynchronize(g_qwen.stream);
         for (int f = 0; f < Kf; f++) out_seed[fk[f]] = htmp[f];
     }
-    return cudaStreamSynchronize(g_qwen.stream) == cudaSuccess ? 0 : -104;
+    cudaError_t werr = cudaStreamSynchronize(g_qwen.stream);
+    if (werr != cudaSuccess) {
+        fprintf(stderr, "paged_prefill_wave: K=%d T=%d failed: %s\n",
+                K, T, cudaGetErrorString(werr));
+        return -104;
+    }
+    return 0;
 }
 
 // ABI: prefill K client segments in one ragged wave. tokens/col_slot/col_pos are T concatenated
