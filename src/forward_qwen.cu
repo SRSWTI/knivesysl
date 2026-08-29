@@ -120,6 +120,12 @@ typedef struct {
     uint32_t *d_sparse_a;
     uint32_t *d_sparse_meta;
     int has_sparse;
+    // NVFP4 tier (TQ_W_NVFP4). Populated by a load-time repack from the dense E2M3
+    // payload; d_A and d_block_scale_inv are FREED when this is live, so a weight is
+    // either FP6 or NVFP4, never both. Per-128-row-block fp32 global in d_nvf4_global.
+    uint32_t *d_nvf4_a;
+    float *d_nvf4_global;
+    int nvf4;
     int Kt64;
 } tq_qmma_weight_t;
 
@@ -3785,6 +3791,26 @@ k_tq_qwen_rmsnorm_b(float *out, const float *x, const uint16_t *weight, int N, f
     }
 }
 
+// gridDim.x for the batched norms. The .x split exists so a SINGLE row still
+// engages many SMs, but every block re-reads the whole row to build sum_sq, so
+// past ~170/rows stripes it is pure read amplification: a 256-row prefill wave was
+// reading 8 x 5.24 MB per norm. The result is bit-identical either way -- the
+// reduction order depends on blockDim.x and N, never on gridDim.x.
+static inline int tq_norm_stripes(int rows) {
+    if (rows <= 0) return 1;
+    int s = 170 / rows;
+    if (s < 1) s = 1;
+    if (s > 8) s = 8;
+    return s;
+}
+
+// out[i] = base + i. Lets callers build position/slot iotas on the device instead
+// of malloc + H2D + a stream sync.
+__global__ void k_tq_fill_iota(int *out, int base, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = base + i;
+}
+
 // Fused add-residual + RMSNorm: computes resid[i] = a[i] + b[i], then
 // out[i] = rmsnorm(resid, weight). Replaces separate add_vec_b + rmsnorm_b.
 __global__ void __launch_bounds__(1024, 1)
@@ -5823,6 +5849,168 @@ __global__ void k_tq_fp6_wide_gemm_split(float *partials, const uint32_t *a, con
     }
 }
 
+// ===========================================================================
+// D.2: TILED + cp.async-PIPELINED wide FP6 GEMM  (replaces k_tq_fp6_wide_gemm)
+// ---------------------------------------------------------------------------
+// k_tq_fp6_wide_gemm runs ONE warp per CTA with every operand coming straight
+// from global via __ldg, so each MMA sits behind its own load-use chain and the
+// tensor cores idle: measured 88.9 TFLOPS FLOP-weighted over this model's real
+// projection shapes (mlp_down 64, o_proj 64, kv_proj 13).
+//
+// This kernel keeps the SAME numerics and the SAME operand layouts and only
+// changes the schedule:
+//   * block tile 128 rows x NG*8 cols, 8 warps as 4(M) x 2(N) -> warp tile
+//     32 x (NG*4): 2 m16-atoms x NG/2 n8-atoms = NG MMAs per k32 tile, NG*2
+//     accumulator registers.
+//   * K is staged 128 at a time (4 k32 tiles) = exactly ONE 128-wide block
+//     scale, so sfa/sfb are loaded once per stage instead of once per k32 tile
+//     per warp (the baseline reloads both from global every single MMA group).
+//   * A and B are cp.async'd into a STAGES-deep circular smem buffer. The .tqf
+//     QMMA fragment layout is *already* the layout the MMA wants, so the copy is
+//     a flat 16 B cp.async with no swizzle, no transform, and the operand-A read
+//     is 3 conflict-free LDS.32 per lane (word stride 3 is coprime with 32).
+//     CUTLASS needs Swizzle<3,4,3> + ldmatrix.b6x16_p32 only because its global
+//     layout is canonical TN; ours is not, and that is an advantage here.
+//   * split-K rides grid.y into [split][nvar*M] partials for
+//     k_tq_reduce_qmma_sf_splits, so small-M projections fill 170 SMs.
+//
+// tk is accumulated in ascending order into the same C register as the baseline,
+// so at k_splits == 1 this is **bit-exact** vs k_tq_fp6_wide_gemm (verified over
+// every shape/N in this model with order-independent exact-arithmetic operands).
+// ===========================================================================
+template<int NG, int STAGES>
+__global__ __launch_bounds__(256, 1)
+void k_tq_fp6_gemm_mma(float *__restrict__ out, const uint32_t *__restrict__ a,
+                       const uint32_t *__restrict__ b, int M, int Mt, int Kt,
+                       const float *__restrict__ wscale_inv, int wscale_cols,
+                       const float *__restrict__ ascale_inv, int nvar,
+                       int kt_per, int ksplits) {
+    constexpr int NA = NG / 2;                 // n8 atoms per warp
+    constexpr int AW = 8 * 4 * 96;             // uint32 words of A per stage (12288 B)
+    constexpr int BW = NG * 4 * 64;            // uint32 words of B per stage
+    constexpr int CHUNKS = AW / 4 + BW / 4;    // 16 B chunks per stage
+    constexpr int ROUNDS = (CHUNKS + 255) / 256;
+
+    extern __shared__ __align__(16) uint32_t tq_gemm_smem[];
+    uint32_t *sA = tq_gemm_smem;                          // [STAGES][8][384]
+    uint32_t *sB = tq_gemm_smem + (size_t)STAGES * AW;    // [STAGES][NG][256]
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int wm = warp >> 1, wn = warp & 1;
+    const int mblk = blockIdx.x;
+    const int split = blockIdx.y;
+    const int kt_begin = split * kt_per;
+    const int nst = kt_per >> 2;               // K is always a multiple of 128
+    if (ksplits > 1) out += (size_t)split * nvar * M;
+
+    float c[2][NA][4];
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int j = 0; j < NA; j++) { c[i][j][0] = c[i][j][1] = c[i][j][2] = c[i][j][3] = 0.0f; }
+
+    const uint32_t sbase = (uint32_t)__cvta_generic_to_shared(tq_gemm_smem);
+
+    auto issue = [&](int buf, int stg) {
+        const int kb = kt_begin + stg * 4;
+        #pragma unroll
+        for (int r = 0; r < ROUNDS; r++) {
+            int idx = tid + r * 256;
+            if (idx >= CHUNKS) continue;
+            if (idx < AW / 4) {                // A: 8 runs of 384 contiguous words
+                int mt = idx / 96, within = idx % 96;
+                int gm = mblk * 8 + mt;
+                size_t woff = (size_t)buf * AW + (size_t)mt * 384 + (size_t)within * 4;
+                if (gm < Mt)
+                    tq_cp_async16(sbase + (uint32_t)(woff * 4),
+                                  a + (size_t)gm * Kt * 96 + (size_t)kb * 96 + (size_t)within * 4);
+                else
+                    *(uint4 *)(sA + woff) = make_uint4(0, 0, 0, 0);
+            } else {                           // B: NG runs of 256 contiguous words
+                int bi = idx - AW / 4;
+                int g = bi >> 6, within = bi & 63;
+                size_t woff = (size_t)STAGES * AW + (size_t)buf * BW
+                            + (size_t)g * 256 + (size_t)within * 4;
+                tq_cp_async16(sbase + (uint32_t)(woff * 4),
+                              b + (size_t)g * Kt * 64 + (size_t)kb * 64 + (size_t)within * 4);
+            }
+        }
+        asm volatile("cp.async.commit_group;\n");
+    };
+
+    #pragma unroll
+    for (int s = 0; s < STAGES; s++) if (s < nst) issue(s, s);
+
+    for (int stg = 0; stg < nst; stg++) {
+        const int buf = stg % STAGES;
+        asm volatile("cp.async.wait_group %0;\n" :: "n"(STAGES - 1));
+        __syncthreads();
+
+        const int kb = kt_begin + stg * 4;
+        const uint32_t sfb = tq_ue8m0_pack4(ascale_inv[kb >> 2]);
+        const uint32_t sfa_s = (wscale_cols == Kt) ? 0u
+                             : tq_ue8m0_pack4(wscale_inv[(size_t)mblk * wscale_cols + (kb >> 2)]);
+        const uint32_t *pA = sA + (size_t)buf * AW;
+        const uint32_t *pB = sB + (size_t)buf * BW;
+        #pragma unroll
+        for (int kk = 0; kk < 4; kk++) {
+            const uint32_t sfa = (wscale_cols == Kt)
+                ? tq_ue8m0_pack4(wscale_inv[(size_t)mblk * wscale_cols + kb + kk]) : sfa_s;
+            uint32_t af[2][4];
+            #pragma unroll
+            for (int i = 0; i < 2; i++) {
+                const uint32_t *t = pA + (size_t)(wm * 2 + i) * 384 + kk * 96 + lane * 3;
+                tq_unpack_e2m3_16(t[0], t[1], t[2], af[i][0], af[i][1], af[i][2], af[i][3]);
+            }
+            uint32_t bf[NA][2];
+            #pragma unroll
+            for (int j = 0; j < NA; j++) {
+                const uint32_t *t = pB + (size_t)(wn * NA + j) * 256 + kk * 64 + lane * 2;
+                bf[j][0] = t[0];
+                bf[j][1] = t[1];
+            }
+            #pragma unroll
+            for (int i = 0; i < 2; i++)
+                #pragma unroll
+                for (int j = 0; j < NA; j++)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X"
+                        ".f32.e2m3.e4m3.f32.ue8m0 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13}, %14, {0,1}, %15, {0,1};"
+                        : "+f"(c[i][j][0]), "+f"(c[i][j][1]), "+f"(c[i][j][2]), "+f"(c[i][j][3])
+                        : "r"(af[i][0]), "r"(af[i][1]), "r"(af[i][2]), "r"(af[i][3]),
+                          "r"(bf[j][0]), "r"(bf[j][1]),
+                          "f"(c[i][j][0]), "f"(c[i][j][1]), "f"(c[i][j][2]), "f"(c[i][j][3]),
+                          "r"(sfa), "r"(sfb));
+        }
+        __syncthreads();
+        // The tail MUST still commit an (empty) group: cp.async.wait_group means
+        // "leave at most N groups pending", so once the outstanding count drops
+        // below STAGES the wait no longer covers the stage about to be read. Without
+        // this the last STAGES-1 stages are consumed before their bytes land -- which
+        // only shows up when the A stream misses L2, i.e. on the largest weight.
+        if (stg + STAGES < nst) issue(buf, stg + STAGES);
+        else asm volatile("cp.async.commit_group;\n");
+    }
+
+    const int cc = lane & 3, g_row = lane >> 2;
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        if (mblk * 8 + wm * 2 + i >= Mt) continue;
+        const int row0 = mblk * 128 + (wm * 2 + i) * 16 + 2 * g_row;   // rows row0, row0+1
+        #pragma unroll
+        for (int j = 0; j < NA; j++) {
+            const int cola = (wn * NA + j) * 8 + 2 * cc;
+            if (cola < nvar)
+                *(float2 *)&out[(size_t)cola * M + row0] = make_float2(c[i][j][0], c[i][j][2]);
+            if (cola + 1 < nvar)
+                *(float2 *)&out[(size_t)(cola + 1) * M + row0] = make_float2(c[i][j][1], c[i][j][3]);
+        }
+    }
+}
+
 // instantiated NG = ceil(N/8) rounded UP to a power of 2 (1,2,4,8,16,32); the kernel
 // masks columns >= nvar, so a chunk of e.g. 80 tokens (10 groups) runs as NG=16.
 static inline int wide_ng(int N) { int g = (N + 7) / 8, ng = 1; while (ng < g) ng <<= 1; return ng; }
@@ -5857,19 +6045,121 @@ static int launch_fp6_wide_gemm_tile(float *out, const tq_qmma_weight_t *w, cons
 #undef TQ_WIDE_SPLIT
 #undef TQ_WIDE_SWITCH
 
-// N-tiling wrapper: cap columns per launch at 128 (NG<=16 -> <=64 accumulator
-// registers/thread). N=256 with NG=32 (128 acc regs) spilled and REGRESSED
-// (gate 285->392us); two 128-col tiles scale linearly instead. Each tile reads
-// the weight once; the shared per-128K-block activation scale is global so a
-// sub-tile reuses it unchanged. b is grouped 8 cols/group (Kt*256 bytes/group).
+// ---- D.2 dispatch ---------------------------------------------------------
+// TQ_WIDE_GEMM=0 restores the 1-warp/CTA kernel below (k_splits then comes from
+// qmma_sf_k_split_auto as before). TQ_GEMM_STAGES overrides the pipeline depth.
+static int tq_wide_gemm_tiled(void) {
+    static int en = -1;
+    if (en < 0) { const char *e = getenv("TQ_WIDE_GEMM"); en = (e && *e) ? (atoi(e) != 0) : 1; }
+    return en;
+}
+static int tq_wide_gemm_stages(void) {
+    static int s = -1;
+    if (s < 0) {
+        const char *e = getenv("TQ_GEMM_STAGES");
+        s = (e && *e) ? atoi(e) : 2;
+        if (s < 2) s = 2;
+        if (s > 4) s = 4;
+    }
+    return s;
+}
+// Column tile: NG = ceil(cols/8) rounded to a pow2, and the kernel is instantiated
+// for NG <= 32 (NG=32 -> 128 accumulator regs/thread, which fits without spilling
+// because the operands now come from smem instead of 32 live __ldg results).
+#define TQ_WIDE_GEMM_TILE 256
+
+// One K-stage is 128 columns of K, so a split must keep kt_per a multiple of 4 and
+// deep enough to fill the pipeline. Pick the largest split that still lands the whole
+// grid inside a single wave of the 170 SMs -- the tiled kernel is 1 CTA/SM (>48 KB
+// smem), so a second wave costs a full extra pass.
+static int tq_wide_gemm_ksplits(int Mt, int Kt, int stages) {
+    int mblocks = (Mt + 7) / 8;
+    int sm = 170;
+    {
+        static int cached = 0;
+        if (!cached) { int d = 0; if (cudaGetDevice(&d) == cudaSuccess) {
+            int n = 0; if (cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, d) == cudaSuccess && n > 0) sm = n; }
+            cached = sm; }
+        else sm = cached;
+    }
+    for (int s = 8; s >= 1; s >>= 1) {
+        if (Kt % (4 * s) != 0) continue;         // kt_per must be a whole number of stages
+        if (Kt / s < 4 * stages) continue;       // and deep enough to fill the pipeline
+        if ((long)mblocks * s > sm) continue;    // single wave
+        return s;
+    }
+    return 1;
+}
+
+template<int NG, int STAGES>
+static int tq_launch_gemm_mma(float *out, const tq_qmma_weight_t *w, const uint32_t *bb,
+                              const float *act_scale, int N, float *partials, int ks,
+                              cudaStream_t st) {
+    constexpr size_t bytes = (size_t)STAGES * (8 * 4 * 96 + NG * 4 * 64) * 4;
+    static int primed = 0;
+    if (!primed) {
+        if (cudaFuncSetAttribute(k_tq_fp6_gemm_mma<NG, STAGES>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes) != cudaSuccess)
+            return -1;
+        primed = 1;
+    }
+    int M = w->M, Kt = w->Kt, Mt = w->Mt, sc = w->scale_cols;
+    const uint32_t *a = (const uint32_t *)w->d_A;
+    const float *ws = w->d_block_scale_inv;
+    int mblocks = (Mt + 7) / 8;
+    if (ks > 1 && !partials) ks = 1;
+    float *dst = (ks > 1) ? partials : out;
+    k_tq_fp6_gemm_mma<NG, STAGES><<<dim3(mblocks, ks), 256, bytes, st>>>(
+        dst, a, bb, M, Mt, Kt, ws, sc, act_scale, N, (ks > 1) ? Kt / ks : Kt, ks);
+    if (ks > 1)
+        k_tq_reduce_qmma_sf_splits<<<((size_t)N * M + 255) / 256, 256, 0, st>>>(
+            out, partials, N * M, ks);
+    return 0;
+}
+
+#define TQ_GEMM_MMA_NG(STAGES) \
+    switch (G) { \
+    case 1: case 2: return tq_launch_gemm_mma<2, STAGES>(out, w, bb, act_scale, N, partials, ks, st); \
+    case 4:  return tq_launch_gemm_mma<4, STAGES>(out, w, bb, act_scale, N, partials, ks, st); \
+    case 8:  return tq_launch_gemm_mma<8, STAGES>(out, w, bb, act_scale, N, partials, ks, st); \
+    case 16: return tq_launch_gemm_mma<16, STAGES>(out, w, bb, act_scale, N, partials, ks, st); \
+    case 32: return tq_launch_gemm_mma<32, STAGES>(out, w, bb, act_scale, N, partials, ks, st); \
+    default: return -1; }
+
+static int launch_fp6_gemm_mma_tile(float *out, const tq_qmma_weight_t *w, const uint8_t *b,
+                                    const float *act_scale, int N, float *partials,
+                                    int ks_cap, cudaStream_t st) {
+    const uint32_t *bb = (const uint32_t *)b;
+    int G = wide_ng(N);
+    int stages = tq_wide_gemm_stages();
+    int ks = tq_wide_gemm_ksplits(w->Mt, w->Kt, stages);
+    // NEVER exceed the slab the caller sized: partials hold ks_cap * N * M floats.
+    if (!partials) ks = 1;
+    else if (ks_cap >= 1 && ks > ks_cap) ks = ks_cap;
+    if (stages == 2) { TQ_GEMM_MMA_NG(2) }
+    else if (stages == 3) { TQ_GEMM_MMA_NG(3) }
+    else { TQ_GEMM_MMA_NG(4) }
+}
+#undef TQ_GEMM_MMA_NG
+
+// N-tiling wrapper. Each tile reads the weight once, so a wider tile amortizes the
+// ~20 GiB weight pass over more tokens; the shared per-128K-block activation scale is
+// global so a sub-tile reuses it unchanged. b is grouped 8 cols/group (Kt*256 B/group).
 static int launch_fp6_wide_gemm(float *out, const tq_qmma_weight_t *w, const uint8_t *b,
                                 const float *act_scale, int N, float *partials, int k_splits,
                                 cudaStream_t st) {
-    const int TILE = 128;
+    const int tiled = tq_wide_gemm_tiled();
+    const int TILE = tiled ? TQ_WIDE_GEMM_TILE : 128;
     int M = w->M, Kt = w->Kt;
     for (int off = 0; off < N; off += TILE) {
         int nt = (N - off < TILE) ? (N - off) : TILE;
-        int rc = launch_fp6_wide_gemm_tile(out + (size_t)off * M, w,
+        int rc;
+        if (tiled)
+            rc = launch_fp6_gemm_mma_tile(out + (size_t)off * M, w,
+                                          b + (size_t)(off / 8) * Kt * 256,
+                                          act_scale, nt, partials, k_splits, st);
+        else
+            rc = launch_fp6_wide_gemm_tile(out + (size_t)off * M, w,
                                            b + (size_t)(off / 8) * Kt * 256,
                                            act_scale, nt, partials, k_splits, st);
         if (rc) return rc;
@@ -10123,6 +10413,360 @@ __global__ void k_tq_repack_e2m3_to_e2m1(const uint32_t *src, int M, int K,
     out[idx] = val;
 }
 
+// ===================================================================== NVFP4 tier
+// W4A4 in NVIDIA's NVFP4 numerics: E2M1 codes + per-16 ue4m3 block scales + one fp32
+// global per 128-row block. 4.502 bits/weight vs FP6's 6.002, and it is the ONLY tier
+// that reaches the wide `mma.sync.kind::mxf4nvf4` k64 instruction -- k64 doubles the
+// FLOPs per instruction at the same register and smem cost, which is where the speed
+// comes from. Our existing TQ_W_E2M1 tier embeds 4-bit codes in the k32 mxf8f6f4 MMA
+// and therefore gets memory savings with ZERO compute win; this one gets both.
+//
+// Every layout constant below was decoded on this card with one-hot MMA probes
+// (/tmp/nvf4/probe*.cu), not read off a spec. Per m16k64 weight tile, 576 B:
+//   words [0,128)    E2M1 codes, lane L owns words [4L,4L+4)     -> one LDS.128
+//   words [128,144)  per-16 ue4m3 scales, word 128+r = row r's 4 k-group bytes;
+//                    lane L reads word 128 + ((L>>2) + 8*(L&1)) -> one LDS.32
+// Per n8k64 activation tile, 288 B:
+//   words [0,64)     E2M1 codes, lane L owns words [2L,2L+2)     -> one LDS.64
+//   words [64,72)    per-16 ue4m3 scales, word 64+c = col c's 4 bytes
+// Both are exactly what the MMA wants, so global->smem is a flat 16 B cp.async: no
+// swizzle, no ldmatrix, no software unpack. (FP6 needs 3x LDS.32 + a LOP3 unpack.)
+#define TQ_NVF4_AW 144       // uint32 per m16k64 weight tile     (128 data + 16 scale)
+#define TQ_NVF4_BW 72        // uint32 per n8k64 activation tile  (64 data + 8 scale)
+
+// ue4m3: 1 unused | 4 exp (bias 7) | 3 mant.  0x38 == 1.0, 0x40 == 2.0 (probe-verified)
+static __host__ __device__ __forceinline__ float tq_ue4m3_to_f(uint8_t b) {
+    int e = (b >> 3) & 0xF, m = b & 0x7;
+    if (e == 0) return (float)m * 0.125f * 0.015625f;         // 2^-6 subnormal
+    return ldexpf(1.0f + (float)m * 0.125f, e - 7);
+}
+static __host__ __device__ __forceinline__ uint8_t tq_f2ue4m3(float v) {
+    if (!(v > 0.0f)) return 0;
+    int e; float m = frexpf(v, &e);                           // v = m * 2^e, m in [0.5,1)
+    int E = e + 6, f = (int)lrintf((2.0f * m - 1.0f) * 8.0f);  // v = (1+f/8) * 2^(E-7)
+    if (f > 7) { f = 0; E++; }
+    if (E > 15) { E = 15; f = 7; }
+    if (E < 1) return 0;
+    return (uint8_t)((E << 3) | f);
+}
+
+// Probe-derived slot <-> logical-k maps. The scale byte g owns the CONTIGUOUS k group
+// [16g,16g+16), which only comes out right with exactly this mapping -- my first
+// labelling was a permutation of the hardware's and produced a uniform ~11% error.
+//   A: row = (L>>2) + 8*(reg&1),  k = 32*(reg>>1) + 16*((L>>1)&1) + 8*(L&1) + nib
+//   B: col = L>>2,                k = 32*reg      + 16*((L>>1)&1) + 8*(L&1) + nib
+static __host__ __device__ __forceinline__ int tq_nvf4_a_k(int lane, int reg, int nib) {
+    return 32 * (reg >> 1) + 16 * ((lane >> 1) & 1) + 8 * (lane & 1) + nib;
+}
+static __host__ __device__ __forceinline__ int tq_nvf4_a_row(int lane, int reg) {
+    return (lane >> 2) + 8 * (reg & 1);
+}
+static __host__ __device__ __forceinline__ int tq_nvf4_b_k(int lane, int reg, int nib) {
+    return 32 * reg + 16 * ((lane >> 1) & 1) + 8 * (lane & 1) + nib;
+}
+
+#define TQ_NVF4_MMA(A0,A1,A2,A3,B0,B1,SFA,SFB,C0,C1,C2,C3)                             \
+  asm volatile("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X"              \
+               ".m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "                             \
+               "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13},"                 \
+               "{%14},{%15,%16},{%17},{%18,%19};"                                       \
+               : "+f"(C0), "+f"(C1), "+f"(C2), "+f"(C3)                                 \
+               : "r"(A0), "r"(A1), "r"(A2), "r"(A3), "r"(B0), "r"(B1),                  \
+                 "f"(C0), "f"(C1), "f"(C2), "f"(C3),                                    \
+                 "r"(SFA), "h"(zsel), "h"(zsel), "r"(SFB), "h"(zsel), "h"(zsel))
+
+// Block tile: 128 rows (8 m16 tiles) x NG*8 cols, 8 warps as WM(M) x (8/WM)(N).
+// Warp (wm,wn) owns MA = 8/WM m16-tiles and NA = NG/(8/WM) n8 groups. Shared loads per
+// k64 step are 2*MA (A) + 2*NA (B) for MA*NA MMAs, so a squarer warp tile issues fewer
+// loads for the same work: 4x8 needs 24 loads per 32 MMAs where 2x16 needs 36.
+//
+// ONE full-CTA barrier per stage. The barrier at the top of iteration stg already proves
+// every warp is done reading buf_{stg-1}, so that buffer is refilled right there instead
+// of after a second barrier at the bottom. All 8 warps issue the copies: warp
+// specialisation was built and measured, and it LOSES -- with cp.async a producer's
+// memory-level parallelism IS its warp count, so throughput scaled linearly with
+// producer warps (357/540/703 TF at pw=1/2/4, gate/up N=256) and never reached the
+// 959 TF of all-8-warps issue. That is why CUTLASS needs TMA for its producer group.
+//
+// The cp.async group bookkeeping is the load-bearing detail. Stage s must map to group s
+// so the wait retires exactly the copy about to be read: the prologue issues STAGES-1
+// stages and iteration stg issues stage stg+STAGES-1, giving group index == stage index.
+// Past the last real stage we still commit an EMPTY group per iteration to keep the
+// retire count advancing, and those empties land AFTER every real group so they cannot
+// displace one. Committing the empty FIRST (at stg=0) instead permanently offsets the
+// mapping and silently reads a stage whose bytes have not landed -- it failed exactly
+// the STAGES=2 configs. Order of the empty commit is not cosmetic.
+template <int NG, int STAGES, int WM>
+__global__ __launch_bounds__(256, 1)
+void k_tq_nvf4_gemm(float *__restrict__ out, const uint32_t *__restrict__ a,
+                    const uint32_t *__restrict__ b, const float *__restrict__ wglobal,
+                    int M, int Mt, int Kt64, int nvar, int kt_per, int ksplits) {
+    constexpr int WN = 8 / WM;
+    constexpr int MA = 8 / WM;
+    constexpr int NA = (NG / WN) < 1 ? 1 : (NG / WN);
+    constexpr int AW = 8 * 2 * TQ_NVF4_AW;
+    constexpr int BW = NG * 2 * TQ_NVF4_BW;
+    constexpr int CHUNKS = AW / 4 + BW / 4;
+    constexpr int ROUNDS = (CHUNKS + 255) / 256;
+    constexpr int PRO = STAGES - 1;
+    constexpr int WAITN = (STAGES > 2) ? STAGES - 2 : 0;
+
+    extern __shared__ __align__(16) uint32_t sm[];
+    uint32_t *sA = sm;
+    uint32_t *sB = sm + (size_t)STAGES * AW;
+
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int wm = warp / WN, wn = warp % WN;
+    const int mblk = blockIdx.x, split = blockIdx.y;
+    const int kt_begin = split * kt_per;
+    const int nst = kt_per >> 1;                  // 2 k64 tiles per stage
+    const uint16_t zsel = 0;
+    if (ksplits > 1) out += (size_t)split * nvar * M;
+
+    float c[MA][NA][4];
+    #pragma unroll
+    for (int i = 0; i < MA; i++)
+        #pragma unroll
+        for (int j = 0; j < NA; j++) { c[i][j][0] = c[i][j][1] = c[i][j][2] = c[i][j][3] = 0.f; }
+
+    const uint32_t sbase = (uint32_t)__cvta_generic_to_shared(sm);
+    const int a_sf_word = 128 + ((lane >> 2) + 8 * (lane & 1));   // probe-derived
+    const int b_sf_word = 64 + (lane >> 2);
+
+    auto issue = [&](int buf, int stg) {
+        const int kb = kt_begin + stg * 2;
+        #pragma unroll
+        for (int r = 0; r < ROUNDS; r++) {
+            int idx = tid + r * 256;
+            if (idx >= CHUNKS) continue;
+            if (idx < AW / 4) {                       // A: 8 runs of 2*144 = 288 words
+                int mt = idx / 72, within = idx % 72;
+                int gm = mblk * 8 + mt;
+                size_t woff = (size_t)buf * AW + (size_t)mt * 288 + (size_t)within * 4;
+                if (gm < Mt)
+                    tq_cp_async16(sbase + (uint32_t)(woff * 4),
+                                  a + (size_t)gm * Kt64 * TQ_NVF4_AW
+                                    + (size_t)kb * TQ_NVF4_AW + (size_t)within * 4);
+                else
+                    *(uint4 *)(sA + woff) = make_uint4(0, 0, 0, 0);
+            } else {                                  // B: NG runs of 2*72 = 144 words
+                int bi = idx - AW / 4;
+                int g = bi / 36, within = bi % 36;
+                size_t woff = (size_t)STAGES * AW + (size_t)buf * BW
+                            + (size_t)g * 144 + (size_t)within * 4;
+                tq_cp_async16(sbase + (uint32_t)(woff * 4),
+                              b + (size_t)g * Kt64 * TQ_NVF4_BW
+                                + (size_t)kb * TQ_NVF4_BW + (size_t)within * 4);
+            }
+        }
+        asm volatile("cp.async.commit_group;\n");
+    };
+
+    #pragma unroll
+    for (int s = 0; s < PRO; s++) if (s < nst) issue(s, s);
+
+    for (int stg = 0; stg < nst; stg++) {
+        const int buf = stg % STAGES;
+        asm volatile("cp.async.wait_group %0;\n" :: "n"(WAITN));
+        __syncthreads();
+        {
+            const int ps = stg + STAGES - 1;
+            if (ps < nst) issue(ps % STAGES, ps);
+            else asm volatile("cp.async.commit_group;\n");
+        }
+        const uint32_t *pA = sA + (size_t)buf * AW;
+        const uint32_t *pB = sB + (size_t)buf * BW;
+        #pragma unroll
+        for (int kk = 0; kk < 2; kk++) {
+            uint32_t af[MA][4], sfa[MA];
+            #pragma unroll
+            for (int i = 0; i < MA; i++) {
+                const uint32_t *t = pA + (size_t)(wm * MA + i) * 288 + kk * TQ_NVF4_AW;
+                const uint4 v = *(const uint4 *)(t + lane * 4);   // ONE LDS.128
+                af[i][0] = v.x; af[i][1] = v.y; af[i][2] = v.z; af[i][3] = v.w;
+                sfa[i] = t[a_sf_word];                            // ONE LDS.32
+            }
+            uint32_t bf[NA][2], sfb[NA];
+            #pragma unroll
+            for (int j = 0; j < NA; j++) {
+                const uint32_t *t = pB + (size_t)(wn * NA + j) * 144 + kk * TQ_NVF4_BW;
+                bf[j][0] = t[lane * 2 + 0];
+                bf[j][1] = t[lane * 2 + 1];
+                sfb[j] = t[b_sf_word];
+            }
+            #pragma unroll
+            for (int i = 0; i < MA; i++)
+                #pragma unroll
+                for (int j = 0; j < NA; j++)
+                    TQ_NVF4_MMA(af[i][0], af[i][1], af[i][2], af[i][3], bf[j][0], bf[j][1],
+                                sfa[i], sfb[j],
+                                c[i][j][0], c[i][j][1], c[i][j][2], c[i][j][3]);
+        }
+    }
+
+    // Fold the per-128-row-block fp32 global. It is constant over K by construction --
+    // a per-K-block global could NOT be factored out of the K sum. Accumulator layout is
+    // the PTX standard: row = (lane>>2) + 8*(reg>>1), col = 2*(lane&3) + (reg&1).
+    const float gs = wglobal[mblk];
+    const int qc = lane & 3, gr = lane >> 2;
+    #pragma unroll
+    for (int i = 0; i < MA; i++) {
+        if (mblk * 8 + wm * MA + i >= Mt) continue;
+        const int rowbase = mblk * 128 + (wm * MA + i) * 16 + gr;
+        #pragma unroll
+        for (int j = 0; j < NA; j++) {
+            const int cola = (wn * NA + j) * 8 + 2 * qc;
+            if (cola < nvar) {
+                out[(size_t)cola * M + rowbase]     = c[i][j][0] * gs;
+                out[(size_t)cola * M + rowbase + 8] = c[i][j][2] * gs;
+            }
+            if (cola + 1 < nvar) {
+                out[(size_t)(cola + 1) * M + rowbase]     = c[i][j][1] * gs;
+                out[(size_t)(cola + 1) * M + rowbase + 8] = c[i][j][3] * gs;
+            }
+        }
+    }
+}
+
+__global__ void k_tq_nvf4_reduce(float *out, const float *part, int n, int ks) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float s = 0.f;
+    for (int k = 0; k < ks; k++) s += part[(size_t)k * n + i];
+    out[i] = s;
+}
+
+// ---- NVFP4 packers. Source is the weight ALREADY on device in dense E2M3, read
+// through the logical accessor tq_e2m3_code_at(payload, Kt, row, col), so the packer
+// never has to know the FP6 fragment layout. This is a re-quantization (E2M3 -> E2M1),
+// so it is strictly lossier than converting from the original bf16; the converter path
+// is the quality answer. It exists because it needs no re-conversion of the 22.6 GB
+// .tqf and makes the tier measurable today -- exactly the precedent TQ_W_E2M1 set.
+
+// One fp32 global per 128-row block, chosen so the per-16 ue4m3 scales sit near 2^0
+// (ue4m3 spans 2^-6..2^8, so centring costs no dynamic range and avoids clipping).
+__global__ void k_tq_nvf4_global_from_e2m3(float *wglobal, const uint32_t *src,
+                                           int M, int K, int Kt, int scale_cols,
+                                           const float *scale_old, int nrb) {
+    int rb = blockIdx.x;
+    if (rb >= nrb) return;
+    __shared__ float red[256];
+    float mx = 0.f;
+    for (long i = threadIdx.x; i < 128L * K; i += 256) {
+        int r = rb * 128 + (int)(i / K), k = (int)(i % K);
+        if (r < M && k < K) {
+            int scol = (scale_cols == (K + 31) / 32) ? (k >> 5) : (k >> 7);
+            float so = scale_old[(r >> 7) * scale_cols + scol];
+            mx = fmaxf(mx, fabsf(tq_e2m3_decode(tq_e2m3_code_at(src, Kt, r, k)) * so));
+        }
+    }
+    red[threadIdx.x] = mx;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) wglobal[rb] = (red[0] > 0.f) ? red[0] / 6.0f : 1.0f;
+}
+
+// One block (32 threads) per m16k64 output tile.
+__global__ void k_tq_nvf4_pack_w_from_e2m3(uint32_t *a, const float *wglobal,
+                                           const uint32_t *src, int M, int K, int Kt,
+                                           int scale_cols, const float *scale_old,
+                                           int Mt, int Kt64) {
+    long tile = (long)blockIdx.x;                      // (mt * Kt64 + kt)
+    if (tile >= (long)Mt * Kt64) return;
+    int mt = (int)(tile / Kt64), kt = (int)(tile % Kt64);
+    int lane = threadIdx.x;                            // 0..31
+    uint32_t *dst = a + tile * TQ_NVF4_AW;
+    float gs = wglobal[mt >> 3];
+
+    // dequantized source value at logical (row, k)
+    auto srcval = [&](int row, int k) -> float {
+        if (row >= M || k >= K) return 0.f;
+        int scol = (scale_cols == (K + 31) / 32) ? (k >> 5) : (k >> 7);
+        float so = scale_old[(row >> 7) * scale_cols + scol];
+        return tq_e2m3_decode(tq_e2m3_code_at(src, Kt, row, k)) * so;
+    };
+
+    // 1. per-(row, 16-k-group) ue4m3 scale. 16 rows x 4 groups; lanes 0..15 own a row.
+    __shared__ float sc[16][4];
+    if (lane < 16) {
+        int row = mt * 16 + lane;
+        uint32_t w = 0;
+        for (int g = 0; g < 4; g++) {
+            float mx = 0.f;
+            for (int t = 0; t < 16; t++)
+                mx = fmaxf(mx, fabsf(srcval(row, kt * 64 + g * 16 + t)));
+            uint8_t sb = tq_f2ue4m3(mx / 6.0f / gs);   // 6.0 = E2M1 max
+            if (sb == 0) sb = 1;                       // never a zero scale
+            w |= (uint32_t)sb << (8 * g);
+            sc[lane][g] = tq_ue4m3_to_f(sb) * gs;      // the value the MMA will use
+        }
+        dst[128 + lane] = w;
+    }
+    __syncthreads();
+
+    // 2. codes, in the exact slot order the MMA reads them.
+    uint32_t words[4] = {0, 0, 0, 0};
+    for (int reg = 0; reg < 4; reg++) {
+        int row = tq_nvf4_a_row(lane, reg);
+        for (int j = 0; j < 8; j++) {
+            int k = tq_nvf4_a_k(lane, reg, j);
+            float v = srcval(mt * 16 + row, kt * 64 + k);
+            float s = sc[row][k >> 4];
+            words[reg] |= tq_quant_e2m1_code(s > 0.f ? v / s : 0.f) << (4 * j);
+        }
+    }
+    #pragma unroll
+    for (int reg = 0; reg < 4; reg++) dst[lane * 4 + reg] = words[reg];
+}
+
+// Activations: X is [nvar][K] token-major fp32 (the engine's wide activation pack).
+// Per-16 ue4m3 with NO global scale -- ue4m3's 2^-6..2^8 already covers post-RMSNorm
+// activations, and a per-column global would not fold out of the K sum anyway.
+// One block (32 threads) per n8k64 tile; lanes 0..7 own a column.
+__global__ void k_tq_nvf4_quant_x(uint32_t *b, const float *X, int nvar, int K,
+                                  int NGgroups, int Kt64) {
+    long tile = (long)blockIdx.x;                      // (g8 * Kt64 + kt)
+    if (tile >= (long)NGgroups * Kt64) return;
+    int g8 = (int)(tile / Kt64), kt = (int)(tile % Kt64);
+    int lane = threadIdx.x;
+    uint32_t *dst = b + tile * TQ_NVF4_BW;
+    __shared__ float sc[8][4];
+    if (lane < 8) {
+        int col = g8 * 8 + lane;
+        uint32_t w = 0;
+        for (int g = 0; g < 4; g++) {
+            float mx = 0.f;
+            for (int t = 0; t < 16; t++) {
+                int k = kt * 64 + g * 16 + t;
+                float v = (col < nvar && k < K) ? X[(size_t)col * K + k] : 0.f;
+                mx = fmaxf(mx, fabsf(v));
+            }
+            uint8_t sb = tq_f2ue4m3(mx / 6.0f);
+            if (sb == 0) sb = 1;
+            w |= (uint32_t)sb << (8 * g);
+            sc[lane][g] = tq_ue4m3_to_f(sb);
+        }
+        dst[64 + lane] = w;
+    }
+    __syncthreads();
+    uint32_t words[2] = {0, 0};
+    int col = g8 * 8 + (lane >> 2);
+    for (int reg = 0; reg < 2; reg++) {
+        for (int j = 0; j < 8; j++) {
+            int k = tq_nvf4_b_k(lane, reg, j);
+            int gk = kt * 64 + k;
+            float v = (col < nvar && gk < K) ? X[(size_t)col * K + gk] : 0.f;
+            float s = sc[lane >> 2][k >> 4];
+            words[reg] |= tq_quant_e2m1_code(s > 0.f ? v / s : 0.f) << (4 * j);
+        }
+    }
+    dst[lane * 2 + 0] = words[0];
+    dst[lane * 2 + 1] = words[1];
+}
+
 // One block per 128x128 weight block -> pow2 ue8m0 scale_inv targeting E2M3 (7.5).
 __global__ void k_tq_block_absmax_pow2_e2m3(const uint16_t *bf16, int M, int K,
                                             int scale_cols, float *scale_inv) {
@@ -11710,6 +12354,379 @@ static void maybe_e2m1_convert_all(void) {
             env, mlp, delta, attn, (before - g_qwen.device_bytes) >> 20);
 }
 
+// Any NVFP4 weight live? Flips the wide path from eager FP6 activation quantization to
+// per-weight lazy quantization (see wide_quant_input).
+static int g_nvf4_any = 0;
+
+// ---- TQ_W_NVFP4: convert selected dense E2M3 weights to the NVFP4 tier.
+// Selectors match TQ_W_E2M1: "all"/"1", "mlp", "delta", "attn", or fine-grained
+// "gate,up,down". Two shipped tiers the user asked for:
+//   TQ_W_NVFP4=all  -> full W4A4 (max throughput, largest quality cost)
+//   TQ_W_NVFP4=mlp  -> MLP-only FP4; attention + DeltaNet projections stay FP6.
+//                      The MLP is ~70% of both FLOPs and weight bytes, so this keeps
+//                      most of the win at a fraction of the quality cost -- structurally
+//                      what unsloth's mixed W8A8+W4A4 checkpoint does.
+// Unlike TQ_W_E2M1 (4-bit codes embedded in the k32 mxf8f6f4 MMA = memory win, ZERO
+// compute win) this tier reaches the k64 mxf4nvf4 instruction, so it wins both.
+static int nvf4_convert_weight(tq_qmma_weight_t *w, const char *what) {
+    if (!w->d_A || !w->e2m3 || w->e2m1 || w->e2m3_byte || w->row_major || w->word_major)
+        return 0;
+    if (w->nvf4) return 0;
+    if (w->has_sparse) { fprintf(stderr, "TQ_W_NVFP4: %s has sparse payload, skipped\n", what); return 0; }
+    if (w->K % 64 != 0 || w->M % 16 != 0) {
+        fprintf(stderr, "TQ_W_NVFP4: %s dims %dx%d not k64/m16 aligned, skipped\n", what, w->M, w->K);
+        return 0;
+    }
+    const int M = w->M, K = w->K, Mt = w->Mt, Kt = w->Kt, Kt64 = K / 64;
+    const int nrb = (M + 127) / 128;
+    const size_t abytes = (size_t)Mt * Kt64 * TQ_NVF4_AW * sizeof(uint32_t);
+    uint32_t *d_a = NULL; float *d_g = NULL;
+    if (cudaMalloc(&d_a, abytes) != cudaSuccess) {
+        fprintf(stderr, "TQ_W_NVFP4: OOM (%zu MB) on %s\n", abytes >> 20, what); return 0;
+    }
+    if (cudaMalloc(&d_g, (size_t)nrb * sizeof(float)) != cudaSuccess) {
+        cudaFree(d_a); fprintf(stderr, "TQ_W_NVFP4: OOM on %s globals\n", what); return 0;
+    }
+    k_tq_nvf4_global_from_e2m3<<<nrb, 256, 0, g_qwen.stream>>>(
+        d_g, (const uint32_t *)w->d_A, M, K, Kt, w->scale_cols, w->d_block_scale_inv, nrb);
+    k_tq_nvf4_pack_w_from_e2m3<<<(unsigned)((size_t)Mt * Kt64), 32, 0, g_qwen.stream>>>(
+        d_a, d_g, (const uint32_t *)w->d_A, M, K, Kt, w->scale_cols, w->d_block_scale_inv,
+        Mt, Kt64);
+    if (cudaStreamSynchronize(g_qwen.stream) != cudaSuccess) {
+        fprintf(stderr, "TQ_W_NVFP4: repack failed on %s: %s\n", what,
+                cudaGetErrorString(cudaGetLastError()));
+        cudaFree(d_a); cudaFree(d_g); return 0;
+    }
+    // FP6 payload + its block scales are dead once NVFP4 is live: 384 B/m16k32 tile
+    // (= 768 B per m16k64) plus scale_rows*scale_cols floats, replaced by 576 B.
+    size_t freed = (size_t)Mt * Kt * 384u
+                 + (size_t)w->scale_rows * w->scale_cols * sizeof(float);
+    cudaFree(w->d_A);
+    cudaFree(w->d_block_scale_inv);
+    w->d_A = NULL;
+    w->d_block_scale_inv = NULL;
+    w->d_nvf4_a = d_a;
+    w->d_nvf4_global = d_g;
+    w->nvf4 = 1;
+    w->Kt64 = Kt64;
+    g_qwen.device_bytes -= freed;
+    g_qwen.device_bytes += abytes + (size_t)nrb * sizeof(float);
+    return 1;
+}
+
+static void maybe_nvf4_convert_all(void) {
+    const char *env = getenv("TQ_W_NVFP4");
+    if (!env || !env[0] || !strcmp(env, "0")) return;
+    int mlp = 0, delta = 0, attn = 0;
+    if (!strcmp(env, "1") || strstr(env, "all")) mlp = delta = attn = 1;
+    if (strstr(env, "mlp")) mlp = 1;
+    if (strstr(env, "delta")) delta = 1;
+    if (strstr(env, "attn")) attn = 1;
+    int gate = mlp || strstr(env, "gate") != NULL;
+    int up   = mlp || strstr(env, "up") != NULL;
+    int down = mlp || strstr(env, "down") != NULL;
+    size_t before = g_qwen.device_bytes;
+    int n = 0;
+    for (int i = 0; i < g_qwen.L; i++) {
+        tq_layer_t *l = &g_qwen.layers[i];
+        if (gate) n += nvf4_convert_weight(&l->mlp_gate, "mlp_gate");
+        if (up)   n += nvf4_convert_weight(&l->mlp_up, "mlp_up");
+        if (down) n += nvf4_convert_weight(&l->mlp_down, "mlp_down");
+        if (delta) {
+            n += nvf4_convert_weight(&l->linear_in_qkv, "linear_in_qkv");
+            n += nvf4_convert_weight(&l->linear_in_z, "linear_in_z");
+            n += nvf4_convert_weight(&l->linear_in_b, "linear_in_b");
+            n += nvf4_convert_weight(&l->linear_in_a, "linear_in_a");
+            n += nvf4_convert_weight(&l->linear_out, "linear_out");
+        }
+        if (attn) {
+            n += nvf4_convert_weight(&l->q_proj, "q_proj");
+            n += nvf4_convert_weight(&l->k_proj, "k_proj");
+            n += nvf4_convert_weight(&l->v_proj, "v_proj");
+            n += nvf4_convert_weight(&l->o_proj, "o_proj");
+        }
+    }
+    g_nvf4_any = (n > 0);
+    fprintf(stderr, "TQ_W_NVFP4=%s (mlp=%d delta=%d attn=%d): %d weights -> NVFP4 W4A4 "
+                    "(4.50 bits/w vs 6.00), %zu MB device -> %zu MB (-%zu MB)\n",
+            env, mlp, delta, attn, n, before >> 20, g_qwen.device_bytes >> 20,
+            (before - g_qwen.device_bytes) >> 20);
+}
+
+// ---- NVFP4 launcher. Column tile is fixed at 256 (NG=32): that is the widest the
+// 128-accumulator register budget allows and also where the kernel peaks, so the host
+// tiles wider N into 256-column passes. At 27B shapes a second 256-column pass re-reads
+// the weight from L2 (50 MB weight vs 96 MB L2), not DRAM, so the tiling is ~free --
+// measured flat from N=256 to N=512 (959 -> 954 TF on gate/up).
+#define TQ_NVF4_TILE 256
+
+static uint32_t *g_nvf4_b = NULL;      // quantized activation tiles
+static size_t g_nvf4_b_words = 0;
+static float *g_nvf4_part = NULL;      // split-K partials
+static size_t g_nvf4_part_floats = 0;
+
+static int tq_nvf4_wide_ng(int n) { int g = (n + 7) / 8, ng = 1; while (ng < g) ng <<= 1; return ng; }
+
+static int tq_nvf4_stages(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("TQ_NVFP4_STAGES");
+        cached = e ? atoi(e) : 3;
+        if (cached < 2) cached = 2;
+        if (cached > 5) cached = 5;
+    }
+    return cached;
+}
+
+// One CTA per (128-row block, split). Pick the largest split that fills 170 SMs without
+// starving a CTA of K-work (it needs at least one full pipeline's worth of stages).
+static int tq_nvf4_ksplits(int Mt, int Kt64, int stages) {
+    int mb = (Mt + 7) / 8, best = 1;
+    for (int s = 1; s <= 8; s <<= 1) {
+        if (Kt64 % (2 * s) != 0) continue;
+        if (Kt64 / s < 2 * stages) continue;
+        if ((long)mb * s > 8192) continue;
+        best = s;
+        if ((long)mb * s >= 170) break;
+    }
+    return best;
+}
+
+// WM is NOT free: the 8 warps split as WM(M) x (8/WM)(N), so the warp column count
+// 8/WM must be <= NG or the high-wn warps index past the end of the B stage buffer
+// (a silent out-of-bounds shared read -- the numeric gate caught exactly this at N=8).
+// NG=1 -> WM=8, NG=2 -> WM=4, NG>=4 -> WM=2 (the squarest tile that fits, fewest
+// shared loads per MMA).
+#define TQ_NVF4_ARGS dst, w->d_nvf4_a, b, w->d_nvf4_global, M, Mt, Kt64, nvar, per, ks
+#define TQ_NVF4_DISPATCH_G(S) switch (G) {                                                    \
+    case 1:  k_tq_nvf4_gemm<1, S,8><<<gr,256,bytes,st>>>(TQ_NVF4_ARGS); break;                \
+    case 2:  k_tq_nvf4_gemm<2, S,4><<<gr,256,bytes,st>>>(TQ_NVF4_ARGS); break;                \
+    case 4:  k_tq_nvf4_gemm<4, S,2><<<gr,256,bytes,st>>>(TQ_NVF4_ARGS); break;                \
+    case 8:  k_tq_nvf4_gemm<8, S,2><<<gr,256,bytes,st>>>(TQ_NVF4_ARGS); break;                \
+    case 16: k_tq_nvf4_gemm<16,S,2><<<gr,256,bytes,st>>>(TQ_NVF4_ARGS); break;                \
+    default: k_tq_nvf4_gemm<32,S,2><<<gr,256,bytes,st>>>(TQ_NVF4_ARGS); break; }
+
+// out is [nvar][M] column-major, same convention as the FP6 wide GEMM output.
+static int launch_nvf4_gemm(float *out, const tq_qmma_weight_t *w, const uint32_t *b,
+                            int nvar, int ks, cudaStream_t st) {
+    const int M = w->M, Mt = w->Mt, Kt64 = w->Kt64;
+    const int stages = tq_nvf4_stages();
+    const int G = tq_nvf4_wide_ng(nvar < TQ_NVF4_TILE ? nvar : TQ_NVF4_TILE);
+    const size_t bytes = (size_t)stages * (8 * 2 * TQ_NVF4_AW + G * 2 * TQ_NVF4_BW) * 4;
+    const int per = (ks == 1) ? Kt64 : Kt64 / ks;
+    float *dst = out;
+    if (ks > 1) {
+        size_t need = (size_t)ks * nvar * M;
+        if (need > g_nvf4_part_floats) {
+            if (g_nvf4_part) cudaFree(g_nvf4_part);
+            if (cudaMalloc(&g_nvf4_part, need * sizeof(float)) != cudaSuccess) {
+                g_nvf4_part = NULL; g_nvf4_part_floats = 0; return -91;
+            }
+            g_nvf4_part_floats = need;
+        }
+        dst = g_nvf4_part;
+    }
+    // Opt-in dynamic smem, once per stage count, for exactly the (NG,WM) pairs the
+    // dispatch can launch. The NG=32 budget dominates, so one size covers all.
+    static int primed[6] = {0, 0, 0, 0, 0, 0};
+    if (!primed[stages]) {
+        size_t mx = (size_t)stages * (8 * 2 * TQ_NVF4_AW + 32 * 2 * TQ_NVF4_BW) * 4;
+        #define TQ_NVF4_PRIME(NGV, WMV) do {                                              \
+            cudaFuncSetAttribute(k_tq_nvf4_gemm<NGV, 2, WMV>,                             \
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)mx);   \
+            cudaFuncSetAttribute(k_tq_nvf4_gemm<NGV, 3, WMV>,                             \
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)mx);   \
+        } while (0)
+        TQ_NVF4_PRIME(1, 8); TQ_NVF4_PRIME(2, 4); TQ_NVF4_PRIME(4, 2);
+        TQ_NVF4_PRIME(8, 2); TQ_NVF4_PRIME(16, 2); TQ_NVF4_PRIME(32, 2);
+        #undef TQ_NVF4_PRIME
+        cudaGetLastError();
+        primed[stages] = 1;
+    }
+    dim3 gr((Mt + 7) / 8, ks);
+    if (stages == 2)      { TQ_NVF4_DISPATCH_G(2) }
+    else                  { TQ_NVF4_DISPATCH_G(3) }
+    if (ks > 1) {
+        size_t n = (size_t)nvar * M;
+        k_tq_nvf4_reduce<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(out, g_nvf4_part, (int)n, ks);
+    }
+    return 0;
+}
+
+// The activation quantization is memoized: several projections consume the SAME
+// post-norm activation (gate+up; qkv+z+b+a), so quantizing once per activation instead
+// of once per projection removes 1 of 2 (MLP) or 3 of 4 (DeltaNet in) redundant passes.
+// Pointer equality alone is NOT a safe memo key -- g_wide_norm is reused every layer
+// with new contents -- so the memo is invalidated explicitly by wide_quant_input, which
+// is called exactly when a new activation has been produced.
+static const float *g_nvf4_qsrc = NULL;
+static int g_nvf4_qK = 0, g_nvf4_qN = 0, g_nvf4_qvalid = 0;
+
+static void nvf4_quant_invalidate(void) { g_nvf4_qvalid = 0; }
+
+// Quantize the whole [N][K] activation into fragment-native tiles. Space is rounded up
+// to whole 32-group (256-column) tiles so every host column tile starts on a tile
+// boundary and the GEMM's power-of-two NG never reads past what was written.
+static int nvf4_quant_ensure(const float *d_x, int K, int N, cudaStream_t st) {
+    if (g_nvf4_qvalid && g_nvf4_qsrc == d_x && g_nvf4_qK == K && g_nvf4_qN == N) return 0;
+    if (K % 64 != 0) return -93;
+    const int Kt64 = K / 64;
+    const int ntiles = (N + TQ_NVF4_TILE - 1) / TQ_NVF4_TILE;
+    const size_t Gtot = (size_t)ntiles * (TQ_NVF4_TILE / 8);
+    const size_t bw = Gtot * Kt64 * TQ_NVF4_BW;
+    if (bw > g_nvf4_b_words) {
+        if (g_nvf4_b) cudaFree(g_nvf4_b);
+        if (cudaMalloc(&g_nvf4_b, bw * sizeof(uint32_t)) != cudaSuccess) {
+            g_nvf4_b = NULL; g_nvf4_b_words = 0; return -92;
+        }
+        g_nvf4_b_words = bw;
+    }
+    const int ng8 = (N + 7) / 8;
+    if ((size_t)ng8 < Gtot)     // padding groups must read ZERO, not stale bytes
+        cudaMemsetAsync(g_nvf4_b + (size_t)ng8 * Kt64 * TQ_NVF4_BW, 0,
+                        (Gtot - (size_t)ng8) * Kt64 * TQ_NVF4_BW * sizeof(uint32_t), st);
+    k_tq_nvf4_quant_x<<<(unsigned)((size_t)ng8 * Kt64), 32, 0, st>>>(
+        g_nvf4_b, d_x, N, K, ng8, Kt64);
+    g_nvf4_qsrc = d_x; g_nvf4_qK = K; g_nvf4_qN = N; g_nvf4_qvalid = 1;
+    return 0;
+}
+
+// GEMM against the already-quantized activation, tiling columns at TQ_NVF4_TILE.
+static int nvf4_gemm_tiled(const tq_qmma_weight_t *w, float *out, int nvar,
+                           cudaStream_t st) {
+    if (!w->nvf4 || !w->d_nvf4_a) return -90;
+    const int Kt64 = w->Kt64;
+    const int ks = tq_nvf4_ksplits(w->Mt, Kt64, tq_nvf4_stages());
+    for (int off = 0; off < nvar; off += TQ_NVF4_TILE) {
+        const int nt = (nvar - off < TQ_NVF4_TILE) ? (nvar - off) : TQ_NVF4_TILE;
+        int rc = launch_nvf4_gemm(out + (size_t)off * w->M, w,
+                                  g_nvf4_b + (size_t)(off / 8) * Kt64 * TQ_NVF4_BW,
+                                  nt, ks, st);
+        if (rc != 0) return rc;
+    }
+    return 0;
+}
+
+static int nvf4_proj(const tq_qmma_weight_t *w, const float *d_x, float *out, int nvar,
+                     cudaStream_t st) {
+    if (!w->nvf4 || !w->d_nvf4_a) return -90;
+    int rc = nvf4_quant_ensure(d_x, w->K, nvar, st);
+    if (rc != 0) return rc;
+    return nvf4_gemm_tiled(w, out, nvar, st);
+}
+
+// Deterministic synthetic activations for the gate (no host transfer, reproducible).
+__global__ void k_tq_nvf4_fill_x(float *x, long n, unsigned salt) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    unsigned h = (unsigned)i * 2654435761u + salt * 40503u + 1013904223u;
+    h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
+    x[i] = ((float)(h & 0xffffu) / 32768.0f) - 1.0f;
+}
+
+// Reference: decode the PACKED NVFP4 bytes back and contract in DOUBLE. Validates the
+// fragment layout, the scale-group mapping and the MMA all at once -- this is the check
+// that caught my scale bytes being a permutation of the hardware's k-groups (a uniform
+// ~11% error that looked like a numerics problem, not a layout bug). One thread per
+// sampled output element.
+__global__ void k_tq_nvf4_ref(float *out, const uint32_t *a, const uint32_t *b,
+                              const float *wglobal, int M, int Kt64, int nvar,
+                              int rowstep, int colstep, int Mr, int Nr) {
+    int ri = blockIdx.x, ci = blockIdx.y;
+    if (ri >= Mr || ci >= Nr) return;
+    int row = ri * rowstep, col = ci * colstep;
+    if (row >= M || col >= nvar) return;
+    int mt = row >> 4, rl = row & 15, g8 = col >> 3, cl = col & 7;
+    double acc = 0.0;
+    float gs = wglobal[mt >> 3];
+    const float e2m1[16] = { 0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f,
+                            -0.f, -.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f };
+    for (int kt = 0; kt < Kt64; kt++) {
+        const uint32_t *at = a + ((size_t)mt * Kt64 + kt) * TQ_NVF4_AW;
+        const uint32_t *bt = b + ((size_t)g8 * Kt64 + kt) * TQ_NVF4_BW;
+        uint32_t asf = at[128 + rl], bsf = bt[64 + cl];
+        for (int k = 0; k < 64; k++) {
+            int grp = k >> 4;
+            int la = (rl & 7) * 4 + 2 * ((k >> 4) & 1) + ((k >> 3) & 1);
+            int ra = (rl >> 3) | ((k >> 5) << 1);
+            float wc = e2m1[(at[la * 4 + ra] >> (4 * (k & 7))) & 0xF];
+            int lb = cl * 4 + 2 * ((k >> 4) & 1) + ((k >> 3) & 1);
+            int rb = k >> 5;
+            float xc = e2m1[(bt[lb * 2 + rb] >> (4 * (k & 7))) & 0xF];
+            float ws = tq_ue4m3_to_f((uint8_t)((asf >> (8 * grp)) & 0xFF));
+            float xs = tq_ue4m3_to_f((uint8_t)((bsf >> (8 * grp)) & 0xFF));
+            acc += (double)wc * ws * (double)xc * xs;
+        }
+    }
+    out[(size_t)ci * Mr + ri] = (float)(acc * gs);
+}
+
+// Pull the layer's NVFP4 weight by index, mirroring wide_gemm_pick's ordering.
+static const tq_qmma_weight_t *tq_nvf4_pick(int layer, int which) {
+    if (layer < 0 || layer >= g_qwen.L) return NULL;
+    tq_layer_t *l = &g_qwen.layers[layer];
+    switch (which) {
+        case 0: return &l->mlp_gate;
+        case 1: return &l->mlp_up;
+        case 2: return &l->mlp_down;
+        case 3: return &l->q_proj;
+        case 4: return &l->o_proj;
+        case 5: return &l->linear_in_qkv;
+        case 6: return &l->linear_in_z;
+        default: return NULL;
+    }
+}
+
+// TQ_W_NVFP4 numeric gate. Quantizes a deterministic synthetic activation, runs the
+// shipping nvf4_proj path, and compares a subsample against the fp64 decode reference.
+// Returns 0 and writes max |diff| / max |ref| into *max_rel.
+extern "C" int qwn_nvf4_check(int layer, int which, int N, float *max_rel) {
+    if (!g_qwen.initialized) return -1;
+    const tq_qmma_weight_t *w = tq_nvf4_pick(layer, which);
+    if (!w) return -2;
+    if (!w->nvf4 || !w->d_nvf4_a) return -3;
+    if (N < 8) N = 8;
+    if (N > TQ_NVF4_TILE) N = TQ_NVF4_TILE;
+    const int M = w->M, K = w->K, Kt64 = w->Kt64;
+    float *d_x = NULL, *d_out = NULL, *d_ref = NULL;
+    const int rowstep = (M / 16 > 0) ? (M / 16) : 1, colstep = (N / 8 > 0) ? (N / 8) : 1;
+    const int Mr = (M + rowstep - 1) / rowstep, Nr = (N + colstep - 1) / colstep;
+    if (cudaMalloc(&d_x, (size_t)N * K * sizeof(float)) != cudaSuccess) return -4;
+    if (cudaMalloc(&d_out, (size_t)N * M * sizeof(float)) != cudaSuccess) { cudaFree(d_x); return -4; }
+    if (cudaMalloc(&d_ref, (size_t)Mr * Nr * sizeof(float)) != cudaSuccess) {
+        cudaFree(d_x); cudaFree(d_out); return -4;
+    }
+    k_tq_nvf4_fill_x<<<(unsigned)(((size_t)N * K + 255) / 256), 256, 0, g_qwen.stream>>>(
+        d_x, (long)N * K, 1337u);
+    int rc = nvf4_proj(w, d_x, d_out, N, g_qwen.stream);
+    if (rc != 0) { cudaFree(d_x); cudaFree(d_out); cudaFree(d_ref); return rc; }
+    // the quantized B still sits in g_nvf4_b from the last tile (N <= TILE -> one tile)
+    k_tq_nvf4_ref<<<dim3(Mr, Nr), 1, 0, g_qwen.stream>>>(
+        d_ref, w->d_nvf4_a, g_nvf4_b, w->d_nvf4_global, M, Kt64, N,
+        rowstep, colstep, Mr, Nr);
+    if (cudaStreamSynchronize(g_qwen.stream) != cudaSuccess) {
+        cudaFree(d_x); cudaFree(d_out); cudaFree(d_ref); return -5;
+    }
+    float *h_ref = (float *)malloc((size_t)Mr * Nr * sizeof(float));
+    float *h_out = (float *)malloc((size_t)N * M * sizeof(float));
+    cudaMemcpy(h_ref, d_ref, (size_t)Mr * Nr * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_out, d_out, (size_t)N * M * sizeof(float), cudaMemcpyDeviceToHost);
+    double mx = 0.0, mag = 0.0;
+    for (int ci = 0; ci < Nr; ci++)
+        for (int ri = 0; ri < Mr; ri++) {
+            int row = ri * rowstep, col = ci * colstep;
+            if (row >= M || col >= N) continue;
+            double r = h_ref[(size_t)ci * Mr + ri];
+            double o = h_out[(size_t)col * M + row];
+            mx = fmax(mx, fabs(o - r));
+            mag = fmax(mag, fabs(r));
+        }
+    if (max_rel) *max_rel = (mag > 0.0) ? (float)(mx / mag) : 0.0f;
+    free(h_ref); free(h_out);
+    cudaFree(d_x); cudaFree(d_out); cudaFree(d_ref);
+    return 0;
+}
+
 extern "C" int qwn_init(const char *path) {
     int r = parse_tqf(path, 1);
     if (r != 0) return r;
@@ -11773,6 +12790,7 @@ extern "C" int qwn_init(const char *path) {
     }
     maybe_byte_convert_all();
     maybe_e2m1_convert_all();
+    maybe_nvf4_convert_all();   // after e2m1/byte: those tiers opt out of NVFP4
     maybe_ldsm_convert_all();
     {
         // Default ON since 2026-07-08: bit-exact by construction (deadlock-free
@@ -12558,8 +13576,11 @@ static int ensure_qmma_work_counter(void) {
     return 0;
 }
 
+// NVFP4 weights are deliberately EXCLUDED here: their FP6 payload (d_A) and block
+// scales are freed by the repack, so every FP6/E2M1 GEMM and GEMV path must refuse them
+// rather than dereference a NULL d_A. Only tq_wide_fmt_ok/wide_proj know about the tier.
 static int can_use_qmma_sf_weight(const tq_qmma_weight_t *w) {
-    return use_qmma_sf() && w->block_scaled;
+    return use_qmma_sf() && w->block_scaled && !w->nvf4;
 }
 
 static int can_share_qmma_sf_input(const tq_qmma_weight_t *base, const tq_qmma_weight_t *w) {
@@ -13232,6 +14253,7 @@ extern "C" int qwn_wide_gemm_check(int which, int N, float *max_abs_diff) {
     if (!can_use_qmma_sf_weight(w) || w->row_major || !w->e2m3) return -3;
     int K = w->K, M = w->M, Kt = w->Kt, G = (N + 7) / 8, nblocks = (K + 127) / 128;
     int k_splits = qmma_sf_k_split_auto(w->Mt, w->Kt);
+    { int t = tq_wide_gemm_ksplits(w->Mt, w->Kt, tq_wide_gemm_stages()); if (t > k_splits) k_splits = t; }
     if (run_qmma_projection_from_input_to_debug_out(w, g_qwen.d_debug_norm) != 0) return -4;
     if (cudaStreamSynchronize(g_qwen.stream) != cudaSuccess) return -5;
     float *ref = (float *)malloc((size_t)M * sizeof(float));
@@ -13282,6 +14304,7 @@ extern "C" int qwn_wide_gemm_bench(int which, int N, int iters,
     if (!can_use_qmma_sf_weight(w) || w->row_major || !w->e2m3) return -3;
     int K = w->K, M = w->M, Kt = w->Kt, G = (N + 7) / 8, nblocks = (K + 127) / 128;
     int k_splits = qmma_sf_k_split_auto(w->Mt, w->Kt);
+    { int t = tq_wide_gemm_ksplits(w->Mt, w->Kt, tq_wide_gemm_stages()); if (t > k_splits) k_splits = t; }
     float *d_x = NULL, *d_out = NULL, *d_bscale = NULL, *d_part = NULL; uint8_t *d_b = NULL;
     cudaMalloc(&d_x, (size_t)N * K * sizeof(float));
     cudaMalloc(&d_out, (size_t)N * M * sizeof(float));
@@ -14471,7 +15494,22 @@ extern "C" int qwn_debug_decode_layers(int token_id, int pos, int n_layers, floa
     return count;
 }
 
+// The single-token decode path is the fused persistent/GEMV route and reads w->d_A --
+// which the NVFP4 repack frees. Refuse CLEANLY here instead of letting it dereference a
+// freed payload (that surfaced as an illegal memory access three kernels later). NVFP4
+// today serves prefill and the batched/paged decode loops, which both go through
+// wide_proj; single-stream spec-decode needs TQ_W_NVFP4=0.
 extern "C" int qwn_decode(int token_id, int pos) {
+    if (g_nvf4_any) {
+        static int warned = 0;
+        if (!warned) {
+            fprintf(stderr, "qwn_decode: single-stream decode is not NVFP4-aware "
+                            "(the FP6 payload is freed by the TQ_W_NVFP4 repack). "
+                            "Use the batched/paged decode path, or set TQ_W_NVFP4=0.\n");
+            warned = 1;
+        }
+        return -120;
+    }
     int ret = run_decode_layers_to_debug_x(token_id, pos, g_qwen.L);
     if (ret != 0) return ret;
     ret = run_final_norm_device();
@@ -17287,14 +18325,45 @@ static int launch_deltanet_chunk(int ck, float *core_out, float *recurrent_state
 // this writes the RAW core and k_tq_deltanet_norm finalises it. Numerically
 // identical to k_tq_deltanet_chunk (same per-column math, same FP order per lane
 // group up to the G-split reduction order).
-template<int CK, int D, int NSTRIPE, int G>
-__global__ void k_tq_deltanet_chunk_hs(float *core_raw, float *recurrent_state,
+// D.3 rewrite (2026-08). Three changes, all BIT-EXACT vs the version this replaces:
+//
+//  (a) RECURRENT STATE LIVES IN REGISTERS across the whole N-token chunk. Each
+//      thread owns KPT = D/G rows of its value column, so the [D x SV] stripe is
+//      read from global ONCE at entry and written back ONCE at exit. Before, step 3
+//      re-read and step 8 re-read+wrote the full 32 KB stripe EVERY CK=8 tokens:
+//      at N=256 that is 32 sub-chunks x 96 KB = 3 MB per CTA, 288 MB per layer per
+//      wave, for a 3 MB working set. Same values in the same order -> same bits.
+//
+//  (b) THE PER-TOKEN PREP IS HOISTED AND PARALLELISED. The q/k inverse-L2 factors
+//      ran on CK=8 threads out of 512 (each looping d=0..127 over UNCOALESCED
+//      global reads) and the beta / cumulative-log-decay loop ran on thread 0
+//      alone -- both inside the sub-chunk loop, so 512-thread barriers serialised
+//      behind ~8 and ~1 active threads, 2 x N/CK times per launch. They are now a
+//      pre-pass over a super-chunk of up to NMAX tokens: one thread per token for
+//      the factors, one thread per sub-chunk for beta/la. Each item keeps its own
+//      serial accumulation order, so every value is bit-identical.
+//
+//  (c) NO IDLE-LANE PHASE. The (I+L)Delta=R substitution ran under `klane == 0`,
+//      i.e. 1 of G lanes, and Delta was then shuffle-broadcast. The G lanes of a
+//      column are in the same warp, so masking them off saves nothing -- the warp
+//      issues the same instructions either way. Reducing kS0/qS0 with an XOR
+//      butterfly instead of a shfl_down tree leaves every lane holding the value
+//      the old lane 0 held (same operands, same tree depth, only sibling operands
+//      commuted -- fp add is commutative), so all lanes can run the substitution
+//      and the broadcast disappears.
+//
+// Cross-value gated RMSNorm still cannot be done per stripe: this writes the RAW
+// core and k_tq_deltanet_norm finalises it.
+template<int CK, int D, int NSTRIPE, int G, int NMAX>
+__global__ __launch_bounds__((D / NSTRIPE) * G, 1)
+void k_tq_deltanet_chunk_hs(float *core_raw, float *recurrent_state,
                                        const float *qkv_conv,
                                        const float *b_proj, const float *a_proj,
                                        const float *A_log, const uint16_t *dt_bias,
                                        int N, int value_heads, int key_heads, int dim) {
     const int SV = D / NSTRIPE;                  // value columns per stripe
     const int BS = SV * G;                       // threads per block
+    const int KPT = D / G;                       // state rows held per thread
     int head = blockIdx.x / NSTRIPE;
     int stripe = blockIdx.x % NSTRIPE;
     if (head >= value_heads) return;
@@ -17312,89 +18381,111 @@ __global__ void k_tq_deltanet_chunk_hs(float *core_raw, float *recurrent_state,
     __shared__ float qn_sh[CK][D];
     __shared__ float Lmat[CK][CK];
     __shared__ float Amat[CK][CK];
-    __shared__ float la_sh[CK];
-    __shared__ float beta_sh[CK];
-    __shared__ float qfac[CK];
-    __shared__ float kfac[CK];
+    __shared__ float la_all[NMAX];
+    __shared__ float beta_all[NMAX];
+    __shared__ float qfac_all[NMAX];
+    __shared__ float kfac_all[NMAX];
 
     float Alog = A_log[head];
     float dtb  = tq_bf16_to_float(dt_bias[head]);
-    float *state = recurrent_state + (size_t)head * D * D;
+    float *state = recurrent_state + (size_t)head * D * D;   // S[k][v] = state[k*D+v]
     const unsigned FULL = 0xffffffffu;
 
-    for (int s = 0; s < N; s += CK) {
-        int L = (N - s) < CK ? (N - s) : CK;
+    // (a) state stripe -> registers, once.
+    float S[KPT];
+    #pragma unroll
+    for (int i = 0; i < KPT; i++) S[i] = state[(size_t)(klane + i * G) * D + v];
 
-        // 1a. per-token q/k inverse-L2 factors (thread tid<L owns token tid).
-        if (tid < L) {
-            int t = s + tid;
-            const float *q = qkv_conv + (size_t)t * conv_dim + (size_t)key_head * D;
-            const float *k = qkv_conv + (size_t)t * conv_dim + key_dim + (size_t)key_head * D;
+    for (int s0 = 0; s0 < N; s0 += NMAX) {
+        const int NB = (N - s0) < NMAX ? (N - s0) : NMAX;
+
+        // (b1) per-token q/k inverse-L2 factors: one thread per token, same serial
+        //      d-order as the single-thread version -> bit-identical.
+        for (int t = tid; t < NB; t += BS) {
+            int gt = s0 + t;
+            const float *q = qkv_conv + (size_t)gt * conv_dim + (size_t)key_head * D;
+            const float *k = qkv_conv + (size_t)gt * conv_dim + key_dim + (size_t)key_head * D;
             float qss = 0.0f, kss = 0.0f;
             for (int d = 0; d < D; d++) { float a = q[d]; qss += a * a; float b = k[d]; kss += b * b; }
-            qfac[tid] = rsqrtf(qss + 1.0e-6f) * rsqrtf((float)D);
-            kfac[tid] = rsqrtf(kss + 1.0e-6f);
+            qfac_all[t] = rsqrtf(qss + 1.0e-6f) * rsqrtf((float)D);
+            kfac_all[t] = rsqrtf(kss + 1.0e-6f);
         }
-        if (tid == 0) {
+        // (b2) beta + cumulative log-decay: one thread per sub-chunk, and la still
+        //      accumulates serially from the sub-chunk start -> bit-identical.
+        const int nsub = (NB + CK - 1) / CK;
+        for (int si = tid; si < nsub; si += BS) {
+            int base = si * CK;
+            int L = (NB - base) < CK ? (NB - base) : CK;
             float cum = 0.0f;
             for (int j = 0; j < L; j++) {
-                int t = s + j;
-                float bb = b_proj[(size_t)t * value_heads + head];
-                float sp_arg = a_proj[(size_t)t * value_heads + head] + dtb;
+                int gt = s0 + base + j;
+                float bb = b_proj[(size_t)gt * value_heads + head];
+                float sp_arg = a_proj[(size_t)gt * value_heads + head] + dtb;
                 float sp = log1pf(expf(-fabsf(sp_arg))) + fmaxf(sp_arg, 0.0f);
                 cum += -expf(Alog) * sp;
-                beta_sh[j] = 1.0f / (1.0f + expf(-bb));
-                la_sh[j] = cum;
+                beta_all[base + j] = 1.0f / (1.0f + expf(-bb));
+                la_all[base + j] = cum;
             }
-        }
-        __syncthreads();
-        // 1b. normalised q/k for every (token,dim) -- flat over all BS threads.
-        for (int idx = tid; idx < L * D; idx += BS) {
-            int j = idx / D, d = idx % D;
-            int t = s + j;
-            qn_sh[j][d] = qkv_conv[(size_t)t * conv_dim + (size_t)key_head * D + d] * qfac[j];
-            kn_sh[j][d] = qkv_conv[(size_t)t * conv_dim + key_dim + (size_t)key_head * D + d] * kfac[j];
-        }
-        __syncthreads();
-        // 2. decayed inner-product matrices L and A.
-        for (int idx = tid; idx < L * L; idx += BS) {
-            int j = idx / L, m = idx % L;
-            float dkk = 0.0f, dqk = 0.0f;
-            #pragma unroll 4
-            for (int d = 0; d < D; d++) {
-                float knm = kn_sh[m][d];
-                dkk += kn_sh[j][d] * knm;
-                dqk += qn_sh[j][d] * knm;
-            }
-            float decay = (m <= j) ? expf(la_sh[j] - la_sh[m]) : 0.0f;
-            Lmat[j][m] = (m < j)  ? beta_sh[j] * decay * dkk : 0.0f;
-            Amat[j][m] = (m <= j) ? decay * dqk : 0.0f;
         }
         __syncthreads();
 
-        // 3. kS0[j], qS0[j] for column v -- G lanes split the head-dim contraction.
-        float kS0[CK], qS0[CK];
-        #pragma unroll
-        for (int j = 0; j < CK; j++) { kS0[j] = 0.0f; qS0[j] = 0.0f; }
-        for (int k = klane; k < D; k += G) {
-            float sval = state[(size_t)k * D + v];
-            for (int j = 0; j < L; j++) {
-                kS0[j] += kn_sh[j][k] * sval;
-                qS0[j] += qn_sh[j][k] * sval;
-            }
-        }
-        #pragma unroll
-        for (int off = G >> 1; off > 0; off >>= 1)
-            for (int j = 0; j < L; j++) {
-                kS0[j] += __shfl_down_sync(FULL, kS0[j], off, G);
-                qS0[j] += __shfl_down_sync(FULL, qS0[j], off, G);
-            }
+        for (int sb = 0; sb < NB; sb += CK) {
+            const int L = (NB - sb) < CK ? (NB - sb) : CK;
+            const float *la_sh = la_all + sb;
+            const float *beta_sh = beta_all + sb;
 
-        float Dl[CK];
-        if (klane == 0) {
+            // 1b. normalised q/k for every (token,dim) -- flat over all BS threads.
+            for (int idx = tid; idx < L * D; idx += BS) {
+                int j = idx / D, d = idx % D;
+                int gt = s0 + sb + j;
+                qn_sh[j][d] = qkv_conv[(size_t)gt * conv_dim + (size_t)key_head * D + d] * qfac_all[sb + j];
+                kn_sh[j][d] = qkv_conv[(size_t)gt * conv_dim + key_dim + (size_t)key_head * D + d] * kfac_all[sb + j];
+            }
+            __syncthreads();
+            // 2. decayed inner-product matrices L and A (one thread per (j,m) pair,
+            //    serial over d -> unchanged order).
+            for (int idx = tid; idx < L * L; idx += BS) {
+                int j = idx / L, m = idx % L;
+                float dkk = 0.0f, dqk = 0.0f;
+                #pragma unroll 4
+                for (int d = 0; d < D; d++) {
+                    float knm = kn_sh[m][d];
+                    dkk += kn_sh[j][d] * knm;
+                    dqk += qn_sh[j][d] * knm;
+                }
+                float decay = (m <= j) ? expf(la_sh[j] - la_sh[m]) : 0.0f;
+                Lmat[j][m] = (m < j)  ? beta_sh[j] * decay * dkk : 0.0f;
+                Amat[j][m] = (m <= j) ? decay * dqk : 0.0f;
+            }
+            __syncthreads();
+
+            // 3. kS0[j], qS0[j] for column v, from the REGISTER state. The XOR
+            //    butterfly leaves the old lane-0 sum in every lane (see (c)).
+            float kS0[CK], qS0[CK];
+            #pragma unroll
+            for (int j = 0; j < CK; j++) { kS0[j] = 0.0f; qS0[j] = 0.0f; }
+            #pragma unroll
+            for (int i = 0; i < KPT; i++) {
+                float sval = S[i];
+                int k = klane + i * G;
+                for (int j = 0; j < L; j++) {
+                    kS0[j] += kn_sh[j][k] * sval;
+                    qS0[j] += qn_sh[j][k] * sval;
+                }
+            }
+            #pragma unroll
+            for (int off = G >> 1; off > 0; off >>= 1)
+                for (int j = 0; j < L; j++) {
+                    kS0[j] += __shfl_xor_sync(FULL, kS0[j], off, G);
+                    qS0[j] += __shfl_xor_sync(FULL, qS0[j], off, G);
+                }
+
+            // 4-7. R, the forward-substitution solve, and the causal core. Every
+            //      lane of the column runs this on identical inputs.
+            float Dl[CK];
             for (int j = 0; j < L; j++) {
-                int t = s + j;
-                float vv = qkv_conv[(size_t)t * conv_dim + 2 * key_dim + (size_t)head * D + v];
+                int gt = s0 + sb + j;
+                float vv = qkv_conv[(size_t)gt * conv_dim + 2 * key_dim + (size_t)head * D + v];
                 Dl[j] = beta_sh[j] * (vv - expf(la_sh[j]) * kS0[j]);
             }
             for (int j = 1; j < L; j++) {
@@ -17402,26 +18493,32 @@ __global__ void k_tq_deltanet_chunk_hs(float *core_raw, float *recurrent_state,
                 for (int m = 0; m < j; m++) acc -= Lmat[j][m] * Dl[m];
                 Dl[j] = acc;
             }
-            for (int j = 0; j < L; j++) {
-                float acc = expf(la_sh[j]) * qS0[j];
-                for (int i = 0; i <= j; i++) acc += Amat[j][i] * Dl[i];
-                // raw (un-normed) core for column v, token s+j
-                core_raw[(size_t)(s + j) * value_dim + (size_t)head * D + v] = acc;
+            if (klane == 0) {
+                for (int j = 0; j < L; j++) {
+                    float acc = expf(la_sh[j]) * qS0[j];
+                    for (int i = 0; i <= j; i++) acc += Amat[j][i] * Dl[i];
+                    // raw (un-normed) core for column v, token s0+sb+j
+                    core_raw[(size_t)(s0 + sb + j) * value_dim + (size_t)head * D + v] = acc;
+                }
             }
+            // 8. state carry, entirely in registers.
+            float la_last = la_sh[L - 1];
+            float gamma_last = expf(la_last);
+            float dec[CK];
+            for (int i = 0; i < L; i++) dec[i] = expf(la_last - la_sh[i]) * Dl[i];
+            #pragma unroll
+            for (int i = 0; i < KPT; i++) {
+                int k = klane + i * G;
+                float acc = gamma_last * S[i];
+                for (int j = 0; j < L; j++) acc += dec[j] * kn_sh[j][k];
+                S[i] = acc;
+            }
+            __syncthreads();
         }
-        // 8. state carry -- broadcast Delta from klane 0, lanes split the k write.
-        for (int i = 0; i < L; i++) Dl[i] = __shfl_sync(FULL, Dl[i], 0, G);
-        float la_last = la_sh[L - 1];
-        float gamma_last = expf(la_last);
-        float dec[CK];
-        for (int i = 0; i < L; i++) dec[i] = expf(la_last - la_sh[i]) * Dl[i];
-        for (int k = klane; k < D; k += G) {
-            float acc = gamma_last * state[(size_t)k * D + v];
-            for (int i = 0; i < L; i++) acc += dec[i] * kn_sh[i][k];
-            state[(size_t)k * D + v] = acc;
-        }
-        __syncthreads();
     }
+    // (a) advanced state stripe -> global, once.
+    #pragma unroll
+    for (int i = 0; i < KPT; i++) state[(size_t)(klane + i * G) * D + v] = S[i];
 }
 
 // Batched gated RMSNorm finaliser for the head-split path: one block per
@@ -17461,10 +18558,16 @@ static int launch_deltanet_chunk_hs(int ck, int nstripe, int g,
     if (dim != 128) return -100;
     int sv = dim / nstripe;
     dim3 grid(value_heads * nstripe), blk(sv * g);
-    #define TQ_LAUNCH_DNC_HS(CKV, NS, GG)                                              \
-        k_tq_deltanet_chunk_hs<CKV, 128, NS, GG><<<grid, blk, 0, st>>>(                 \
+    // NMAX = tokens covered by one prep pre-pass. Static smem is
+    // CK*D*2 (kn/qn) + CK*CK*2 (L/A) + NMAX*4 floats, and must stay under the
+    // 48 KB no-opt-in limit: CK=32 already spends 41 KB on the first two terms,
+    // so the wide (CK<=16) configs get NMAX=512 and CK=32 gets NMAX=CK, which
+    // degenerates the pre-pass back to one sub-chunk at a time.
+    #define TQ_LAUNCH_DNC_HS_N(CKV, NS, GG, NM)                                        \
+        k_tq_deltanet_chunk_hs<CKV, 128, NS, GG, NM><<<grid, blk, 0, st>>>(             \
             core_out, recurrent_state, qkv_conv, b_proj, a_proj,                        \
             A_log, dt_bias, N, value_heads, key_heads, dim)
+    #define TQ_LAUNCH_DNC_HS(CKV, NS, GG) TQ_LAUNCH_DNC_HS_N(CKV, NS, GG, 512)
     int ok = 0;
     if (ck == 16) {
         if      (nstripe == 1 && g == 4) TQ_LAUNCH_DNC_HS(16, 1, 4);
@@ -17492,11 +18595,12 @@ static int launch_deltanet_chunk_hs(int ck, int nstripe, int g,
         else if (nstripe == 4 && g == 8) TQ_LAUNCH_DNC_HS(4, 4, 8);
         else ok = -101;
     } else if (ck == 32) {
-        if      (nstripe == 2 && g == 4) TQ_LAUNCH_DNC_HS(32, 2, 4);
-        else if (nstripe == 4 && g == 8) TQ_LAUNCH_DNC_HS(32, 4, 8);
+        if      (nstripe == 2 && g == 4) TQ_LAUNCH_DNC_HS_N(32, 2, 4, 32);
+        else if (nstripe == 4 && g == 8) TQ_LAUNCH_DNC_HS_N(32, 4, 8, 32);
         else ok = -101;
     } else ok = -101;
     #undef TQ_LAUNCH_DNC_HS
+    #undef TQ_LAUNCH_DNC_HS_N
     if (ok != 0) return ok;
     k_tq_deltanet_norm<<<value_heads * N, dim, 0, st>>>(
         core_out, core_out, z, norm_weight, value_heads, dim, eps);
@@ -19489,16 +20593,22 @@ static int launch_batched_attn_q4(float *out, const float *q_proj, const uint16_
                                   size_t k4_stride, size_t kq4s_stride, size_t v8_stride, size_t vscale_stride,
                                   cudaStream_t st);
 
+// A weight is wide-eligible if it is FP6/E2M1 block-scaled OR NVFP4. NVFP4 is checked
+// FIRST because can_use_qmma_sf_weight() deliberately rejects it (its FP6 payload is
+// freed) -- the NVFP4 tier brings its own wide GEMM.
+static inline int tq_wide_fmt_ok(const tq_qmma_weight_t *w) {
+    if (w->nvf4) return w->d_nvf4_a != NULL;
+    return can_use_qmma_sf_weight(w) && !w->row_major && (w->e2m3 || w->e2m1);
+}
+
 // Wide MLP for a chunk of n tokens: post-rmsnorm(resid) -> gate/up (wide, shared B-frag)
 // -> silu*mul -> down (wide) -> layer_out = resid + down. resid and layer_out are [n x H]
 // (token-major); may NOT alias. Returns 0; -1 if mlp weights aren't e2m3-SF (caller falls back).
 static int wide_mlp(tq_layer_t *l, const float *resid, float *layer_out, int n) {
     int H = g_qwen.H, I = g_qwen.I;
-    if (!((l->mlp_gate.e2m3 || l->mlp_gate.e2m1) && (l->mlp_up.e2m3 || l->mlp_up.e2m1) &&
-          (l->mlp_down.e2m3 || l->mlp_down.e2m1) &&
-          can_use_qmma_sf_weight(&l->mlp_gate) && !l->mlp_gate.row_major &&
-          can_use_qmma_sf_weight(&l->mlp_down) && !l->mlp_down.row_major)) return -1;
-    k_tq_qwen_rmsnorm_b<<<dim3(8, n), 1024, 0, g_qwen.stream>>>(g_wide_pn, resid, l->d_post_ln, H, g_qwen.eps);
+    if (!(tq_wide_fmt_ok(&l->mlp_gate) && tq_wide_fmt_ok(&l->mlp_up) &&
+          tq_wide_fmt_ok(&l->mlp_down))) return -1;
+    k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(n), n), 1024, 0, g_qwen.stream>>>(g_wide_pn, resid, l->d_post_ln, H, g_qwen.eps);
     int ret = wide_quant_input(g_wide_pn, H, n);
     if (ret != 0) return ret;
     if ((ret = wide_proj(&l->mlp_gate, g_wide_gate, n)) != 0) return ret;
@@ -19516,9 +20626,25 @@ static int wide_mlp(tq_layer_t *l, const float *resid, float *layer_out, int n) 
 static uint8_t *g_wproj_b = NULL; static float *g_wproj_bscale = NULL, *g_wproj_part = NULL;
 static size_t g_wproj_b_bytes = 0, g_wproj_bscale_n = 0, g_wproj_part_bytes = 0;
 
+
+// run one wide projection from the prepared B-frag (call wide_quant_input first).
+// wide path accepts E2M3 (6-bit), E2M1 (4-bit via TQ_W_E2M1 repack) or NVFP4
+// (TQ_W_NVFP4) -- see tq_wide_fmt_ok above.
+
 // quantize activations [N x K] (token-major) -> B-frag groups in g_wproj_b (e4m3, shared
 // pow2 scale per 128-K block in g_wproj_bscale). Mirrors the bench path exactly.
-static int wide_quant_input(const float *d_x, int K, int N) {
+//
+// With an NVFP4 tier live the two formats need DIFFERENT activation quantizations from
+// the same post-norm buffer (FP6 wants per-128 pow2 e4m3, NVFP4 wants per-16 ue4m3), and
+// which one is needed depends on the weight, not the activation. So when any weight is
+// NVFP4 this only RECORDS the pending activation and wide_proj materialises whichever
+// form its weight consumes, memoized. That also drops the FP6 quantize entirely for
+// activations feeding only NVFP4 projections (~5.8% of prefill went to the quantizer).
+// With no NVFP4 weights it quantizes eagerly exactly as before.
+static const float *g_wq_pend_x = NULL;
+static int g_wq_pend_K = 0, g_wq_pend_N = 0, g_wq_fp6_done = 0;
+
+static int wide_quant_input_fp6(const float *d_x, int K, int N) {
     int Kt = (K + 31) / 32, G = wide_ng(N), nblocks = (K + 127) / 128;  // NG groups (pow2); extras zeroed
     size_t need_b = (size_t)G * Kt * 256;
     if (need_b > g_wproj_b_bytes) {
@@ -19536,18 +20662,42 @@ static int wide_quant_input(const float *d_x, int K, int N) {
     (void)nblocks;
     return 0;
 }
-
-// run one wide projection from the prepared B-frag (call wide_quant_input first).
-// wide path accepts E2M3 (6-bit) OR E2M1 (4-bit, throughput tier via TQ_W_E2M1 repack), both SF.
-static inline int tq_wide_fmt_ok(const tq_qmma_weight_t *w) {
-    return can_use_qmma_sf_weight(w) && !w->row_major && (w->e2m3 || w->e2m1);
+static int wide_quant_input(const float *d_x, int K, int N) {
+    g_wq_pend_x = d_x; g_wq_pend_K = K; g_wq_pend_N = N;
+    g_wq_fp6_done = 0;
+    nvf4_quant_invalidate();
+    if (!g_nvf4_any) {                     // default path: unchanged, eager
+        int rc = wide_quant_input_fp6(d_x, K, N);
+        if (rc == 0) g_wq_fp6_done = 1;
+        return rc;
+    }
+    return 0;
 }
 
+// run one wide projection from the prepared activation (call wide_quant_input first).
+// Weight format decides which activation quantization is materialised here.
 static int wide_proj(const tq_qmma_weight_t *w, float *out, int N) {
-    if (!can_use_qmma_sf_weight(w) || w->row_major || !(w->e2m3 || w->e2m1)) return -90;
-    int k_splits = qmma_sf_k_split_auto(w->Mt, w->Kt);
+    if (w->nvf4) {
+        if (!g_wq_pend_x || g_wq_pend_N != N || g_wq_pend_K != w->K) return -94;
+        int rc = nvf4_quant_ensure(g_wq_pend_x, g_wq_pend_K, N, g_qwen.stream);
+        if (rc != 0) return rc;
+        return nvf4_gemm_tiled(w, out, N, g_qwen.stream);
+    }
+    if (!tq_wide_fmt_ok(w)) return -90;
+    if (!g_wq_fp6_done) {
+        if (!g_wq_pend_x) return -94;
+        int rc = wide_quant_input_fp6(g_wq_pend_x, g_wq_pend_K, g_wq_pend_N);
+        if (rc != 0) return rc;
+        g_wq_fp6_done = 1;
+    }
+    // The tiled FP6 path picks its own split (single-wave rule, 1 CTA/SM) and tiles
+    // columns at TQ_WIDE_GEMM_TILE, so size the partial slab for whichever path runs.
+    const int tiled_fp6 = (!w->e2m1) && tq_wide_gemm_tiled();
+    int k_splits = tiled_fp6 ? tq_wide_gemm_ksplits(w->Mt, w->Kt, tq_wide_gemm_stages())
+                             : qmma_sf_k_split_auto(w->Mt, w->Kt);
     if (k_splits > 1) {
-        size_t need = (size_t)k_splits * N * w->M * sizeof(float);
+        int ncols = tiled_fp6 ? (N < TQ_WIDE_GEMM_TILE ? N : TQ_WIDE_GEMM_TILE) : N;
+        size_t need = (size_t)k_splits * ncols * w->M * sizeof(float);
         if (need > g_wproj_part_bytes) {
             if (g_wproj_part) cudaFree(g_wproj_part);
             if (cudaMalloc(&g_wproj_part, need) != cudaSuccess) return -91;
@@ -19568,14 +20718,11 @@ static int run_wide_chunk_forward(const int *tokens, int base_pos, int n) {
     if (ensure_float_buffer(&g_qwen.d_debug_core, &g_qwen.debug_core_count, attn_m, "d_debug_core") != 0) return -51;
     if (ensure_float_buffer(&g_qwen.d_debug_resid, &g_qwen.debug_resid_count, H, "d_debug_resid") != 0) return -51;
     if (ensure_attn_scores() != 0) return -52;
-    if (!g_wide_capture_mode) {   // host malloc + sync -> not capturable; skip during replay capture
-        int *hp = (int *)malloc((size_t)n * sizeof(int));
-        if (!hp) return -53;
-        for (int i = 0; i < n; i++) hp[i] = base_pos + 1 + i;   // token i -> absolute slot
-        cudaMemcpyAsync(g_wide_pos, hp, (size_t)n * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
-        cudaStreamSynchronize(g_qwen.stream);
-        free(hp);
-    }
+    // positions are an iota -- fill them on the device. The old host malloc + H2D +
+    // cudaStreamSynchronize drained the entire pipeline once per wave (8 full stalls
+    // in a 2048-token prefill) purely to know when the host buffer could be freed.
+    // The device fill is also graph-capturable, so the capture-mode guard is gone.
+    k_tq_fill_iota<<<(n + 255) / 256, 256, 0, g_qwen.stream>>>(g_wide_pos, base_pos + 1, n);
     int max_pos = base_pos + n;                                 // = positions[n-1]
     for (int i = 0; i < n; i++)
         k_tq_embed_lookup<<<(H + 255) / 256, 256, 0, g_qwen.stream>>>(
@@ -19588,9 +20735,9 @@ static int run_wide_chunk_forward(const int *tokens, int base_pos, int n) {
             // WIDE path (k_tq_fp6_wide_gemm, one weight read for all n tokens) when the
             // projections are e2m3-SF; otherwise per-token fallback. q/k norm is applied
             // later inside launch_wide_attn, so these are the raw projections.
-            if (l->q_proj.e2m3 && l->k_proj.e2m3 && l->v_proj.e2m3 &&
-                can_use_qmma_sf_weight(&l->q_proj) && !l->q_proj.row_major) {
-                k_tq_qwen_rmsnorm_b<<<dim3(8, n), 1024, 0, g_qwen.stream>>>(
+            if (tq_wide_fmt_ok(&l->q_proj) && tq_wide_fmt_ok(&l->k_proj) &&
+                tq_wide_fmt_ok(&l->v_proj)) {
+                k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(n), n), 1024, 0, g_qwen.stream>>>(
                     g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
                 if ((ret = wide_quant_input(g_wide_norm, H, n)) != 0) return -54;
                 if ((ret = wide_proj(&l->q_proj, g_wide_q, n)) != 0) return -54;
@@ -19624,8 +20771,8 @@ static int run_wide_chunk_forward(const int *tokens, int base_pos, int n) {
             }
             // (c) o_proj WIDE (+residual) then WIDE MLP -> updated hidden. o_proj input is
             // g_wide_core [n x attn_m]; resid = h + o_proj(core); then wide gate/up/down.
-            int wide_ok = l->o_proj.e2m3 && can_use_qmma_sf_weight(&l->o_proj) && !l->o_proj.row_major &&
-                          l->mlp_gate.e2m3 && l->mlp_down.e2m3;
+            int wide_ok = tq_wide_fmt_ok(&l->o_proj) && tq_wide_fmt_ok(&l->mlp_gate) &&
+                          tq_wide_fmt_ok(&l->mlp_down);
             if (wide_ok) {
                 if ((ret = wide_quant_input(g_wide_core, attn_m, n)) != 0) return -58;
                 if ((ret = wide_proj(&l->o_proj, g_wide_o, n)) != 0) return -58;
@@ -19651,11 +20798,12 @@ static int run_wide_chunk_forward(const int *tokens, int base_pos, int n) {
             // conv/recurrent state from i-1). Falls back to per-token decode otherwise.
             int lkh = g_qwen.linear_num_key_heads, lvh = g_qwen.linear_num_value_heads, ld = g_qwen.linear_value_head_dim;
             int value_dim = lvh * ld, key_dim = lkh * ld, conv_dim = 2 * key_dim + value_dim;
-            int lin_wide = l->linear_in_qkv.e2m3 && l->linear_in_z.e2m3 && l->linear_in_b.e2m3 &&
-                           l->linear_in_a.e2m3 && l->linear_out.e2m3 && l->mlp_gate.e2m3 && l->mlp_down.e2m3 &&
-                           can_use_qmma_sf_weight(&l->linear_in_qkv) && !l->linear_in_qkv.row_major;
+            int lin_wide = tq_wide_fmt_ok(&l->linear_in_qkv) && tq_wide_fmt_ok(&l->linear_in_z) &&
+                           tq_wide_fmt_ok(&l->linear_in_b) && tq_wide_fmt_ok(&l->linear_in_a) &&
+                           tq_wide_fmt_ok(&l->linear_out) && tq_wide_fmt_ok(&l->mlp_gate) &&
+                           tq_wide_fmt_ok(&l->mlp_down);
             if (lin_wide) {
-                k_tq_qwen_rmsnorm_b<<<dim3(8, n), 1024, 0, g_qwen.stream>>>(
+                k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(n), n), 1024, 0, g_qwen.stream>>>(
                     g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
                 if ((ret = wide_quant_input(g_wide_norm, H, n)) != 0) return -60;
                 if ((ret = wide_proj(&l->linear_in_qkv, g_wide_qkv, n)) != 0) return -60;
@@ -20458,7 +21606,7 @@ static int run_batched_decode_step_core(const int *tokens, const int *positions,
         if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION) {
             if (!(tq_wide_fmt_ok(&l->q_proj) && tq_wide_fmt_ok(&l->o_proj) &&
                   tq_wide_fmt_ok(&l->mlp_gate) && tq_wide_fmt_ok(&l->mlp_down))) return -20;
-            k_tq_qwen_rmsnorm_b<<<dim3(8, N), 1024, 0, g_qwen.stream>>>(
+            k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(N), N), 1024, 0, g_qwen.stream>>>(
                 g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, N)) != 0) return -21;
             if ((ret = wide_proj(&l->q_proj, g_wide_q, N)) != 0) return -21;
@@ -20484,7 +21632,7 @@ static int run_batched_decode_step_core(const int *tokens, const int *positions,
                   tq_wide_fmt_ok(&l->linear_in_b) && tq_wide_fmt_ok(&l->linear_in_a) &&
                   tq_wide_fmt_ok(&l->linear_out) && tq_wide_fmt_ok(&l->mlp_gate) &&
                   tq_wide_fmt_ok(&l->mlp_down))) return -30;
-            k_tq_qwen_rmsnorm_b<<<dim3(8, N), 1024, 0, g_qwen.stream>>>(
+            k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(N), N), 1024, 0, g_qwen.stream>>>(
                 g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, N)) != 0) return -31;
             if ((ret = wide_proj(&l->linear_in_qkv, g_wide_qkv, N)) != 0) return -31;
@@ -20508,7 +21656,7 @@ static int run_batched_decode_step_core(const int *tokens, const int *positions,
     }
     // final norm (wide) -> lm_head. Wide lm_head when it is e2m3-SF (one read for all N);
     // otherwise per-client fallback through the canonical single-stream lm_head argmax.
-    k_tq_qwen_rmsnorm_b<<<dim3(8, N), 1024, 0, g_qwen.stream>>>(
+    k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(N), N), 1024, 0, g_qwen.stream>>>(
         g_wide_norm, g_wide_h, g_qwen.d_norm, H, g_qwen.eps);
     int per_client_lm = getenv("TQ_BATCHED_LMHEAD_PERCLIENT") != NULL;
     if (!per_client_lm && !g_qwen.tie_word_embeddings &&
@@ -20873,6 +22021,203 @@ __global__ void k_tq_paged_attn_q4_split(
     if (tid == 0) { part_ml[pidx * 2 + 0] = m_run; part_ml[pidx * 2 + 1] = l_run; }
 }
 
+// ===========================================================================
+// E.gqa: GQA-SHARED paged decode attention.
+// ---------------------------------------------------------------------------
+// k_tq_paged_attn_q4_split above runs ONE CTA per (query head, column, split).
+// This model is nh=24 / nkv=4, so six CTAs independently stream the SAME KV
+// rows: the pool read is amplified 6x. At 1 client x 131072 positions the 16
+// full-attention layers hold 3.52 GiB of Q4 K + E4M3 V, and a decode step was
+// moving ~21 GiB of it -- 27 of the 46 ms.
+//
+// Here one CTA owns a (kv head, column, split) and carries the GQA query heads
+// that share it, so each K row and each V row is fetched once and fed to all
+// GQA of them. Everything else is preserved element-for-element:
+//   * Q norm/RoPE/FWHT run per head with the same arithmetic and the same
+//     256-thread reduction as the 1-head kernel.
+//   * the K dot keeps the e = 0..7 accumulation order, with the dequantized
+//     (code - zp) * scale hoisted out of the head loop (same expression).
+//   * the running max / denominator use the SAME 256-thread tree, just walked
+//     once for all GQA heads instead of GQA times.
+//   * the V fold is written `s * vcode * vscl` per head, NOT `s * (vcode*vscl)`,
+//     so the association matches the scalar kernel exactly.
+// Output layout is unchanged, so k_tq_paged_attn_q4_merge is reused verbatim.
+// ===========================================================================
+#define TQ_GQA_ATTN_CHUNK 512
+template <int GQA>
+__global__ __launch_bounds__(256, 1)
+void k_tq_paged_attn_q4_split_gqa(
+    const float *q_proj_base, const uint16_t *q_norm_w,
+    const uint8_t *k4_pool, const float *kq4s_pool, const uint8_t *v8_pool, const float *vscale_pool,
+    const int *positions, const int *slot_ids,
+    const int *block_table, int max_blocks, int page, int page_log,
+    int nh, int nkv, int hd, int q_m, int S,
+    float eps, float rope_theta, float *part_acc, float *part_ml) {
+    __shared__ float partial[8];
+    __shared__ float q_sum_shared;
+    __shared__ float qn[GQA][256];
+    __shared__ float s_chunk[GQA][TQ_GQA_ATTN_CHUNK];
+    __shared__ int   pr_chunk[TQ_GQA_ATTN_CHUNK];
+    __shared__ float red[GQA][256];
+    __shared__ float m_run[GQA], l_run[GQA], m_new_s[GQA], alpha_s[GQA], l_chunk_s[GQA];
+    const int kv_head = blockIdx.x, col = blockIdx.y, split = blockIdx.z, tid = threadIdx.x;
+    if (kv_head >= nkv || tid >= hd) return;
+    const int group = nh / nkv;                  // == GQA
+    const int pos = positions[col];
+    const int slot = slot_ids[col];
+    const int rotary_dim = 64;
+    const float *q_proj = q_proj_base + (size_t)col * q_m;
+
+    // ---- per-head Q prep (norm -> RoPE -> Hadamard), same math as the 1-head kernel
+    #pragma unroll
+    for (int g = 0; g < GQA; g++) {
+        int head = kv_head * group + g;
+        float qv = q_proj[head * (2 * hd) + tid];
+        float qsum = qv * qv;
+        for (int offset = 16; offset > 0; offset >>= 1) qsum += __shfl_down_sync(0xffffffff, qsum, offset);
+        if ((tid & 31) == 0) partial[tid >> 5] = qsum;
+        __syncthreads();
+        if (tid < 8) {
+            float vtmp = partial[tid];
+            for (int offset = 4; offset > 0; offset >>= 1) vtmp += __shfl_down_sync(0xff, vtmp, offset);
+            if (tid == 0) q_sum_shared = vtmp;
+        }
+        __syncthreads();
+        float rms = rsqrtf(q_sum_shared / (float)hd + eps);
+        qv = qv * rms * (1.0f + tq_bf16_to_float(q_norm_w[tid]));
+        if (tid < rotary_dim) {
+            int idx = tid & 31;
+            float freq = powf(rope_theta, -((float)(2 * idx) / (float)rotary_dim));
+            float angle = (float)pos * freq;
+            float c = cosf(angle), s = sinf(angle);
+            int pi = (tid < 32) ? tid + 32 : tid - 32;
+            float q_pair = q_proj[head * (2 * hd) + pi];
+            q_pair = q_pair * rms * (1.0f + tq_bf16_to_float(q_norm_w[pi]));
+            float q_rot = (tid < 32) ? -q_pair : q_pair;
+            qv = qv * c + q_rot * s;
+        }
+        qn[g][tid] = qv;
+        __syncthreads();
+        tq_fwht256(&qn[g][0], tid);
+    }
+    if (tid < GQA) { m_run[tid] = -3.402823466e38f; l_run[tid] = 0.0f; }
+    __syncthreads();
+
+    const size_t bt_base = (size_t)slot * max_blocks;
+    const size_t k4_pp = (size_t)(nkv * hd) >> 1, kq4s_pp = (size_t)nkv * 16, v8_pp = (size_t)nkv * hd;
+    const int warp = tid >> 5, lane = tid & 31;
+    const float scale = rsqrtf((float)hd);
+    float acc[GQA];
+    #pragma unroll
+    for (int g = 0; g < GQA; g++) acc[g] = 0.0f;
+    const int total = pos + 1;
+    const int per = (total + S - 1) / S;
+    const int lo = split * per;
+    int hi = lo + per; if (hi > total) hi = total;
+
+    for (int c0 = lo; c0 < hi; c0 += TQ_GQA_ATTN_CHUNK) {
+        int clen = hi - c0;
+        if (clen > TQ_GQA_ATTN_CHUNK) clen = TQ_GQA_ATTN_CHUNK;
+        for (int j = tid; j < clen; j += 256) {
+            int t = c0 + j;
+            int phys = block_table[bt_base + (t >> page_log)];
+            pr_chunk[j] = phys * page + (t & (page - 1));
+        }
+        __syncthreads();
+        // scores: one K row per (warp, position), reused by all GQA heads
+        for (int j = warp; j < clen; j += 8) {
+            size_t pr = (size_t)pr_chunk[j];
+            const uint8_t *krow = k4_pool + pr * k4_pp + (size_t)kv_head * (hd >> 1);
+            const float *ksz = q4s_adv(kq4s_pool, pr * kq4s_pp + (size_t)kv_head * 16);
+            float kd[8];
+            #pragma unroll
+            for (int e = 0; e < 8; e++) {
+                int d = lane + 32 * e;
+                uint8_t byte = krow[d >> 1];
+                float code = (float)((d & 1) ? (byte >> 4) : (byte & 15));
+                kd[e] = (code - q4s_at(ksz, 2 * e + 1)) * q4s_at(ksz, 2 * e);
+            }
+            #pragma unroll
+            for (int g = 0; g < GQA; g++) {
+                float dot = 0.0f;
+                #pragma unroll
+                for (int e = 0; e < 8; e++) dot += qn[g][lane + 32 * e] * kd[e];
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, off);
+                if (lane == 0) s_chunk[g][j] = dot * scale;
+            }
+        }
+        __syncthreads();
+        // running max: one tree, GQA lanes of it
+        #pragma unroll
+        for (int g = 0; g < GQA; g++) {
+            float m = -3.402823466e38f;
+            for (int j = tid; j < clen; j += 256) if (s_chunk[g][j] > m) m = s_chunk[g][j];
+            red[g][tid] = m;
+        }
+        __syncthreads();
+        for (int s = 128; s > 0; s >>= 1) {
+            if (tid < s) {
+                #pragma unroll
+                for (int g = 0; g < GQA; g++)
+                    if (red[g][tid + s] > red[g][tid]) red[g][tid] = red[g][tid + s];
+            }
+            __syncthreads();
+        }
+        if (tid < GQA) {
+            float m_old = m_run[tid], m_new = fmaxf(m_old, red[tid][0]);
+            m_new_s[tid] = m_new;
+            alpha_s[tid] = expf(m_old - m_new);
+        }
+        __syncthreads();
+        // exponentiate in place + denominator, same tree
+        #pragma unroll
+        for (int g = 0; g < GQA; g++) {
+            float m_new = m_new_s[g];
+            float lsum = 0.0f;
+            for (int j = tid; j < clen; j += 256) {
+                float p = expf(s_chunk[g][j] - m_new);
+                s_chunk[g][j] = p;
+                lsum += p;
+            }
+            red[g][tid] = lsum;
+        }
+        __syncthreads();
+        for (int s = 128; s > 0; s >>= 1) {
+            if (tid < s) {
+                #pragma unroll
+                for (int g = 0; g < GQA; g++) red[g][tid] += red[g][tid + s];
+            }
+            __syncthreads();
+        }
+        if (tid < GQA) l_chunk_s[tid] = red[tid][0];
+        __syncthreads();
+        #pragma unroll
+        for (int g = 0; g < GQA; g++) acc[g] *= alpha_s[g];
+        // V fold: one V row per position, reused by all GQA heads
+        for (int j = 0; j < clen; j++) {
+            size_t pr = (size_t)pr_chunk[j];
+            float vcode = tq_e4m3_dec_fast(v8_pool[pr * v8_pp + (size_t)kv_head * hd + tid]);
+            float vscl = vscale_pool[pr * nkv + kv_head];
+            #pragma unroll
+            for (int g = 0; g < GQA; g++) acc[g] += s_chunk[g][j] * vcode * vscl;
+        }
+        __syncthreads();
+        if (tid < GQA) {
+            l_run[tid] = l_run[tid] * alpha_s[tid] + l_chunk_s[tid];
+            m_run[tid] = m_new_s[tid];
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int g = 0; g < GQA; g++) {
+        int head = kv_head * group + g;
+        size_t pidx = ((size_t)(head * gridDim.y + col) * S + split);
+        part_acc[pidx * hd + tid] = acc[g];
+        if (tid == 0) { part_ml[pidx * 2 + 0] = m_run[g]; part_ml[pidx * 2 + 1] = l_run[g]; }
+    }
+}
+
 // combine S split partials per (head,col): m*=max m_s; acc*=sum exp(m_s-m*) acc_s; l* likewise;
 // out = (acc*/l*) * sigmoid(gate). One block per (head,col), thread tid = output channel.
 __global__ void k_tq_paged_attn_q4_merge(
@@ -21064,6 +22409,32 @@ static int paged_split_S(int N, int max_pos) {
     return S;
 }
 
+// TQ_PAGED_GQA=0 reverts to the per-query-head kernel above.
+static int paged_attn_gqa(void) {
+    static int en = -1;
+    if (en < 0) { const char *e = getenv("TQ_PAGED_GQA"); en = (e && *e) ? (atoi(e) != 0) : 1; }
+    return en;
+}
+
+// The GQA kernel has nkv (not nh) CTAs per column, i.e. 6x fewer, so the split
+// has to work 6x harder to fill the SMs -- and it can, because the whole point is
+// that a split no longer re-reads the KV pool. The 512-row floor stays (partials
+// are nh*N*S*hd floats); the cap is lifted 32 -> 64 for the same reason.
+static int paged_split_S_gqa(int N, int max_pos) {
+    static int forced = -2;
+    if (forced == -2) { const char *e = getenv("TQ_PAGED_SPLIT"); forced = e ? atoi(e) : -1; }
+    if (forced >= 0) return forced < 1 ? 1 : forced;
+    int total = max_pos + 1, sm = paged_sm_count(), blocks0 = g_qwen.nkv * N;
+    if (blocks0 < 1) blocks0 = 1;
+    if (total < 1024) return 1;
+    int s_occ = (4 * sm + blocks0 - 1) / blocks0;
+    int s_work = total / 512;
+    int S = s_occ < s_work ? s_occ : s_work;
+    if (S < 1) S = 1;
+    if (S > 64) S = 64;
+    return S;
+}
+
 static int ensure_attn_partials(size_t units) {        // units = nh*N*S
     if (units > g_attn_pacc_n) {
         if (g_attn_pacc) cudaFree(g_attn_pacc);
@@ -21088,6 +22459,21 @@ static int launch_paged_attn_q4(float *out, const float *q_proj, const uint16_t 
     k_tq_paged_attn_kv_write_q4<<<dim3(nkv, N), hd, 0, st>>>(
         k4_pool, kq4s_pool, v8_pool, vscale_pool, k_proj, v_proj, k_norm_w, positions, slot_ids,
         block_table, max_blocks, page, page_log, nkv, hd, kv_m, g_qwen.eps, g_qwen.rope_theta);
+    // GQA path: nkv CTAs per column carry all nh/nkv query heads that share a KV
+    // head, so the pool is streamed once instead of nh/nkv times. S=1 also routes
+    // through split+merge -- at S=1 the merge is exp(0)=1 * acc / l * sigmoid(gate),
+    // i.e. exactly what the single kernel writes.
+    if (paged_attn_gqa() && nkv > 0 && (nh % nkv) == 0 && hd == 256 && (nh / nkv) == 6) {
+        int S = paged_split_S_gqa(N, max_pos);
+        if (ensure_attn_partials((size_t)nh * N * S) != 0) return -2;
+        k_tq_paged_attn_q4_split_gqa<6><<<dim3(nkv, N, S), hd, 0, st>>>(
+            q_proj, q_norm_w, k4_pool, kq4s_pool, v8_pool, vscale_pool, positions, slot_ids,
+            block_table, max_blocks, page, page_log, nh, nkv, hd, q_m, S, g_qwen.eps, g_qwen.rope_theta,
+            g_attn_pacc, g_attn_pml);
+        k_tq_paged_attn_q4_merge<<<dim3(nh, N), hd, 0, st>>>(
+            out, q_proj, positions, nh, hd, q_m, attn_m, S, g_attn_pacc, g_attn_pml);
+        return cudaGetLastError() == cudaSuccess ? 0 : -1;
+    }
     int S = paged_split_S(N, max_pos);
     if (S <= 1) {
         k_tq_paged_attn_q4<<<dim3(nh, N), hd, 0, st>>>(
@@ -21351,7 +22737,7 @@ static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, 
         if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION) {
             if (!(tq_wide_fmt_ok(&l->q_proj) && tq_wide_fmt_ok(&l->o_proj) &&
                   tq_wide_fmt_ok(&l->mlp_gate) && tq_wide_fmt_ok(&l->mlp_down))) return -63;
-            k_tq_qwen_rmsnorm_b<<<dim3(8, N), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
+            k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(N), N), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, N)) != 0) return -64;
             if ((ret = wide_proj(&l->q_proj, g_wide_q, N)) != 0) return -64;
             if ((ret = wide_proj(&l->k_proj, g_wide_k, N)) != 0) return -65;
@@ -21369,7 +22755,7 @@ static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, 
                   tq_wide_fmt_ok(&l->linear_in_b) && tq_wide_fmt_ok(&l->linear_in_a) &&
                   tq_wide_fmt_ok(&l->linear_out) && tq_wide_fmt_ok(&l->mlp_gate) &&
                   tq_wide_fmt_ok(&l->mlp_down))) return -70;
-            k_tq_qwen_rmsnorm_b<<<dim3(8, N), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
+            k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(N), N), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, N)) != 0) return -71;
             if ((ret = wide_proj(&l->linear_in_qkv, g_wide_qkv, N)) != 0) return -71;
             if ((ret = wide_proj(&l->linear_in_z, g_wide_z, N)) != 0) return -72;
@@ -21387,7 +22773,7 @@ static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, 
             if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, N)) != 0) return -77;
         }
     }
-    k_tq_qwen_rmsnorm_b<<<dim3(8, N), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, g_qwen.d_norm, H, g_qwen.eps);
+    k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(N), N), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, g_qwen.d_norm, H, g_qwen.eps);
     if (!g_qwen.tie_word_embeddings && g_qwen.lm_head.e2m3 && !g_qwen.lm_head.e2m3_byte &&
         !g_qwen.lm_head.word_major && can_use_qmma_sf_weight(&g_qwen.lm_head) && !g_qwen.lm_head.row_major) {
         if ((ret = wide_quant_input(g_wide_norm, H, N)) != 0) return -78;
@@ -21490,7 +22876,7 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
         if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION) {
             if (!(tq_wide_fmt_ok(&l->q_proj) && tq_wide_fmt_ok(&l->o_proj) &&
                   tq_wide_fmt_ok(&l->mlp_gate) && tq_wide_fmt_ok(&l->mlp_down))) return -92;
-            k_tq_qwen_rmsnorm_b<<<dim3(8, T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
+            k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(T), T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, T)) != 0) return -93;
             if ((ret = wide_proj(&l->q_proj, g_wide_q, T)) != 0) return -93;
             if ((ret = wide_proj(&l->k_proj, g_wide_k, T)) != 0) return -93;
@@ -21529,7 +22915,7 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
                   tq_wide_fmt_ok(&l->linear_in_b) && tq_wide_fmt_ok(&l->linear_in_a) &&
                   tq_wide_fmt_ok(&l->linear_out) && tq_wide_fmt_ok(&l->mlp_gate) &&
                   tq_wide_fmt_ok(&l->mlp_down))) return -97;
-            k_tq_qwen_rmsnorm_b<<<dim3(8, T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
+            k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(T), T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, T)) != 0) return -98;
             if ((ret = wide_proj(&l->linear_in_qkv, g_wide_qkv, T)) != 0) return -98;
             if ((ret = wide_proj(&l->linear_in_z, g_wide_z, T)) != 0) return -98;
@@ -21565,7 +22951,7 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
         fk[Kf++] = k;
     }
     if (Kf > 0) {
-        k_tq_qwen_rmsnorm_b<<<dim3(8, Kf), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_resid, g_qwen.d_norm, H, g_qwen.eps);
+        k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(Kf), Kf), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_resid, g_qwen.d_norm, H, g_qwen.eps);
         if (!g_qwen.tie_word_embeddings && g_qwen.lm_head.e2m3 && !g_qwen.lm_head.e2m3_byte &&
             !g_qwen.lm_head.word_major && can_use_qmma_sf_weight(&g_qwen.lm_head) && !g_qwen.lm_head.row_major) {
             if ((ret = wide_quant_input(g_wide_norm, H, Kf)) != 0) return -102;
@@ -21603,10 +22989,14 @@ extern "C" int qwn_paged_prefill_batch(const int *tokens, const int *col_slot, c
     // cap at 128 (-57). Wider waves amortize the per-wave weight read over more
     // prompt columns, which is the whole game for prefill-bound multi-client load.
     // TQ_WAVE_MAX raises it; per-segment length still rides the MMA tiling.
+    // Default raised 128 -> TQ_WIDE_GEMM_TILE (256): that is the tiled FP6 GEMM's
+    // native column tile, so a 256-column wave reads the ~20 GiB weight stripe once
+    // for twice the prompt columns. The old 128 was inherited from the single-stream
+    // wide path (whose batched attention really does cap at 128, -57).
     static int wave_cap = 0;
     if (wave_cap == 0) {
         const char *e = getenv("TQ_WAVE_MAX");
-        wave_cap = e ? atoi(e) : 128;
+        wave_cap = e ? atoi(e) : (tq_wide_gemm_tiled() ? TQ_WIDE_GEMM_TILE : 128);
         if (wave_cap < 1) wave_cap = 128;
     }
     if (T > wave_cap) return -6;
@@ -21748,6 +23138,7 @@ extern "C" int qwn_capture_decode(int token_id, int pos) {
 }
 
 extern "C" int qwn_decode_graph(int token_id, int pos) {
+    if (g_nvf4_any) return -120;   // same reason as qwn_decode: FP6 payload is freed
     if (!g_qwen.decode_graph_ready || !g_qwen.decode_graph_exec) {
         int ret = capture_decode_graph(token_id, pos, 1);
         if (ret != 0) return ret;

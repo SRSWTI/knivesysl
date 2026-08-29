@@ -87,29 +87,62 @@ anchor, so a follow-up turn re-prefills only the suffix:
 the batched server has the same primitive for a shared system prompt: **340 --> 784 tok/s**
 at n=32, p50 latency 14.5 --> 6.2 s.
 
-### prefill — we lose, and we know exactly why
+### prefill — the gemm deficit is closed
 
 ![gemm headroom](assets/gemm-headroom.svg)
 
-our hand-written fp6 gemm runs at **124 tflops**. cutlass 4.7's sm120 block-scaled
-collective, on the identical numerics (e4m3 x e2m3) and the identical shapes on this gpu,
-runs at **255 tflops at m=128 and 572 at m=512** — verify-passing. we are at a fifth of
-the tensor cores.
+the hand-written fp6 gemm used to run at **124 tflops** against cutlass 4.8's sm120
+block-scaled collective at 255 (m=128) / 572 (m=512) on the identical numerics and
+shapes. it ran one warp per cta with every operand arriving from global through `__ldg`.
+it is now a proper tiled kernel: 128-row x 256-column block tile, 8 warps, k staged 128
+at a time into a `cp.async` circular buffer, split-k on `grid.y`. flop-weighted over this
+model's real projection mix:
 
-that is the whole prefill gap. under a continuous-arrival benchmark (guidellm, n streams
-held in flight, 256 output tokens, 20 s window) we lose every cell: 462 vs 774 tok/s at
-128-token prompts / n=32, and at 4096-token prompts the window fills with prefill before
-anything finishes. prefill never stops under arrivals, so a slow gemm compounds.
+| columns/wave | before | after | cutlass sm120 collective |
+|---|--:|--:|--:|
+| 128 | 88.9 tflops | **392.8** | 255 (its m=128) |
+| 256 | 88.1 tflops | **477.7** | 572 (its m=512) |
+
+at `k_splits == 1` it is **bit-exact** vs the kernel it replaces — verified with
+exactly-representable operands so summation order cannot mask an indexing bug. the two
+largest projections now run at 1.29-1.40 tb/s, i.e. against the dram roofline rather
+than the tensor cores.
 
 ![prefill profile](assets/prefill-profile.svg)
 
-and the gemm is only 55% of it. the 48 gated-deltanet layers' chunkwise scan is 22.5% —
-amdahl says a cutlass port alone takes prefill 2500 --> ~4400 tok/s (parity with vllm's
-2800-4400 band), and it needs the deltanet kernel too to clearly pass them.
+the gemm was 55% of prefill and the 48 gated-deltanet layers' chunkwise scan 22.5%, so
+the scan was rewritten too — recurrent state held in registers across the whole chunk
+instead of re-read and re-written every 8 tokens, the per-token prep hoisted out of the
+sub-chunk loop and parallelised, and the idle-lane substitution phase removed. 1.56-1.59x
+at every chunk width.
 
-**the honest summary: fixed batch, we hold the decode ceiling. sustained arrivals with
-long prompts, vllm wins on prefill throughput. the fix is identified and measured, not
-speculative.**
+```
+prefill, single stream, 4096-token prompt:  2579 --> 4630 tok/s   (1.80x)
+prefill, paged, 32 clients x 2048 tokens:   1198 --> 2216 tok/s   (1.85x)
+```
+
+**the honest summary: the identified gemm gap is gone and prefill is 1.7-1.85x faster.
+the guidellm sustained-arrival comparison against vllm has NOT been re-run since (the
+two engines cannot be resident on the card at once) — the cells in the table below are
+the old measurement and the prefill column of it is now stale in our favour.**
+
+### decode at depth — gqa-shared paged attention
+
+the paged decode attention ran one cta per *query* head, and this model is 24 q heads
+over 4 kv heads, so six ctas independently streamed the same kv rows. at 131k context
+that was ~21 gib of kv traffic per step for a 3.5 gib working set — 27 of the 46 ms. one
+cta now carries all six query heads that share a kv head:
+
+| case | before | after | |
+|---|--:|--:|--:|
+| n=32, ctx 2048 | 41.98 ms | **29.36** | 1.43x |
+| n=1, ctx 65536 | 31.31 | **21.93** | 1.43x |
+| n=1, ctx 131072 | 46.53 | **27.83** | 1.67x |
+| n=1, ctx 147456 | 50.06 | **29.24** | 1.71x |
+
+6/6 argmax match vs single-stream q4 decode. the projection gemm inside a decode step
+now sustains 1.56 tb/s = 87% of this card's dram peak, so decode's remaining headroom is
+attention and the deltanet recurrence, not the weight read.
 
 ---
 
@@ -196,6 +229,33 @@ CUDA_VISIBLE_DEVICES=0 TQ_CTX=32768 TQ_KV_Q4=1 python3 tools/serve_batched.py \
     --port 8100 --max-slots 32 --num-blocks 1024 --tqf model.tqf --model-dir ...
 ```
 
+### terminal coding client
+
+`tools/axe_vllm.py` runs the agentic terminal client against any live
+OpenAI-compatible vLLM server. It defaults to `http://127.0.0.1:8000/v1`, discovers the
+served model from `/v1/models`, streams thinking separately from the final response, and
+preserves assistant/tool history so server-side prefix caching can reuse completed turns.
+
+```bash
+# use a Python environment containing openai, python-dotenv, and tiktoken
+# (plus ddgs and trafilatura for the web_search tool)
+/path/to/vllm/.venv/bin/python tools/axe_vllm.py /path/to/project
+
+# optional endpoint/model overrides
+VLLM_BASE_URL=http://127.0.0.1:8000/v1 VLLM_MODEL=your/model \
+    /path/to/vllm/.venv/bin/python tools/axe_vllm.py /path/to/project
+```
+
+Thinking is enabled and printed under `thinking>` by default; `--no-thinking` explicitly
+disables it. Interactive commands are `/model`, `/clear`, and `/quit`. `--prompt` runs one
+non-interactive agent turn, including tool calls, for automation and smoke tests.
+
+`web_search` searches DuckDuckGo via `ddgs`, scrapes the top result pages with
+`trafilatura`, and sends the digest to the same model the agent is running on; the
+tool output is that model's summary of the links and what it found (a non-streaming
+completion on the same client, `enable_thinking` off). if the summarisation call fails,
+the raw scraped digest is returned instead.
+
 ### reasoning effort
 
 qwen3.8's chat template owns it: `reasoning_effort` in `low | medium | xhigh` (default
@@ -213,8 +273,14 @@ turns.
 | `TQ_KV_Q4=1` | 4-bit k + e4m3 v cache (needed for 256k) |
 | `TQ_EMBED_FP8=2` | 6-bit embed table, -1.5 gib |
 | `TQ_PAGED_SPLIT` | force split-k on/off for paged decode attention |
-| `TQ_WAVE_MAX` | prefill wave column cap (default 128) |
-| `TQ_W_E2M1=1` | opt-in 4-bit weight tier |
+| `TQ_PAGED_GQA=0` | revert paged decode attention to one cta per query head |
+| `TQ_WIDE_GEMM=0` | revert the wide fp6 projection gemm to the 1-warp/cta kernel |
+| `TQ_GEMM_STAGES` | wide-gemm `cp.async` pipeline depth (2..4, default 2) |
+| `TQ_WAVE_MAX` | prefill wave column cap (default 256 = the gemm's column tile) |
+| `TQ_W_E2M1=1` | opt-in 4-bit weight tier (k32 mma: memory win only, no compute win) |
+| `TQ_W_NVFP4=all` | nvfp4 w4a4 tier, every projection (k64 mma: 2.05x instruction roof) |
+| `TQ_W_NVFP4=mlp` | nvfp4 for the mlp only; attention + deltanet stay fp6 |
+| `TQ_NVFP4_STAGES` | nvfp4 gemm `cp.async` pipeline depth (2..5, default 3) |
 | `--prefill-budget` | prompt columns per wave, on top of the decode rows |
 | `--prefix-cache` | materialize a shared prompt prefix once (batched server) |
 
@@ -224,6 +290,11 @@ turns.
 python3 tools/mtp_spec_smoke.py --prompt-tokens 1024 --gen 128 --tqf model.tqf ...
 python3 tools/bench_rounds.py  --prompt-tokens 65536 --rounds 200 --tqf model.tqf ...
 python3 tools/needle_check.py                      # long-context retrieval gate
+python3 tools/paged_smoke.py                       # paged decode == single-stream argmax
+python3 tools/bench_decode.py --cases 1:2048,32:2048,1:131072
+python3 tools/tf_agreement.py --chunk 256          # then diff two runs position by position
+TQ_W_NVFP4=mlp python3 tools/nvfp4_check.py       # nvfp4 vs fp64 decode of the same bytes
+TQ_W_NVFP4=mlp python3 tools/nvfp4_quality.py     # then diff ARGMAX against a TQ_W_NVFP4=0 run
 ```
 
 ## layout
@@ -236,15 +307,26 @@ tools/serve.sh             launcher: env defaults, vram-sized TQ_CTX, daemon/sto
 tools/convert_qwen_tqf.py  hf qwen --> .tqf converter
 tools/inspect_tqf.py       inspect a .tqf
 tools/bench_coding.py      cold/follow-up coding-workload benchmark
+tools/bench_decode.py      paged decode sweep (concurrency x context depth)
+tools/tf_agreement.py      teacher-forced top-1 agreement between two libs/configs
+tools/nvfp4_check.py       nvfp4 numeric gate (fp64 decode of the packed bytes)
+tools/nvfp4_quality.py     nvfp4 wide-path argmax agreement (tf_agreement can't reach it)
 ```
 
 see `CHANGELOG.md` for the measurement log behind every number here.
 
 ## where this is going
 
-1. port the wide-prefill gemm to the cutlass sm120 block-scaled collective --> prefill
-   parity (~4400 tok/s), which flips the sustained-load column
-2. profile and rework the deltanet chunkwise scan (22.5% of prefill)
-3. re-measure quality against nvfp4 ourselves instead of inheriting the number
-4. more models — the converter and the format are architecture-agnostic; the kernels
+1. re-run the guidellm sustained-arrival comparison against vllm. the gemm deficit that
+   lost every cell of it is closed (124 --> 392-478 tflops, against the 255-572 cutlass
+   reference) and prefill is 1.8x, but the comparison itself is not re-measured
+2. tensorize the deltanet chunk transforms. the scan is 1.6x faster but still pure
+   scalar fp32 fma, on regular 8x128 / 128x64 shapes, and it fills only 96 of 170 sms
+   (48 value heads x 2 stripes) because the per-stripe prep is duplicated. hoisting the
+   prep into its own kernel unlocks nstripe=4/8
+3. fold the two-pass activation quantizer into one pass by holding the k-block in
+   registers instead of shared memory (it is 5.8% of prefill and reads `x` twice), and
+   fuse `silu_mul` + `add_vec` into the quantizer / norm that follow them (another ~4%)
+4. re-measure quality against nvfp4 ourselves instead of inheriting the number
+5. more models — the converter and the format are architecture-agnostic; the kernels
    are not, yet
