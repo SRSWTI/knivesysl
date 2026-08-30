@@ -8,6 +8,74 @@ thinking off unless stated. vLLM comparisons are vLLM 0.27.1 serving
 
 ## Unreleased
 
+### The multi-client server was never running the prefill attention kernel
+
+`TQ_WIDE_ATTN_MMA` was opt-in while the tensor-core prefill attention was being brought
+up, and the flag outlived the bring-up. `serve_openai.py` set it. `bench_decode.py` set
+it. **`serve_batched.py` never did.** So every number in this repo came from the MMA
+path, while the multi-client paged server -- the one that actually serves the paged
+prefill wave -- silently ran the memory-bound paged *decode* kernel across prompt
+columns. It is now on by default; `TQ_WIDE_ATTN_MMA=0` reverts.
+
+Found by profiling both processes and diffing `cuda_gpu_kern_sum`. Same prefill work,
+different attention kernel (load-time repack/autotune are identical in both -- 496
+launches, 475 vs 474 ms -- so they cancel):
+
+| process | attention kernel | ms | launches | ms/launch |
+|---|---|--:|--:|--:|
+| `serve_batched.py` | `k_tq_paged_attn_q4_split_gqa<6>` | 725.2 | 384 | **1.89** |
+| `bench_decode.py` | `k_tq_wide_attn_mma<4>` | 77.5 | 256 | **0.30** |
+
+| | before | after |
+|---|--:|--:|
+| server-side prefill 4096 tok (HTTP) | 3336 | **5672 tok/s** |
+| per-wave engine time, `T=256` | 82.1 ms | **48.3 ms** |
+| single-stream wide prefill 2048 tok | 2606 | **3860 tok/s** |
+
+**This closes the 1.79x server-vs-engine prefill gap.** That gap had been bounded to
+"inside the engine call" and left open: the scheduler (0.026 ms/wave), pool geometry,
+threading, streaming, tokenization (2.9 ms) and CPU contention had all been excluded by
+measurement, correctly -- none of them was ever the cause. 48.3 ms/wave now agrees with
+`bench_decode`'s 50.6 ms for identical `T=256`, so there is no residual to explain. The
+lesson is that "I have excluded everything host-side" is not the same as "it must be
+intrinsic": both processes were compared on the assumption they ran the same kernels,
+and that assumption was never checked until it was profiled.
+
+#### Third instance of one bug class
+
+A Python-side copy of an engine default going stale, now three times in this work:
+
+| mirror | assumed | truth | symptom |
+|---|---|---|---|
+| `serve_batched.py` `WAVE_MAX` | 128 columns | 256 (GEMM tile) | every wave half width, `--prefill-budget` ignored |
+| `mtp_spec_smoke.py` `mma_on` | env unset == off | on | wide cap pinned at 16384; 140k prompts fell to the chunked ABI and failed `-97` |
+| `serve_batched.py` attention | — | MMA available | 6.3x slower attention |
+
+Both mirrors now ask the library: `qwn_wide_attn_mma()` joins `qwn_wave_cap()`. The
+general rule this earns: **an engine default that a harness needs must be published over
+the ABI, never duplicated.** A duplicated default is not wrong when written -- it is
+wrong later, silently, and it corrupts the measurement rather than crashing.
+
+#### Corrected head-to-head
+
+Every server-level vLLM comparison in this file was measured against the slow path and
+is superseded. vLLM 0.27.1 NVFP4, `--enforce-eager` (its cudagraph profiling OOMs on
+this checkpoint at 32 GB), `--max-model-len 8192`, same client, both engines over HTTP:
+
+| metric | vLLM | knivesysl | ratio |
+|---|--:|--:|--:|
+| prefill 4096, unique, cold | 7985 | 5648 | 0.71x |
+| prefill 4096, unique, warm | 9206 | 5668 | 0.62x |
+| prefill 4096, shared prefix, warm | 35324 | **171435** | **4.85x** |
+| decode N=1 | 29.2 | **61.2** | **2.10x** |
+| decode N=8, unique | 170.8 | **205.4** | **1.20x** |
+| decode N=8, shared prefix | 220.4 | **435.1** | **1.97x** |
+
+The cold unique-prompt prefill deficit went from **2.98x to 1.41x**. That remainder is
+now genuinely the kernels -- 54% of the 2051 TFLOP/s issue roof against CUTLASS's 68%,
+plus a DeltaNet chunk scan that is still scalar FP32 with no `mma.sync` in it at all.
+Everything else on this card, we win.
+
 ### TMA staging + a measured launch config for the NVFP4 GEMM
 
 The prefill GEMM was at 49% of the measured 2051 TFLOP/s `mxf4nvf4` issue roof against

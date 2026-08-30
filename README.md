@@ -121,10 +121,26 @@ prefill, single stream, 4096-token prompt:  2579 --> 4630 tok/s   (1.80x)
 prefill, paged, 32 clients x 2048 tokens:   1198 --> 2216 tok/s   (1.85x)
 ```
 
-**the honest summary: the identified gemm gap is gone and prefill is 1.7-1.85x faster.
-the guidellm sustained-arrival comparison against vllm has NOT been re-run since (the
-two engines cannot be resident on the card at once) — the cells in the table below are
-the old measurement and the prefill column of it is now stale in our favour.**
+with the nvfp4 w4a4 tier, tma staging and a measured split-k config on top, the same
+4096-token single-stream prefill is now **5970 tok/s** and the paged path 5973 at n=1.
+
+**and the server-level comparison has now been run** — same client, both engines over
+http, vllm 0.27.1 serving `unsloth/Qwen3.8-27B-NVFP4` (`--enforce-eager`: its cudagraph
+memory profiling ooms on this checkpoint at 32 gb):
+
+| | vllm | knivesysl | ratio |
+|---|--:|--:|--:|
+| prefill 4096, unique prompt, cold | 7985 | 5648 | 0.71x |
+| prefill 4096, shared prefix, warm | 35324 | **171435** | **4.85x** |
+| decode n=1 | 29.2 | **61.2** | **2.10x** |
+| decode n=8, unique | 170.8 | **205.4** | **1.20x** |
+| decode n=8, shared prefix | 220.4 | **435.1** | **1.97x** |
+
+**the honest summary: we win decode at every concurrency and win cached prefill by ~5x;
+we lose cold unique-prompt prefill by 1.41x.** that last cell was 2.98x until the
+multi-client server was found to be running the wrong attention kernel entirely (see
+`CHANGELOG.md`); what remains of it is the kernels — 54% of this card's measured 2051
+tflop/s fp4 issue roof against cutlass's 68%, and a deltanet scan still on scalar fp32.
 
 ### decode at depth — gqa-shared paged attention
 
@@ -282,6 +298,7 @@ turns.
 | `TQ_W_NVFP4=mlp` | nvfp4 for the mlp only; attention + deltanet stay fp6 |
 | `TQ_NVFP4_STAGES` | nvfp4 gemm pipeline depth fallback (autotuned per shape at load) |
 | `TQ_NVFP4_TMA=0` | revert the nvfp4 gemm from `cp.async.bulk.tensor` to `cp.async` |
+| `TQ_WIDE_ATTN_MMA=0` | revert prefill attention to the scalar/split-k decode kernel |
 | `--prefill-budget` | prompt columns per wave, on top of the decode rows |
 | `--prefix-cache` | materialize a shared prompt prefix once (batched server) |
 
