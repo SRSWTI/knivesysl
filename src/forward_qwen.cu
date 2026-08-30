@@ -13242,7 +13242,12 @@ static int tq_wave_cap(void) {
     static int cap = 0;
     if (cap == 0) {
         const char *e = getenv("TQ_WAVE_MAX");
-        cap = e ? atoi(e) : (tq_wide_gemm_tiled() ? TQ_WIDE_GEMM_TILE : 128);
+        // Default raised 256 -> 512 (2 x TQ_WIDE_GEMM_TILE): the second 256-col
+        // GEMM pass re-reads each projection weight from L2, so a 512-col wave
+        // measured 7539 vs 7043 tok/s (+7%) on a 4096-token NVFP4 prefill once
+        // the scan/GEMM mix stopped hiding the weight re-stream. 768+ declines
+        // (attention's deepest-position charge grows with the wave).
+        cap = e ? atoi(e) : (tq_wide_gemm_tiled() ? 2 * TQ_WIDE_GEMM_TILE : 128);
         if (cap < 1) cap = 128;
     }
     return cap;
