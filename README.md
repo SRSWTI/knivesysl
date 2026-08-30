@@ -140,13 +140,13 @@ decode:
 
 | | vllm | knivesysl | |
 |---|--:|--:|---|
-| prefill 2048, unique, cold (fresh server) | 5218 | 7357 | 1.41x ours |
-| prefill 2048, unique, fully warm | 10304 | 7432 | 1.39x theirs |
-| prefill 4096, unique, fully warm | 16080 | 7099 | 2.27x theirs |
+| prefill 2048, unique, cold (fresh server) | 5218 | 7939 | 1.52x ours |
+| prefill 2048, unique, fully warm | 10304 | 8026 | 1.28x theirs |
+| prefill 4096, unique, fully warm | 16080 | 7544 | 2.13x theirs |
 | prefill 4096, shared prefix, warm | 40282 | **174093** | **4.32x ours** |
-| prefill 16384 (conc 2) | 10104 | 5279 | 1.91x theirs |
-| prefill 65536 | 7162 | 2710 | 2.64x theirs |
-| ttft p50, 8 clients x 2048 | 1.425 s | **1.404 s** | ours |
+| prefill 16384 (conc 2) | 10104 | 6157 | 1.64x theirs |
+| prefill 65536 | 7162 | 4480 | 1.60x theirs |
+| ttft p50, 8 clients x 2048 | 1.425 s | **1.230 s** | ours |
 | decode n=1, paged | 69.2 | 61.1 | 1.13x theirs |
 | decode n=1, fp6 mtp spec decode | 69.2 | **141.4** | **2.04x ours** |
 
@@ -311,14 +311,15 @@ turns.
 | `TQ_PAGED_GQA=0` | revert paged decode attention to one cta per query head |
 | `TQ_WIDE_GEMM=0` | revert the wide fp6 projection gemm to the 1-warp/cta kernel |
 | `TQ_GEMM_STAGES` | wide-gemm `cp.async` pipeline depth (2..4, default 2) |
-| `TQ_WAVE_MAX` | prefill wave column cap (default 512 = 2x the gemm's column tile; the second 256-col pass l2-hits the weights) |
+| `TQ_WAVE_MAX` | max wave columns the engine accepts (default 2048; builders pick 512 shallow / 2048 past 16k depth) |
 | `TQ_W_E2M1=1` | opt-in 4-bit weight tier (k32 mma: memory win only, no compute win) |
 | `TQ_W_NVFP4=all` | nvfp4 w4a4 tier, every projection (k64 mma: 2.05x instruction roof) |
 | `TQ_W_NVFP4=mlp` | nvfp4 for the mlp only; attention + deltanet stay fp6 |
 | `TQ_NVFP4_STAGES` | nvfp4 gemm pipeline depth fallback (autotuned per shape at load) |
 | `TQ_NVFP4_TMA=0` | revert the nvfp4 gemm from `cp.async.bulk.tensor` to `cp.async` |
 | `TQ_WIDE_ATTN_MMA=0` | revert prefill attention to the scalar/split-k decode kernel |
-| `TQ_DN_MM` | deltanet chunk-64 matmul scan: 1 = on (default, fp32), 0 = ck8 head-split scan, 3 = tf32 wmma tier (fails the quality gates; comparison-only) |
+| `TQ_WIDE_ATTN_QROWS` | force 16/32/64-row attention tiles (default: auto by prefix depth) |
+| `TQ_DN_MM` | deltanet chunk-64 matmul scan: 3 = tf32 wmma (default, gates at the eps band), 1 = fp32 scan (conservative), 0 = ck8 head-split scan |
 | `--fuse-idle-ms` | ride a decode row on a prompt wave only after this idle time (default 125; riding costs 1.2 ms/row/wave) |
 | `--prefill-budget` | prompt columns per wave, on top of the decode rows |
 | `--prefix-cache` | materialize a shared prompt prefix once (batched server) |
@@ -361,9 +362,9 @@ see `CHANGELOG.md` for the measurement log behind every number here.
 
 1. re-run the guidellm sustained-arrival comparison against vllm; the point-benchmark
    matrix (bench_endpoint) is measured and in `CHANGELOG.md`, sustained arrival is not
-2. long-context prefill attention. at 64k the wide-attention share dominates and vllm's
-   flashattention pulls 2.6x ahead (7162 vs 2710 server-level); the 2-16k regime is
-   competitive. this is now the largest single deficit
+2. long-context prefill attention, continued. depth-adaptive 64-row tiles + wide deep
+   waves cut the 64k deficit 2.64x -> 1.68x (server 2677 -> 4267 tok/s); what remains
+   is cp.async/tma staging of the quantized KV stream inside the attention loop
 3. the nvfp4 `all`-tier memory accounting: ~6.5 gb of device allocation is untracked,
    which blocks 262k-context and high-concurrency pools that fp6 handles fine
 4. re-measure quality against nvfp4 ourselves instead of inheriting the number

@@ -28,7 +28,28 @@ import argparse, ctypes, os, time
 import numpy as np
 from transformers import AutoTokenizer
 
-BIGTEXT = os.environ.get("TQ_BENCH_TEXT", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "forward_qwen.cu"))
+# The gate corpus must be STABLE across builds: reading the live engine source made
+# every teacher-forced comparison spanning an edit to the file compare DIFFERENT
+# prompts (an #include added near the top of forward_qwen.cu shifted the token
+# window and produced a fake 2-3% "agreement" between numerically fine builds).
+# Pin to the initial-commit blob of the same file; TQ_BENCH_TEXT still overrides.
+def _bigtext_path():
+    env = os.environ.get("TQ_BENCH_TEXT")
+    if env:
+        return env
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    pin = os.path.join(root, "build-qwen", "tf_corpus_e3cdb42.txt")
+    if not os.path.exists(pin):
+        import subprocess
+        try:
+            blob = subprocess.check_output(["git", "-C", root, "show", "e3cdb42:src/forward_qwen.cu"])
+            os.makedirs(os.path.dirname(pin), exist_ok=True)
+            with open(pin, "wb") as f:
+                f.write(blob)
+        except Exception:
+            return os.path.join(root, "src", "forward_qwen.cu")   # last resort: live file
+    return pin
+BIGTEXT = _bigtext_path()
 
 
 def load_lib(path):

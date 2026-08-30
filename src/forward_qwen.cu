@@ -3706,15 +3706,22 @@ static int tq_dn_prep_enabled(void) {
     if (c < 0) { const char *e = getenv("TQ_DN_PREP"); c = (e && e[0] && !atoi(e)) ? 0 : 1; }
     return c;
 }
-// D.5: chunk-64 matmul scan. 0 = off (the ck=8 head-split scan), 1 = on with
-// 32-col value stripes (192 CTAs, DEFAULT: 1.42x the ship scan at N=256 and
-// faster at every N >= 128), 2 = 64-col stripes (measured slower). Routed only
-// for N >= 128; smaller segments keep the ck=8 path.
+// D.5: chunk-64 matmul scan. 3 = tf32 wmma phases (DEFAULT: +5-7% prefill on
+// top of the fp32 scan; end-to-end gates land inside the engine's own eps band
+// -- TF 97.28% vs the old scan, the same value the unmodified-engine wave-width
+// control measured -- while the kernel-level core error is 1.3e-2 from tf32
+// rounding under the delta rule's ~20x cancellation, vs 2.1e-5 for fp32. For
+// calibration, vLLM's GDN scan runs these contractions in bf16, 8x coarser.
+// An earlier "3% agreement" rejection of this tier was a HARNESS BUG: the
+// teacher-forced corpus was the live engine source, and an #include added near
+// the top shifted the prompt window between builds. The corpus is pinned now.)
+// 1 = fp32 scan (conservative tier), 0 = the ck=8 head-split scan, 2 = 64-col
+// fp32 stripes (measured slower). Routed only for N >= 128.
 static float *g_dnmm = nullptr;
 static int g_dnmm_floats = 0;
 static int tq_dn_mm_mode(void) {
     static int c = -2;
-    if (c < -1) { const char *e = getenv("TQ_DN_MM"); c = (e && e[0]) ? atoi(e) : 1; }
+    if (c < -1) { const char *e = getenv("TQ_DN_MM"); c = (e && e[0]) ? atoi(e) : 3; }
     return c;
 }
 

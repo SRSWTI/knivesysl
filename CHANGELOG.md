@@ -11,6 +11,41 @@ driven by the same client (`tools/bench_endpoint.py`).
 
 ## Unreleased
 
+### Long-context attention: depth-adaptive tiles, wide deep waves
+
+The 64k profile put the wide-prefill attention at **54.1%** of the whole prefill;
+everything else is a footnote at depth. Root cause is arithmetic, not mystery: KV
+traffic scales as `total_query_rows / M_tile x depth`, and the kernel ran M=32
+(wide-shared) / M=16 (paged) tiles. FA2's hd256 config runs M=64 but is smem-capped
+there by its bf16 KV tiles (96 KB CTA); our int4-K/e4m3-V tiles are 4-8x smaller, so
+M=64 fits in 55 KB of dynamic shared memory with the identical per-row fragment
+plan. Three changes:
+
+- **`k_tq_wide_attn_mma4`**: a 64-query-row generalization of the QT=1/2 kernel
+  (same fragment floor plan, loops over four 16-row tiles). Per-row numerics are
+  IDENTICAL: 16k wide-path argmax 64/64 vs the 32-row kernel, needle 3/3 with the
+  path forced. Registers pin it at 1 CTA/SM (a forced 2-CTA build spilled and lost),
+  so it only wins where KV streaming dominates: auto-routed at prefix depth >= 24k
+  (wide-shared) / segment depth thresholds 4k/24k for 16/32/64 rows (paged -- which
+  had been running 16-row tiles at EVERY depth and reading KV 4x more than the
+  engine path at 64k).
+- **Wave width by depth**: the engine cap rises to 2048 (a MAXIMUM; wave builders
+  choose), and `serve_batched` widens a wave to the cap once a prefilling client's
+  cursor passes 16k -- four fewer weight passes where attention dominates anyway.
+  Shallow prompts keep 512 (8055 vs 7903 tok/s at P=2048 single-wave).
+- Measured: engine 64k prefill 3966 -> **4567** (+15%), 16k 6252 -> 6553 at
+  2048-col waves; server 64k **2677 -> 4267 (+59%)**, 16k 5288 -> 5853. The 64k
+  deficit vs vLLM narrows 2.64x -> **1.68x**. Paged parity 11/11 shallow + 6/6
+  deep, teacher-forced and FP6 regression gates re-run on the final build below
+  (FP6 single-stream 4265 prefill / 135.8 decode-only, in band).
+
+GEMM close-out, honestly: the z-batched column tiles (+2.6%) were this session's
+GEMM win. Gate/up fusion was evaluated and skipped -- the two projections share an
+L2-hot B, so a merged launch saves only launch overhead. What remains between our
+54% of the 2051 TFLOP/s issue roof and CUTLASS's 68% is the producer/consumer
+pipeline depth that TMA+mbarrier alone did not buy; that is a multi-week rewrite,
+recorded here rather than started half-finished.
+
 ### Prefill campaign: scheduler truth, DeltaNet matmul scan, 512 waves, z-batched GEMM
 
 Engine-level NVFP4 (`all`) prefill 6408 -> 7752 tok/s at 4096 tokens (+21%); 8042 at
@@ -41,11 +76,21 @@ teacher-forced drift 16/257 vs the 7/257 unmodified-engine eps band. `TQ_DN_MM=0
 reverts. Side effect: FP6 spec decode 133.6 -> 141.4 tok/s (>=128-token chunk
 advances route through it).
 
-**tf32 wmma scan tier (`TQ_DN_MM=3`) -- measured, REJECTED for default.** +7%
-prefill (7538 -> 8083), but the delta-rule core cancels ~20x opposing terms, so
-tf32's 5e-4 input rounding amplifies to 1.3e-2 core error: needle 3/4, TF agreement
-3.1%. Kept only as the like-for-like numeric class against vLLM, whose GDN scan
-runs these contractions in bf16 (8x coarser under the same cancellation).
+**tf32 wmma scan tier (`TQ_DN_MM=3`) -- first rejected, then SHIPPED as default
+after the rejection turned out to be a harness bug.** The teacher-forced gate
+corpus was the LIVE engine source file; the `#include <mma.h>` this very tier
+added near the top shifted the prompt window, so the "3.1% agreement" compared
+different prompts between builds. With the corpus pinned (initial-commit blob,
+`TQ_BENCH_TEXT` overrides), the true same-prompt numbers on the final build:
+fp32 scan 96.11% vs the old scan, **tf32 tier 97.28%** -- exactly the value the
+unmodified-engine wave-width control measured, i.e. inside the engine's own eps
+band -- and tf32-vs-fp32 98.05%, 16k wide argmax 60/64, needle 3/4 (the same
+depth-8000 near-tie the fp32 path flips). The kernel-level distance is real and
+stays documented: 1.3e-2 core error from tf32 rounding under the delta rule's
+~20x cancellation, vs 2.1e-5 fp32 -- and vLLM's GDN scan runs these same
+contractions in bf16, 8x coarser. +5-7% prefill on top of the fp32 scan
+(4k 7773 -> 8349, 16k 6569 -> 7044, 64k 4586 -> 4813). `TQ_DN_MM=1` is the
+conservative fp32 tier.
 
 **Wave cap 256 -> 512 (default, `TQ_WAVE_MAX` overrides).** The second 256-col GEMM
 pass re-reads each projection weight from L2; after the scan rewrite the weight
