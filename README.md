@@ -114,15 +114,19 @@ the gemm was 55% of prefill and the 48 gated-deltanet layers' chunkwise scan 22.
 the scan was rewritten too — recurrent state held in registers across the whole chunk
 instead of re-read and re-written every 8 tokens, the per-token prep hoisted out of the
 sub-chunk loop and parallelised, and the idle-lane substitution phase removed. 1.56-1.59x
-at every chunk width.
+at every chunk width. the scan has since been rewritten AGAIN as a chunk-64 factored
+matmul (`TQ_DN_MM`): every state-independent quantity hoists to a fully parallel prep
+and the serial dimension shrinks 32 -> 4 steps of register-tiled fp32 matmuls per 256
+tokens — 269 -> 188 us/layer-wave, needle 4/4 at 262k, paged parity 11/11.
 
 ```
 prefill, single stream, 4096-token prompt:  2579 --> 4630 tok/s   (1.80x)
 prefill, paged, 32 clients x 2048 tokens:   1198 --> 2216 tok/s   (1.85x)
 ```
 
-with the nvfp4 w4a4 tier, tma staging and a measured split-k config on top, the same
-4096-token single-stream prefill is now **5970 tok/s** and the paged path 5973 at n=1.
+with the nvfp4 w4a4 tier, tma staging, the matmul scan, 512-column waves and the
+z-batched gemm column tiles on top, the same 4096-token single-stream prefill is now
+**7769 tok/s** (8042 at 2048) and the paged path 6948 at n=1.
 
 **and the server-level comparison has now been run against vllm's real production
 config** -- same client, both engines over http. the earlier run used `--enforce-eager`,
@@ -136,19 +140,26 @@ decode:
 
 | | vllm | knivesysl | |
 |---|--:|--:|---|
-| prefill 4096, unique, cold | 8095 | 5625 | 1.44x theirs |
-| prefill 4096, unique, warm | 10723 | 5985 | 1.79x theirs |
-| prefill 4096, shared prefix, warm | 37074 | **175071** | **4.72x ours** |
-| decode n=1 (the only clean server figure) | 68.0 | 60.6 | 1.12x theirs |
+| prefill 2048, unique, cold (fresh server) | 5218 | 7357 | 1.41x ours |
+| prefill 2048, unique, fully warm | 10304 | 7432 | 1.39x theirs |
+| prefill 4096, unique, fully warm | 16080 | 7099 | 2.27x theirs |
+| prefill 4096, shared prefix, warm | 40282 | **174093** | **4.32x ours** |
+| prefill 16384 (conc 2) | 10104 | 5279 | 1.91x theirs |
+| prefill 65536 | 7162 | 2710 | 2.64x theirs |
+| ttft p50, 8 clients x 2048 | 1.425 s | **1.404 s** | ours |
+| decode n=1, paged | 69.2 | 61.1 | 1.13x theirs |
+| decode n=1, fp6 mtp spec decode | 69.2 | **141.4** | **2.04x ours** |
 
-**the honest summary: we win cached prefill by ~4.7x, and we are behind on cold prefill
-(1.44x) and on single-stream decode (1.12x).** their kv is fp8 and ours is int4, so this is
-not like-for-like on quality. the n>1 server decode cells are prefill-contaminated in both
-engines and are not quoted; engine-level our paged decode is 445 tok/s at n=8 and 1198 at
-n=32, so the decode *kernels* are competitive and the *scheduler* gives much of it back
-under mixed load. what remains on prefill is the kernels: 54% of this card's measured 2051
-tflop/s fp4 issue roof against cutlass's 68%, and a deltanet scan pinned at a structural
-1536-warp ceiling.
+**the honest summary: we win shared-prefix prefill ~4.3x, single-request cold starts,
+ttft under batch load, and single-stream decode when the fp6 spec-decode path is used
+(2x). vllm's fully-warmed unique prefill is ahead — 1.4x at 2k growing to 2.6x at 64k —
+and its lead grows with context because its flashattention prefill scales better than
+our wide-attention kernel.** their kv is fp8 and ours is int4, so quality is not
+like-for-like. the n>1 server decode cells are prefill-residency-bound in both engines:
+engine-level our paged decode is 17.98 ms/step at n=8 and 20.0 at n=16 — within 5% of
+theirs — so those cells track the prefill gap, not the decode kernels. what remains is
+(a) long-context prefill attention, now the largest single deficit, and (b) the gemm at
+54% of this card's measured 2051 tflop/s fp4 issue roof against cutlass's 68%.
 
 ### decode at depth — gqa-shared paged attention
 
@@ -300,13 +311,15 @@ turns.
 | `TQ_PAGED_GQA=0` | revert paged decode attention to one cta per query head |
 | `TQ_WIDE_GEMM=0` | revert the wide fp6 projection gemm to the 1-warp/cta kernel |
 | `TQ_GEMM_STAGES` | wide-gemm `cp.async` pipeline depth (2..4, default 2) |
-| `TQ_WAVE_MAX` | prefill wave column cap (default 256 = the gemm's column tile) |
+| `TQ_WAVE_MAX` | prefill wave column cap (default 512 = 2x the gemm's column tile; the second 256-col pass l2-hits the weights) |
 | `TQ_W_E2M1=1` | opt-in 4-bit weight tier (k32 mma: memory win only, no compute win) |
 | `TQ_W_NVFP4=all` | nvfp4 w4a4 tier, every projection (k64 mma: 2.05x instruction roof) |
 | `TQ_W_NVFP4=mlp` | nvfp4 for the mlp only; attention + deltanet stay fp6 |
 | `TQ_NVFP4_STAGES` | nvfp4 gemm pipeline depth fallback (autotuned per shape at load) |
 | `TQ_NVFP4_TMA=0` | revert the nvfp4 gemm from `cp.async.bulk.tensor` to `cp.async` |
 | `TQ_WIDE_ATTN_MMA=0` | revert prefill attention to the scalar/split-k decode kernel |
+| `TQ_DN_MM` | deltanet chunk-64 matmul scan: 1 = on (default, fp32), 0 = ck8 head-split scan, 3 = tf32 wmma tier (fails the quality gates; comparison-only) |
+| `--fuse-idle-ms` | ride a decode row on a prompt wave only after this idle time (default 125; riding costs 1.2 ms/row/wave) |
 | `--prefill-budget` | prompt columns per wave, on top of the decode rows |
 | `--prefix-cache` | materialize a shared prompt prefix once (batched server) |
 
@@ -346,16 +359,13 @@ see `CHANGELOG.md` for the measurement log behind every number here.
 
 ## where this is going
 
-1. re-run the guidellm sustained-arrival comparison against vllm. the gemm deficit that
-   lost every cell of it is closed (124 --> 392-478 tflops, against the 255-572 cutlass
-   reference) and prefill is 1.8x, but the comparison itself is not re-measured
-2. tensorize the deltanet chunk transforms. the scan is 1.6x faster but still pure
-   scalar fp32 fma, on regular 8x128 / 128x64 shapes, and it fills only 96 of 170 sms
-   (48 value heads x 2 stripes) because the per-stripe prep is duplicated. hoisting the
-   prep into its own kernel unlocks nstripe=4/8
-3. fold the two-pass activation quantizer into one pass by holding the k-block in
-   registers instead of shared memory (it is 5.8% of prefill and reads `x` twice), and
-   fuse `silu_mul` + `add_vec` into the quantizer / norm that follow them (another ~4%)
+1. re-run the guidellm sustained-arrival comparison against vllm; the point-benchmark
+   matrix (bench_endpoint) is measured and in `CHANGELOG.md`, sustained arrival is not
+2. long-context prefill attention. at 64k the wide-attention share dominates and vllm's
+   flashattention pulls 2.6x ahead (7162 vs 2710 server-level); the 2-16k regime is
+   competitive. this is now the largest single deficit
+3. the nvfp4 `all`-tier memory accounting: ~6.5 gb of device allocation is untracked,
+   which blocks 262k-context and high-concurrency pools that fp6 handles fine
 4. re-measure quality against nvfp4 ourselves instead of inheriting the number
 5. more models — the converter and the format are architecture-agnostic; the kernels
    are not, yet

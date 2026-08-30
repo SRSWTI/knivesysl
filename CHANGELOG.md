@@ -3,10 +3,87 @@
 All performance numbers are measured on this machine: RTX 5090 (GB202, SM120, 170 SM,
 32 GB, 128 MB L2), CUDA 13.3, driver 595, Qwen3.8-27B FP6 (E2M3) + Q4 KV, greedy,
 thinking off unless stated. vLLM comparisons are vLLM 0.27.1 serving
-`unsloth/Qwen3.8-27B-NVFP4` (mixed W8A8 + W4A4, 22.5 GB) at `--max-model-len 16384
---gpu-memory-utilization 0.90`, driven by the same client.
+`unsloth/Qwen3.8-27B-NVFP4` (mixed W8A8 + W4A4, 22.5 GB), this session at
+`--max-model-len 116032 --gpu-memory-utilization 0.92 --kv-cache-dtype fp8
+--max-num-batched-tokens 8192 --enable-prefix-caching --language-model-only`
+(140000 does not fit at util 0.92 right now: 4.59 GiB KV needed, 3.87 free),
+driven by the same client (`tools/bench_endpoint.py`).
 
 ## Unreleased
+
+### Prefill campaign: scheduler truth, DeltaNet matmul scan, 512 waves, z-batched GEMM
+
+Engine-level NVFP4 (`all`) prefill 6408 -> 7752 tok/s at 4096 tokens (+21%); 8042 at
+2048. Server-level: cold-unique prefill 6264 -> 7357 (vs vLLM's 5218, **1.41x ahead**),
+hot-unique 6264 -> 7432 (vs 9758, deficit 1.56x -> 1.31x), shared-prefix hot 96976
+(2.88x ahead), TTFT p50 at N=8 1.68 -> 1.404 s (now under vLLM's 1.425). Four changes,
+each gated:
+
+**Scheduler: the "2x scheduler loss" claim was wrong -- withdrawn.** A per-wave
+timeline (`/v1/wavelog`, new) showed 14 ms of host gaps in a 4.4 s N=8 run: the
+Python scheduler was innocent all along. The real decode-cell gap decomposes ~85%
+prefill residency in the measurement window, ~10% ride policy, ~5% step speed.
+The measured ride cost is 1.2 ms/row/wave while a tail step is row-invariant, so
+eager riding bought nothing under synchronized load: rides are now starve-gated
+(`--fuse-idle-ms`, default 125) and the legacy min-rows/every-N step triggers only
+apply with fuse off. N=8 212 -> 218, N=16 252 -> 262 at identical kernels.
+
+**DeltaNet chunk-64 matmul scan (`TQ_DN_MM`, default on).** The head-split scan was
+structurally capped at 96 CTAs walking 32 serial sub-chunks per 256 tokens; column
+striping was exhausted. The per-sub-chunk map is affine in the state, so every
+state-independent factor hoists into a fully parallel prep (4x4-register-tiled Gram,
+DP=129 anti-bank-conflict stride -- the stride-128 version burned 60% of the kernel
+in 32-way conflicts -- and a 16-row blocked forward substitution), and the scan
+collapses to N/64 serial steps of register-tiled fp32 matmuls. 269 -> 188
+us/layer-wave (1.42x). Numerics: maxdiff 2.1e-5 vs the per-token reference (ship
+tier was 8.8e-6; N=512 both land ~2.5e-5), needle 4/4 at 262k, paged parity 11/11,
+teacher-forced drift 16/257 vs the 7/257 unmodified-engine eps band. `TQ_DN_MM=0`
+reverts. Side effect: FP6 spec decode 133.6 -> 141.4 tok/s (>=128-token chunk
+advances route through it).
+
+**tf32 wmma scan tier (`TQ_DN_MM=3`) -- measured, REJECTED for default.** +7%
+prefill (7538 -> 8083), but the delta-rule core cancels ~20x opposing terms, so
+tf32's 5e-4 input rounding amplifies to 1.3e-2 core error: needle 3/4, TF agreement
+3.1%. Kept only as the like-for-like numeric class against vLLM, whose GDN scan
+runs these contractions in bf16 (8x coarser under the same cancellation).
+
+**Wave cap 256 -> 512 (default, `TQ_WAVE_MAX` overrides).** The second 256-col GEMM
+pass re-reads each projection weight from L2; after the scan rewrite the weight
+re-stream stopped being hidden: 7043 -> 7556 at 4096 tokens. 768+ declines
+(attention's deepest-position charge grows with the wave). The old width-insensitive
+result predated TMA + autotune + the scan rewrite.
+
+**NVFP4 GEMM column tiles batched in one launch (`blockIdx.z`).** A 512-col wave ran
+two host-serialized 256-col passes; tile 1's CTAs now fill tile 0's grid tail.
+7556 -> 7752. Numeric gate 75 cells at ns up to 512, worst 9.8e-08.
+
+Diagnostic footnote: two real-vs-synthetic "mysteries" during this work were my own
+tooling -- a CSV parse that split kernel template names at commas (making the
+harness look 30x faster than production), and an ftz/denormal theory the data then
+refuted. The bank-conflict and cancellation findings above are what survived.
+
+Final head-to-head (server-level, same client, both engines fully warm; ksl =
+NVFP4 `all`, 20 slots / 340 blocks at 2-4k, 4 slots / 560 blocks at 64k):
+
+| scenario | vllm | knivesysl | |
+|---|--:|--:|---|
+| prefill 2048 unique, fresh server | 5218 | 7357 | 1.41x ours |
+| prefill 2048 unique, warm | 10304 | 7432 | 1.39x theirs |
+| prefill 4096 unique, warm | 16080 | 7099 | 2.27x theirs |
+| prefill 4096 shared prefix | 40282 | 174093 | 4.32x ours |
+| prefill 16384 (conc 2) | 10104 | 5279 | 1.91x theirs |
+| prefill 65536 | 7162 | 2710 | 2.64x theirs |
+| ttft p50 8x2048 | 1.425 s | 1.404 s | ours |
+| decode n=1 paged | 69.2 | 61.1 | 1.13x theirs |
+| decode n=1 fp6 spec | 69.2 | 141.4 | 2.04x ours |
+| decode n=8 / n=16 unique | 468 / 675 | 244 / 295 | prefill-residency-bound |
+| decode n=8 / n=16 shared | 506 / 950 | 438 / 765 | 1.15x / 1.24x theirs |
+
+Engine-level (chunk 512, tok/s): FP6 4869/4821/4539/3190 and NVFP4-all
+8042/7769/6317/3966 at P=2048/4096/16384/65536. Paged decode (`all`):
+16.7/18.0/20.0 ms/step at N=1/8/16 @2k ctx; 16.6 @16k; 20.0 @64k. vLLM's
+lead grows with context: its flashattention prefill scales better than the
+wide-attention kernel, which is now the largest single deficit.
 
 ### Three levers closed by measurement, one small win
 
