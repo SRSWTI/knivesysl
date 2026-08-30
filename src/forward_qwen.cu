@@ -3396,6 +3396,17 @@ static int tq_dn_prep_enabled(void) {
     if (c < 0) { const char *e = getenv("TQ_DN_PREP"); c = (e && e[0] && !atoi(e)) ? 0 : 1; }
     return c;
 }
+// D.5: chunk-64 matmul scan. 0 = off (the ck=8 head-split scan), 1 = on with
+// 32-col value stripes (192 CTAs, DEFAULT: 1.42x the ship scan at N=256 and
+// faster at every N >= 128), 2 = 64-col stripes (measured slower). Routed only
+// for N >= 128; smaller segments keep the ck=8 path.
+static float *g_dnmm = nullptr;
+static int g_dnmm_floats = 0;
+static int tq_dn_mm_mode(void) {
+    static int c = -2;
+    if (c < -1) { const char *e = getenv("TQ_DN_MM"); c = (e && e[0]) ? atoi(e) : 1; }
+    return c;
+}
 
 static int wide_attn_mma_enabled(void) {
     static int c = -1;
@@ -19126,6 +19137,432 @@ __global__ void k_tq_deltanet_norm(float *core_out, const float *core_raw, const
     core_out[base + v] = normed * (gate / (1.0f + expf(-gate)));
 }
 
+// ---------------------------------------------------------------------------------
+// D.5 (TQ_DN_MM): chunk-64 matmul reformulation of the DeltaNet scan.
+//
+// WHY: the head-split scan is structurally capped at value_heads*nstripe = 96 CTAs
+// (1536 warps, ~2.3 per scheduler slot) walking 32 serial sub-chunks per 256
+// tokens, and measured ~6% of fp32 peak -- latency/sync-bound, not FLOP-bound.
+// Column striping is exhausted (ns=4 is slower even with prep hoisted).
+//
+// The per-sub-chunk map is AFFINE in the incoming state S:
+//     S_out = gamma * (S - Kn^T W Kn S ...) + Kn^T D~,
+// so every S-independent factor can be hoisted to a fully parallel prep over
+// (head, chunk-of-64), and the scan collapses to nchunk = N/64 serial steps of
+// dense fp32 matmul phases per (head, value-stripe) CTA:
+//     X    = KW @ S                    [T x VS]   KW = (I+L)^-1 diag(beta*e) Kn
+//     Dl   = D0 - X                               D0 = (I+L)^-1 (beta o V)
+//     core = EQ @ S + Am @ Dl                     EQ = diag(e) Qn, Am = decayed QK^T
+//     S    = gamma * S + KC^T @ Dl                KC = diag(gamma/e) Kn
+// The chunkwise delta rule is exact at any chunk size (CK=32 already ships as a
+// template of the same formulas), so this is the SAME math at CK=64 -- but the
+// serial dimension shrinks 32 -> 4 and every phase is a coalesced matmul.
+// NOT bit-exact vs ck=8 (reassociation); gated by the same check harness and the
+// end-to-end needle/agreement gates as every chunk kernel before it.
+// ---------------------------------------------------------------------------------
+// Real A_log decay drives la tens-of-units negative within a 64-token chunk, so
+// naive expf() fills the factor matrices -- and through them the state -- with
+// fp32 DENORMALS, which measured a ~30-60x kernel slowdown on real data vs the
+// synthetic harness (215 us vs 6.5 us per scan). e^-80 = 1.8e-35 is still a
+// normal float and pure noise for the model, so clamp to a hard zero below
+// that and flush denormal accumulations at phase boundaries.
+static __device__ __forceinline__ float dn_exp(float x) {
+    return (x < -80.0f) ? 0.0f : expf(x);
+}
+static __device__ __forceinline__ float dn_flush(float x) {
+    return (fabsf(x) < 1.0e-30f) ? 0.0f : x;
+}
+// Per-phase cycle accounting for the prep kernel (TQ_DNMM_PH=1 prints once).
+__device__ unsigned long long g_dnmm_ph[8];
+template<int T, int D>
+__global__ __launch_bounds__(256, 1)
+void k_tq_dnmm_prep(float *out, const float *qkv_conv,
+                    const float *b_proj, const float *a_proj,
+                    const float *A_log, const uint16_t *dt_bias,
+                    int N, int value_heads, int key_heads) {
+    const int ci = blockIdx.x;                   // chunk index
+    const int head = blockIdx.y;
+    const int base = ci * T;
+    if (base >= N) return;
+    const int L = (N - base) < T ? (N - base) : T;
+    const int tid = threadIdx.x;
+    const int BS = 256;
+
+    const int group = value_heads / key_heads;
+    const int key_head = head / group;
+    const int key_dim = key_heads * D;
+    const int conv_dim = 2 * key_dim + value_heads * D;
+
+    // DP = D+1 row stride: consecutive m walk kn[m*DP+d] across DISTINCT banks;
+    // at stride D=128 every such read was a 32-way conflict (measured 60% of the
+    // kernel in the Gram phase alone).
+    const int DP = D + 1;
+    extern __shared__ float sm_dnmm[];
+    float *kn = sm_dnmm;                         // [T][DP]
+    float *qn = kn + T * DP;                     // [T][DP]
+    float *Lm = qn + T * DP;                     // [T][T]
+    float *la = Lm + T * T;                      // [T]
+    float *be = la + T;                          // [T]
+
+    const int nchunk = (N + T - 1) / T;
+    const size_t BLK = (size_t)(4 * T * D + T * T + 16);
+    float *o = out + ((size_t)head * nchunk + ci) * BLK;
+    float *oKW = o, *oD0 = o + T * D, *oEQ = o + 2 * T * D, *oKC = o + 3 * T * D;
+    float *oAm = o + 4 * T * D, *oMeta = oAm + T * T;
+
+    __shared__ float qf_sh[T], kf_sh[T];
+    unsigned long long _c0 = clock64();
+    // Inverse-L2 factors: one WARP per token (coalesced 128-float row reads +
+    // butterfly reduce) instead of one thread walking 128 strided loads.
+    {
+        const int warp = tid >> 5, lane = tid & 31, nwarp = BS >> 5;
+        for (int j = warp; j < L; j += nwarp) {
+            const float *q = qkv_conv + (size_t)(base + j) * conv_dim + (size_t)key_head * D;
+            float qss = 0.0f, kss = 0.0f;
+            #pragma unroll
+            for (int d = lane; d < D; d += 32) {
+                float a = q[d]; qss += a * a;
+                float b = q[key_dim + d]; kss += b * b;
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                qss += __shfl_xor_sync(0xffffffffu, qss, off);
+                kss += __shfl_xor_sync(0xffffffffu, kss, off);
+            }
+            if (lane == 0) {
+                qf_sh[j] = rsqrtf(qss + 1.0e-6f) * rsqrtf((float)D);
+                kf_sh[j] = rsqrtf(kss + 1.0e-6f);
+            }
+        }
+    }
+    // Decay terms in parallel (one thread per token: the transcendentals), then
+    // a 64-add serial prefix on thread 0 -- same accumulation order as the
+    // reference's serial loop.
+    if (tid < L) {
+        int gt = base + tid;
+        float Alog = A_log[head], dtb = tq_bf16_to_float(dt_bias[head]);
+        float bb = b_proj[(size_t)gt * value_heads + head];
+        float sp_arg = a_proj[(size_t)gt * value_heads + head] + dtb;
+        float sp = log1pf(expf(-fabsf(sp_arg))) + fmaxf(sp_arg, 0.0f);
+        be[tid] = 1.0f / (1.0f + expf(-bb));
+        la[tid] = -expf(Alog) * sp;          // per-token term; prefixed below
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float cum = 0.0f;
+        for (int j = 0; j < L; j++) { cum += la[j]; la[j] = cum; }
+    }
+    __syncthreads();
+    unsigned long long _c1 = clock64();
+
+    for (int idx = tid; idx < L * D; idx += BS) {
+        int j = idx / D, d = idx % D;
+        const float *q = qkv_conv + (size_t)(base + j) * conv_dim + (size_t)key_head * D;
+        qn[j * DP + d] = q[d] * qf_sh[j];
+        kn[j * DP + d] = q[key_dim + d] * kf_sh[j];
+    }
+    __syncthreads();
+    unsigned long long _c2 = clock64();
+
+    // decayed Gram matrices L (strictly lower, smem for the solve) and Am
+    // (lower incl. diagonal, straight to global). 4x4 register tiles: 12 smem
+    // reads feed 32 FMAs, and tiles strictly above the diagonal skip the dot.
+    for (int t4 = tid; t4 < (T / 4) * (T / 4); t4 += BS) {
+        const int jt4 = (t4 / (T / 4)) * 4;
+        const int mt4 = (t4 % (T / 4)) * 4;
+        float dkk[4][4], dqk[4][4];
+        const bool live = (mt4 <= jt4 + 3);
+        if (live) {
+            #pragma unroll
+            for (int a = 0; a < 4; a++)
+                #pragma unroll
+                for (int bb = 0; bb < 4; bb++) { dkk[a][bb] = 0.0f; dqk[a][bb] = 0.0f; }
+            for (int d = 0; d < D; d++) {
+                float kj[4], qj[4], km[4];
+                #pragma unroll
+                for (int a = 0; a < 4; a++) {
+                    kj[a] = kn[(jt4 + a) * DP + d];
+                    qj[a] = qn[(jt4 + a) * DP + d];
+                    km[a] = kn[(mt4 + a) * DP + d];
+                }
+                #pragma unroll
+                for (int a = 0; a < 4; a++)
+                    #pragma unroll
+                    for (int bb = 0; bb < 4; bb++) {
+                        dkk[a][bb] += kj[a] * km[bb];
+                        dqk[a][bb] += qj[a] * km[bb];
+                    }
+            }
+        }
+        #pragma unroll
+        for (int a = 0; a < 4; a++)
+            #pragma unroll
+            for (int bb = 0; bb < 4; bb++) {
+                const int j = jt4 + a, m = mt4 + bb;
+                float decay = (live && m <= j && j < L && m < L) ? dn_exp(la[j] - la[m]) : 0.0f;
+                Lm[j * T + m]  = (live && m < j)  ? be[j] * decay * dkk[a][bb] : 0.0f;
+                oAm[j * T + m] = (live && m <= j) ? decay * dqk[a][bb] : 0.0f;
+            }
+    }
+    __syncthreads();
+    unsigned long long _c3 = clock64();
+
+    for (int idx = tid; idx < L * D; idx += BS) {
+        int j = idx / D;
+        oEQ[idx] = dn_exp(la[j]) * qn[j * DP + idx % D];
+        oKC[idx] = dn_exp(la[L - 1] - la[j]) * kn[j * DP + idx % D];
+    }
+    for (int idx = L * D + tid; idx < T * D; idx += BS) { oEQ[idx] = 0.0f; oKC[idx] = 0.0f; }
+    __syncthreads();
+    unsigned long long _c4 = clock64();
+
+    // RHS_A = diag(beta*e) Kn -> qn (qn is free), RHS_B = beta o V -> kn
+    for (int idx = tid; idx < L * D; idx += BS) {
+        int j = idx / D;
+        qn[j * DP + idx % D] = be[j] * dn_exp(la[j]) * kn[j * DP + idx % D];
+    }
+    __syncthreads();
+    for (int idx = tid; idx < L * D; idx += BS) {
+        int j = idx / D, d = idx % D;
+        kn[j * DP + d] = be[j] * qkv_conv[(size_t)(base + j) * conv_dim + 2 * key_dim + (size_t)head * D + d];
+    }
+    __syncthreads();
+    unsigned long long _c5 = clock64();
+
+    // Blocked dual forward substitution (I+L)X = RHS, one thread per column of
+    // [qn | kn]: the cross-block update is a dense 16-way-ILP matmul, only the
+    // 16 in-block steps chain -- the previous row-serial version chained all 64.
+    for (int c = tid; c < 2 * D; c += BS) {
+        float *X = (c < D) ? qn : kn;
+        const int col = (c < D) ? c : c - D;
+        for (int jb = 0; jb < T; jb += 16) {
+            float xr[16];
+            #pragma unroll
+            for (int a = 0; a < 16; a++) xr[a] = X[(jb + a) * DP + col];
+            for (int m = 0; m < jb; m++) {
+                const float xm = X[m * DP + col];
+                #pragma unroll
+                for (int a = 0; a < 16; a++) xr[a] -= Lm[(jb + a) * T + m] * xm;
+            }
+            #pragma unroll
+            for (int a = 1; a < 16; a++) {
+                float acc = xr[a];
+                #pragma unroll
+                for (int m = 0; m < a; m++) acc -= Lm[(jb + a) * T + jb + m] * xr[m];
+                xr[a] = acc;
+            }
+            #pragma unroll
+            for (int a = 0; a < 16; a++) X[(jb + a) * DP + col] = xr[a];
+        }
+    }
+    __syncthreads();
+    unsigned long long _c6 = clock64();
+    for (int idx = tid; idx < L * D; idx += BS) { int j = idx / D, d = idx % D; oKW[idx] = qn[j * DP + d]; oD0[idx] = kn[j * DP + d]; }
+    for (int idx = L * D + tid; idx < T * D; idx += BS) { oKW[idx] = 0.0f; oD0[idx] = 0.0f; }
+    if (tid == 0) {
+        oMeta[0] = dn_exp(la[L - 1]); oMeta[1] = (float)L;
+        atomicAdd(&g_dnmm_ph[0], _c1 - _c0); atomicAdd(&g_dnmm_ph[1], _c2 - _c1);
+        atomicAdd(&g_dnmm_ph[2], _c3 - _c2); atomicAdd(&g_dnmm_ph[3], _c4 - _c3);
+        atomicAdd(&g_dnmm_ph[4], _c5 - _c4); atomicAdd(&g_dnmm_ph[5], _c6 - _c5);
+        atomicAdd(&g_dnmm_ph[6], clock64() - _c6); atomicAdd(&g_dnmm_ph[7], 1ull);
+    }
+}
+
+// Serial chunk walk; state stripe [D x VS] lives in shared memory, every phase a
+// dense fp32 matmul fed from a cooperatively staged 16-row slab. Each thread
+// owns a register tile of the output (JR j-rows x 4 value cols, float4 reads on
+// the [.][VS] operands), which cuts shared traffic to ~0.5 reads/FMA -- the
+// naive 2-reads/FMA version was smem-bandwidth-bound at ~8 TF/s.
+// grid = value_heads * (D/VS), 256 threads, >=2 CTAs/SM at VS=32.
+template<int T, int D, int VS>
+__global__ __launch_bounds__(256, 2)
+void k_tq_dnmm_scan(float *core_raw, float *recurrent_state, const float *prep,
+                    int N, int value_heads) {
+    const int nstripe = D / VS;
+    const int head = blockIdx.x / nstripe;
+    const int stripe = blockIdx.x % nstripe;
+    if (head >= value_heads) return;
+    const int tid = threadIdx.x;
+    const int BS = 256;
+    const int SLAB = 16;                         // factor rows staged per pass
+    const int value_dim = value_heads * D;
+    const int v0 = stripe * VS;
+    const int nchunk = (N + T - 1) / T;
+    const size_t BLK = (size_t)(4 * T * D + T * T + 16);
+
+    extern __shared__ float sm_dnmm[];
+    float *S  = sm_dnmm;                         // [D][VS]
+    float *Dl = S + D * VS;                      // [T][VS]
+    float *Am = Dl + T * VS;                     // [T][T]
+    float *sl = Am + T * T;                      // [SLAB][D]
+
+    float *state = recurrent_state + (size_t)head * D * D;
+    for (int idx = tid; idx < D * VS; idx += BS)
+        S[idx] = state[(size_t)(idx / VS) * D + v0 + idx % VS];
+    __syncthreads();
+
+    // output tiling: 4 value cols per thread (float4), JT thread groups over rows
+    constexpr int CT = VS / 4;                   // thread cols  (8 at VS=32)
+    constexpr int JT = BS / CT;                  // thread rows  (32 at VS=32)
+    constexpr int JR = T / JT;                   // j-rows per thread in TxVS phases
+    constexpr int KR = D / JT;                   // k-rows per thread in DxVS carry
+    const int ct = tid % CT;                     // this thread's col group
+    const int jt = tid / CT;                     // this thread's row group
+    const int c4 = 4 * ct;
+
+    for (int c = 0; c < nchunk; c++) {
+        const float *o = prep + ((size_t)head * nchunk + c) * BLK;
+        const float *KW = o, *D0 = o + T * D, *EQ = o + 2 * T * D, *KC = o + 3 * T * D;
+        const float *oAm = o + 4 * T * D;
+        const float gamma = oAm[T * T];
+        const int L = (int)oAm[T * T + 1];
+        for (int idx = tid; idx < T * T; idx += BS) Am[idx] = oAm[idx];
+
+        // Dl = D0 - KW @ S : rows j = jt*JR .. jt*JR+JR-1, cols c4..c4+3
+        for (int js = 0; js < T; js += SLAB) {
+            __syncthreads();
+            for (int idx = tid; idx < SLAB * D; idx += BS) sl[idx] = KW[js * D + idx];
+            __syncthreads();
+            #pragma unroll
+            for (int jr = 0; jr < JR; jr++) {
+                const int j = jt * JR + jr;
+                if (j < js || j >= js + SLAB) continue;
+                float4 acc = *(const float4 *)&D0[j * D + v0 + c4];
+                const float *w = sl + (j - js) * D;
+                #pragma unroll 8
+                for (int k = 0; k < D; k++) {
+                    const float4 s4 = *(const float4 *)&S[k * VS + c4];
+                    const float wk = w[k];
+                    acc.x -= wk * s4.x; acc.y -= wk * s4.y;
+                    acc.z -= wk * s4.z; acc.w -= wk * s4.w;
+                }
+                acc.x = dn_flush(acc.x); acc.y = dn_flush(acc.y);
+                acc.z = dn_flush(acc.z); acc.w = dn_flush(acc.w);
+                *(float4 *)&Dl[j * VS + c4] = acc;
+            }
+        }
+        __syncthreads();
+
+        // core = EQ @ S + Am @ Dl (rows < L only)
+        for (int js = 0; js < T; js += SLAB) {
+            __syncthreads();
+            for (int idx = tid; idx < SLAB * D; idx += BS) sl[idx] = EQ[js * D + idx];
+            __syncthreads();
+            #pragma unroll
+            for (int jr = 0; jr < JR; jr++) {
+                const int j = jt * JR + jr;
+                if (j < js || j >= js + SLAB || j >= L) continue;
+                float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                const float *w = sl + (j - js) * D;
+                #pragma unroll 8
+                for (int k = 0; k < D; k++) {
+                    const float4 s4 = *(const float4 *)&S[k * VS + c4];
+                    const float wk = w[k];
+                    acc.x += wk * s4.x; acc.y += wk * s4.y;
+                    acc.z += wk * s4.z; acc.w += wk * s4.w;
+                }
+                for (int i = 0; i <= j; i++) {
+                    const float4 d4 = *(const float4 *)&Dl[i * VS + c4];
+                    const float aji = Am[j * T + i];
+                    acc.x += aji * d4.x; acc.y += aji * d4.y;
+                    acc.z += aji * d4.z; acc.w += aji * d4.w;
+                }
+                *(float4 *)&core_raw[(size_t)(c * T + j) * value_dim + (size_t)head * D + v0 + c4] = acc;
+            }
+        }
+        __syncthreads();
+
+        // S = gamma * S + KC^T @ Dl : k-rows kt*KR.., float4 over both operands
+        {
+            float carry[KR][4];
+            #pragma unroll
+            for (int kr = 0; kr < KR; kr++) {
+                const int k = jt * KR + kr;
+                const float4 s4 = *(const float4 *)&S[k * VS + c4];
+                carry[kr][0] = gamma * s4.x; carry[kr][1] = gamma * s4.y;
+                carry[kr][2] = gamma * s4.z; carry[kr][3] = gamma * s4.w;
+            }
+            for (int js = 0; js < T; js += SLAB) {
+                __syncthreads();
+                for (int idx = tid; idx < SLAB * D; idx += BS) sl[idx] = KC[js * D + idx];
+                __syncthreads();
+                #pragma unroll
+                for (int j = 0; j < SLAB; j++) {
+                    const float4 d4 = *(const float4 *)&Dl[(js + j) * VS + c4];
+                    #pragma unroll
+                    for (int kr = 0; kr < KR; kr++) {
+                        const float wk = sl[j * D + jt * KR + kr];
+                        carry[kr][0] += wk * d4.x; carry[kr][1] += wk * d4.y;
+                        carry[kr][2] += wk * d4.z; carry[kr][3] += wk * d4.w;
+                    }
+                }
+            }
+            __syncthreads();
+            #pragma unroll
+            for (int kr = 0; kr < KR; kr++) {
+                const int k = jt * KR + kr;
+                float4 s4;
+                s4.x = dn_flush(carry[kr][0]); s4.y = dn_flush(carry[kr][1]);
+                s4.z = dn_flush(carry[kr][2]); s4.w = dn_flush(carry[kr][3]);
+                *(float4 *)&S[k * VS + c4] = s4;
+            }
+        }
+        __syncthreads();
+    }
+    for (int idx = tid; idx < D * VS; idx += BS)
+        state[(size_t)(idx / VS) * D + v0 + idx % VS] = S[idx];
+}
+
+// prep + scan + norm. vs = value-stripe width (32 or 64).
+static int launch_deltanet_chunk_mm(int vs, float *core_out, float *recurrent_state,
+                                    const float *qkv_conv, const float *z,
+                                    const float *b_proj, const float *a_proj,
+                                    const float *A_log, const uint16_t *dt_bias,
+                                    const float *norm_weight, int N, int value_heads,
+                                    int key_heads, int dim, float eps, cudaStream_t st) {
+    if (dim != 128) return -100;
+    const int T = 64;
+    int nchunk = (N + T - 1) / T;
+    size_t blk = (size_t)(4 * T * dim + T * T + 16);
+    size_t need = (size_t)value_heads * nchunk * blk;
+    if (need > (size_t)0x7fffffff) return -103;
+    if (ensure_float_buffer(&g_dnmm, &g_dnmm_floats, (int)need, "d_dnmm") != 0) return -102;
+
+    size_t psm = (size_t)(2 * T * (dim + 1) + T * T + 2 * T) * sizeof(float);  // 81 KB (DP pad, Am direct)
+    size_t ssm32 = (size_t)(dim * 32 + T * 32 + T * T + 16 * dim) * sizeof(float);  // 48 KB
+    size_t ssm64 = (size_t)(dim * 64 + T * 64 + T * T + 16 * dim) * sizeof(float);  // 72 KB
+    static int primed = 0;
+    if (!primed) {
+        cudaFuncSetAttribute(k_tq_dnmm_prep<64, 128>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)psm);
+        cudaFuncSetAttribute(k_tq_dnmm_scan<64, 128, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ssm32);
+        cudaFuncSetAttribute(k_tq_dnmm_scan<64, 128, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ssm64);
+        if (cudaGetLastError() != cudaSuccess) return -105;
+        primed = 1;
+    }
+    dim3 pg(nchunk, value_heads);
+    k_tq_dnmm_prep<64, 128><<<pg, 256, psm, st>>>(g_dnmm, qkv_conv, b_proj, a_proj,
+                                                  A_log, dt_bias, N, value_heads, key_heads);
+    if (vs == 64)
+        k_tq_dnmm_scan<64, 128, 64><<<value_heads * (dim / 64), 256, ssm64, st>>>(
+            core_out, recurrent_state, g_dnmm, N, value_heads);
+    else
+        k_tq_dnmm_scan<64, 128, 32><<<value_heads * (dim / 32), 256, ssm32, st>>>(
+            core_out, recurrent_state, g_dnmm, N, value_heads);
+    if (cudaGetLastError() != cudaSuccess) return -104;
+    k_tq_deltanet_norm<<<value_heads * N, dim, 0, st>>>(
+        core_out, core_out, z, norm_weight, value_heads, dim, eps);
+    static long ph_calls = 0;
+    if (getenv("TQ_DNMM_PH") && ++ph_calls == 200) {
+        cudaStreamSynchronize(st);
+        unsigned long long h[8] = {0};
+        cudaMemcpyFromSymbol(h, g_dnmm_ph, sizeof(h));
+        double nb = (double)(h[7] ? h[7] : 1);
+        fprintf(stderr, "dnmm prep cycles/block: qfkf=%.0f qkload=%.0f gram=%.0f "
+                        "amout=%.0f rhs=%.0f solve=%.0f tail=%.0f blocks=%llu\n",
+                h[0] / nb, h[1] / nb, h[2] / nb, h[3] / nb, h[4] / nb, h[5] / nb, h[6] / nb, h[7]);
+    }
+    return 0;
+}
 // Launch the head-split chunk kernel + the norm finaliser. block = (D/nstripe)*g
 // threads, grid = value_heads*nstripe blocks. BEST config measured on RTX 5090
 // (N=128): ck=8, nstripe=2, g=8 -> ~260us = 15.3x vs the 128x per-token loop
@@ -19138,6 +19575,21 @@ static int launch_deltanet_chunk_hs(int ck, int nstripe, int g,
                                     const float *norm_weight, int N, int value_heads,
                                     int key_heads, int dim, float eps, cudaStream_t st) {
     if (dim != 128) return -100;
+    // D.5 route: ck==64 forces the chunk-64 matmul scan (check/bench harness maps
+    // nstripe 1 -> 64-col stripes, else 32); TQ_DN_MM=1/2 enables it in production
+    // for N >= 128, where the serial dimension actually shrinks (2+ chunks) and
+    // the prep grid fills the card. Falls back to the ck=8 path on any error.
+    if (ck == 64)
+        return launch_deltanet_chunk_mm(nstripe == 1 ? 64 : 32, core_out, recurrent_state,
+                                        qkv_conv, z, b_proj, a_proj, A_log, dt_bias,
+                                        norm_weight, N, value_heads, key_heads, dim, eps, st);
+    if (tq_dn_mm_mode() > 0 && N >= 128) {
+        int rc = launch_deltanet_chunk_mm(tq_dn_mm_mode() >= 2 ? 64 : 32, core_out,
+                                          recurrent_state, qkv_conv, z, b_proj, a_proj,
+                                          A_log, dt_bias, norm_weight, N, value_heads,
+                                          key_heads, dim, eps, st);
+        if (rc == 0) return 0;
+    }
     int sv = dim / nstripe;
     dim3 grid(value_heads * nstripe), blk(sv * g);
 
