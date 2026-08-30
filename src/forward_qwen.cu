@@ -21208,11 +21208,18 @@ static inline int tq_wide_fmt_ok(const tq_qmma_weight_t *w) {
 // Wide MLP for a chunk of n tokens: post-rmsnorm(resid) -> gate/up (wide, shared B-frag)
 // -> silu*mul -> down (wide) -> layer_out = resid + down. resid and layer_out are [n x H]
 // (token-major); may NOT alias. Returns 0; -1 if mlp weights aren't e2m3-SF (caller falls back).
-static int wide_mlp(tq_layer_t *l, const float *resid, float *layer_out, int n) {
+// add_a/add_b non-null: fold `resid = add_a + add_b` into the post-norm launch, which
+// costs one kernel and one full read of resid otherwise. `resid` is written either way
+// (the down-projection residual needs it).
+static int wide_mlp_x(tq_layer_t *l, const float *add_a, const float *add_b,
+                      float *resid_w, const float *resid, float *layer_out, int n) {
     int H = g_qwen.H, I = g_qwen.I;
     if (!(tq_wide_fmt_ok(&l->mlp_gate) && tq_wide_fmt_ok(&l->mlp_up) &&
           tq_wide_fmt_ok(&l->mlp_down))) return -1;
-    k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(n), n), 1024, 0, g_qwen.stream>>>(g_wide_pn, resid, l->d_post_ln, H, g_qwen.eps);
+    if (add_a)
+        k_tq_add_rmsnorm_b<<<dim3(1, n), 1024, 0, g_qwen.stream>>>(g_wide_pn, resid_w, add_a, add_b, l->d_post_ln, H, g_qwen.eps);
+    else
+        k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(n), n), 1024, 0, g_qwen.stream>>>(g_wide_pn, resid, l->d_post_ln, H, g_qwen.eps);
     int ret = wide_quant_input(g_wide_pn, H, n);
     if (ret != 0) return ret;
     if ((ret = wide_proj(&l->mlp_gate, g_wide_gate, n)) != 0) return ret;
@@ -21222,6 +21229,9 @@ static int wide_mlp(tq_layer_t *l, const float *resid, float *layer_out, int n) 
     if ((ret = wide_proj(&l->mlp_down, g_wide_down, n)) != 0) return ret;
     k_tq_add_vec<<<((size_t)n * H + 255) / 256, 256, 0, g_qwen.stream>>>(layer_out, resid, g_wide_down, (size_t)n * H);
     return 0;
+}
+static inline int wide_mlp(tq_layer_t *l, const float *resid, float *layer_out, int n) {
+    return wide_mlp_x(l, nullptr, nullptr, nullptr, resid, layer_out, n);
 }
 
 // ---- D.1 integration: wide projection via k_tq_fp6_wide_gemm (shared per-128K-block
@@ -21407,9 +21417,7 @@ static int run_wide_chunk_forward(const int *tokens, int base_pos, int n) {
             if (wide_ok) {
                 if ((ret = wide_quant_input(g_wide_core, attn_m, n)) != 0) return -58;
                 if ((ret = wide_proj(&l->o_proj, g_wide_o, n)) != 0) return -58;
-                k_tq_add_vec<<<((size_t)n * H + 255) / 256, 256, 0, g_qwen.stream>>>(
-                    g_wide_resid, g_wide_h, g_wide_o, (size_t)n * H);
-                if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, n)) != 0) return -59;
+                if ((ret = wide_mlp_x(l, g_wide_h, g_wide_o, g_wide_resid, g_wide_resid, g_wide_h, n)) != 0) return -59;
             } else {
                 for (int i = 0; i < n; i++) {
                     cudaMemcpyAsync(g_qwen.d_debug_x, g_wide_h + (size_t)i * H,
@@ -21471,9 +21479,7 @@ static int run_wide_chunk_forward(const int *tokens, int base_pos, int n) {
                         n, lvh, lkh, ld, g_qwen.eps, g_qwen.stream)) != 0) return -60;
                 if ((ret = wide_quant_input(g_wide_lcore, value_dim, n)) != 0) return -60;
                 if ((ret = wide_proj(&l->linear_out, g_wide_o, n)) != 0) return -60;
-                k_tq_add_vec<<<((size_t)n * H + 255) / 256, 256, 0, g_qwen.stream>>>(
-                    g_wide_resid, g_wide_h, g_wide_o, (size_t)n * H);
-                if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, n)) != 0) return -60;
+                if ((ret = wide_mlp_x(l, g_wide_h, g_wide_o, g_wide_resid, g_wide_resid, g_wide_h, n)) != 0) return -60;
             } else {
                 for (int i = 0; i < n; i++) {
                     cudaMemcpyAsync(g_qwen.d_debug_x, g_wide_h + (size_t)i * H,
@@ -22255,9 +22261,7 @@ static int run_batched_decode_step_core(const int *tokens, const int *positions,
             }
             if ((ret = wide_quant_input(g_wide_core, attn_m, N)) != 0) return -25;
             if ((ret = wide_proj(&l->o_proj, g_wide_o, N)) != 0) return -25;
-            k_tq_add_vec<<<((size_t)N * H + 255) / 256, 256, 0, g_qwen.stream>>>(
-                g_wide_resid, g_wide_h, g_wide_o, (size_t)N * H);
-            if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, N)) != 0) return -26;
+            if ((ret = wide_mlp_x(l, g_wide_h, g_wide_o, g_wide_resid, g_wide_resid, g_wide_h, N)) != 0) return -26;
         } else {   // linear-attention (gated DeltaNet)
             if (!(tq_wide_fmt_ok(&l->linear_in_qkv) && tq_wide_fmt_ok(&l->linear_in_z) &&
                   tq_wide_fmt_ok(&l->linear_in_b) && tq_wide_fmt_ok(&l->linear_in_a) &&
@@ -22280,9 +22284,7 @@ static int run_batched_decode_step_core(const int *tokens, const int *positions,
                 return -35;
             if ((ret = wide_quant_input(g_wide_lcore, value_dim, N)) != 0) return -36;
             if ((ret = wide_proj(&l->linear_out, g_wide_o, N)) != 0) return -36;
-            k_tq_add_vec<<<((size_t)N * H + 255) / 256, 256, 0, g_qwen.stream>>>(
-                g_wide_resid, g_wide_h, g_wide_o, (size_t)N * H);
-            if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, N)) != 0) return -37;
+            if ((ret = wide_mlp_x(l, g_wide_h, g_wide_o, g_wide_resid, g_wide_resid, g_wide_h, N)) != 0) return -37;
         }
     }
     // final norm (wide) -> lm_head. Wide lm_head when it is e2m3-SF (one read for all N);
@@ -23379,8 +23381,7 @@ static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, 
                                      N, dec_maxpos, g_qwen.stream) != 0) return -67;
             if ((ret = wide_quant_input(g_wide_core, attn_m, N)) != 0) return -68;
             if ((ret = wide_proj(&l->o_proj, g_wide_o, N)) != 0) return -68;
-            k_tq_add_vec<<<((size_t)N * H + 255) / 256, 256, 0, g_qwen.stream>>>(g_wide_resid, g_wide_h, g_wide_o, (size_t)N * H);
-            if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, N)) != 0) return -69;
+            if ((ret = wide_mlp_x(l, g_wide_h, g_wide_o, g_wide_resid, g_wide_resid, g_wide_h, N)) != 0) return -69;
         } else {
             if (!(tq_wide_fmt_ok(&l->linear_in_qkv) && tq_wide_fmt_ok(&l->linear_in_z) &&
                   tq_wide_fmt_ok(&l->linear_in_b) && tq_wide_fmt_ok(&l->linear_in_a) &&
@@ -23400,8 +23401,7 @@ static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, 
                 return -75;
             if ((ret = wide_quant_input(g_wide_lcore, value_dim, N)) != 0) return -76;
             if ((ret = wide_proj(&l->linear_out, g_wide_o, N)) != 0) return -76;
-            k_tq_add_vec<<<((size_t)N * H + 255) / 256, 256, 0, g_qwen.stream>>>(g_wide_resid, g_wide_h, g_wide_o, (size_t)N * H);
-            if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, N)) != 0) return -77;
+            if ((ret = wide_mlp_x(l, g_wide_h, g_wide_o, g_wide_resid, g_wide_resid, g_wide_h, N)) != 0) return -77;
         }
     }
     k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(N), N), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, g_qwen.d_norm, H, g_qwen.eps);
@@ -23550,9 +23550,8 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
             TQ_WV_CK("attention");
             if ((ret = wide_quant_input(g_wide_core, attn_m, T)) != 0) return -95;
             if ((ret = wide_proj(&l->o_proj, g_wide_o, T)) != 0) return -95;
-            k_tq_add_vec<<<((size_t)T * H + 255) / 256, 256, 0, g_qwen.stream>>>(g_wide_resid, g_wide_h, g_wide_o, (size_t)T * H);
-            TQ_WV_CK("o_proj+resid");
-            if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, T)) != 0) return -96;
+            TQ_WV_CK("o_proj");
+            if ((ret = wide_mlp_x(l, g_wide_h, g_wide_o, g_wide_resid, g_wide_resid, g_wide_h, T)) != 0) return -96;
             TQ_WV_CK("mlp");
         } else {
             if (!(tq_wide_fmt_ok(&l->linear_in_qkv) && tq_wide_fmt_ok(&l->linear_in_z) &&
@@ -23580,9 +23579,8 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
             TQ_WV_CK("delta_conv_scan");
             if ((ret = wide_quant_input(g_wide_lcore, value_dim, T)) != 0) return -100;
             if ((ret = wide_proj(&l->linear_out, g_wide_o, T)) != 0) return -100;
-            k_tq_add_vec<<<((size_t)T * H + 255) / 256, 256, 0, g_qwen.stream>>>(g_wide_resid, g_wide_h, g_wide_o, (size_t)T * H);
             TQ_WV_CK("delta_out+resid");
-            if ((ret = wide_mlp(l, g_wide_resid, g_wide_h, T)) != 0) return -101;
+            if ((ret = wide_mlp_x(l, g_wide_h, g_wide_o, g_wide_resid, g_wide_resid, g_wide_h, T)) != 0) return -101;
             TQ_WV_CK("delta_mlp");
         }
     }
