@@ -8,6 +8,88 @@ thinking off unless stated. vLLM comparisons are vLLM 0.27.1 serving
 
 ## Unreleased
 
+### DeltaNet: the state-independent prep hoisted out of the scan
+
+The scan's dominant phase built `Lmat`/`Amat` -- `L*L` inner-product pairs, each a serial
+128-step walk over D. At CK=8 that is 64 pairs against 512 threads, so **448 threads idled
+through the most expensive step**, and because it is a pure function of q,k within the
+sub-chunk, every stripe of a head recomputed it identically.
+
+Split into `k_tq_deltanet_prep_hs`, grid `(nsub, value_heads)` = 1536 blocks at N=256
+against the scan's 96. **Bit-exact, not eps-equivalent**: one thread per `(j,m)` pair
+walking d in the same order, one per token for the `qfac`/`kfac` L2 sums, one per sub-chunk
+for the serial `cum` decay. The chunk-check maxdiff against the per-token reference is
+*identical* in every config (8.792e-06, 7.689e-06, 7.302e-06, 8.732e-06).
+
+| | before | after |
+|---|--:|--:|
+| scan @N=256 (ck=8,ns=2,g=8) | 0.3173 ms | **0.2685** (1.18x) |
+| wide prefill 4096 tok | 6008 | **6365 tok/s** |
+| paged prefill N=1 | 5946 | **6309** |
+| paged prefill N=8 | 4575 | **4662** |
+| FP6 single-stream prefill | 3853 | **3989** |
+
+Prep is 21.9 us of the resulting 263. Gated on `nsub>=4`: ragged multi-client waves give
+`seg_len=8` per launch (32 clients over a 256-column wave), so `nsub=1`, 48 blocks, nothing
+to spread -- that measured **4.3% slower** at N=32 while 5.9% faster at N=1. Above the
+threshold N=32 is neutral. `TQ_DN_PREP=0` reverts.
+
+#### What bounds this, measured
+
+The scan's thread count is `value_heads * D * G` -- **independent of `nstripe`**. Striping
+over D redistributes the same 49152 threads into more, smaller blocks and duplicates
+per-block work; it buys no parallelism at all:
+
+| ck | g | ns=1 | ns=2 | ns=4 | warps (all) |
+|--:|--:|--:|--:|--:|--:|
+| 16 | 8 | 0.6291 | **0.3020** | 0.4610 | 1536 |
+| 8 | 8 | — | **0.2677** | 0.4205 | 1536 |
+| 8 | 16 | — | 0.2939 | 0.3593 | 3072 |
+
+Doubling warps via `g=16` does not help either. So the scan sits at a structural ceiling of
+~1536 warps = 2.3 per scheduler slot on 170 SMs, and passing it needs a different
+decomposition -- a two-level associative scan over sub-chunks with prefix composition --
+not tuning. My earlier ~1.2-1.3x estimate for this lever assumed tensorising the state
+contractions; **I am deliberately not doing that in bf16.** The state is recurrent over
+150k tokens and bf16 operands would push the scan's maxdiff from 8.8e-06 to ~1e-3.
+
+### Corrected vLLM baseline: CUDA graphs were worth 2.3x to them
+
+Every earlier vLLM comparison in this file used `--enforce-eager`, which I had believed was
+forced by this checkpoint OOMing during cudagraph memory profiling at 32 GB. It was not:
+`--language-model-only` skips the vision tower, and with it vLLM runs its full production
+config on this card. Re-measured, same client, both engines over HTTP:
+
+`vllm serve unsloth/Qwen3.8-27B-NVFP4 --max-model-len 140000 --max-num-seqs 32
+--gpu-memory-utilization 0.92 --kv-cache-dtype fp8 --max-num-batched-tokens 8192
+--enable-prefix-caching --language-model-only`
+
+| | vLLM eager (old) | vLLM production | gain to them |
+|---|--:|--:|--:|
+| prefill 4096 unique, cold | 7985 | 8095 | 1.01x |
+| prefill 4096 unique, warm | 9206 | 10723 | 1.16x |
+| decode N=1 | 29.2 | **68.0** | **2.33x** |
+| decode N=8 | 170.8 | **461.7** | **2.70x** |
+
+So **the claim "we win decode at every concurrency" was an artifact of a crippled
+baseline** and is withdrawn. Against the real config:
+
+| | vLLM | knivesysl | |
+|---|--:|--:|---|
+| prefill 4096 unique, cold | 8095 | 5625 | 1.44x theirs |
+| prefill 4096 unique, warm | 10723 | 5985 | 1.79x theirs |
+| prefill 4096 shared prefix, warm | 37074 | **175071** | **4.72x ours** |
+| decode N=1 (clean) | 68.0 | 60.6 | 1.12x theirs |
+
+Two things I will not paper over. **Their KV is fp8, ours is int4** -- ours is smaller and
+lossier, so this is not a like-for-like quality comparison. And the **N>1 server decode
+numbers are prefill-contaminated in both engines**: with `--max-prefill 2` and 256-column
+waves, 8x4096 tokens of prefill overlaps the decode phase, while their
+`--max-num-batched-tokens 8192` retires each prompt in one pass. Engine-level our paged
+decode is 445 tok/s at N=8 (17.96 ms/step) and 1198 at N=32; the honest reading is that our
+decode *kernels* are competitive and our *scheduler* gives much of it back under mixed
+load. N=1 is the only uncontaminated server figure, and there we are 1.12x behind.
+
 ### The multi-client server was never running the prefill attention kernel
 
 `TQ_WIDE_ATTN_MMA` was opt-in while the tensor-core prefill attention was being brought

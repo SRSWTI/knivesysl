@@ -124,23 +124,31 @@ prefill, paged, 32 clients x 2048 tokens:   1198 --> 2216 tok/s   (1.85x)
 with the nvfp4 w4a4 tier, tma staging and a measured split-k config on top, the same
 4096-token single-stream prefill is now **5970 tok/s** and the paged path 5973 at n=1.
 
-**and the server-level comparison has now been run** — same client, both engines over
-http, vllm 0.27.1 serving `unsloth/Qwen3.8-27B-NVFP4` (`--enforce-eager`: its cudagraph
-memory profiling ooms on this checkpoint at 32 gb):
+**and the server-level comparison has now been run against vllm's real production
+config** -- same client, both engines over http. the earlier run used `--enforce-eager`,
+which i wrongly believed this checkpoint forced; `--language-model-only` skips the vision
+tower and vllm runs its full config, cuda graphs included, which is worth **2.3x** to its
+decode:
 
-| | vllm | knivesysl | ratio |
-|---|--:|--:|--:|
-| prefill 4096, unique prompt, cold | 7985 | 5648 | 0.71x |
-| prefill 4096, shared prefix, warm | 35324 | **171435** | **4.85x** |
-| decode n=1 | 29.2 | **61.2** | **2.10x** |
-| decode n=8, unique | 170.8 | **205.4** | **1.20x** |
-| decode n=8, shared prefix | 220.4 | **435.1** | **1.97x** |
+`vllm serve unsloth/Qwen3.8-27B-NVFP4 --max-model-len 140000 --max-num-seqs 32
+--gpu-memory-utilization 0.92 --kv-cache-dtype fp8 --max-num-batched-tokens 8192
+--enable-prefix-caching --language-model-only`
 
-**the honest summary: we win decode at every concurrency and win cached prefill by ~5x;
-we lose cold unique-prompt prefill by 1.41x.** that last cell was 2.98x until the
-multi-client server was found to be running the wrong attention kernel entirely (see
-`CHANGELOG.md`); what remains of it is the kernels — 54% of this card's measured 2051
-tflop/s fp4 issue roof against cutlass's 68%, and a deltanet scan still on scalar fp32.
+| | vllm | knivesysl | |
+|---|--:|--:|---|
+| prefill 4096, unique, cold | 8095 | 5625 | 1.44x theirs |
+| prefill 4096, unique, warm | 10723 | 5985 | 1.79x theirs |
+| prefill 4096, shared prefix, warm | 37074 | **175071** | **4.72x ours** |
+| decode n=1 (the only clean server figure) | 68.0 | 60.6 | 1.12x theirs |
+
+**the honest summary: we win cached prefill by ~4.7x, and we are behind on cold prefill
+(1.44x) and on single-stream decode (1.12x).** their kv is fp8 and ours is int4, so this is
+not like-for-like on quality. the n>1 server decode cells are prefill-contaminated in both
+engines and are not quoted; engine-level our paged decode is 445 tok/s at n=8 and 1198 at
+n=32, so the decode *kernels* are competitive and the *scheduler* gives much of it back
+under mixed load. what remains on prefill is the kernels: 54% of this card's measured 2051
+tflop/s fp4 issue roof against cutlass's 68%, and a deltanet scan pinned at a structural
+1536-warp ceiling.
 
 ### decode at depth — gqa-shared paged attention
 
