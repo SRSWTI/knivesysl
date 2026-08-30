@@ -280,7 +280,8 @@ turns.
 | `TQ_W_E2M1=1` | opt-in 4-bit weight tier (k32 mma: memory win only, no compute win) |
 | `TQ_W_NVFP4=all` | nvfp4 w4a4 tier, every projection (k64 mma: 2.05x instruction roof) |
 | `TQ_W_NVFP4=mlp` | nvfp4 for the mlp only; attention + deltanet stay fp6 |
-| `TQ_NVFP4_STAGES` | nvfp4 gemm `cp.async` pipeline depth (2..5, default 3) |
+| `TQ_NVFP4_STAGES` | nvfp4 gemm pipeline depth fallback (autotuned per shape at load) |
+| `TQ_NVFP4_TMA=0` | revert the nvfp4 gemm from `cp.async.bulk.tensor` to `cp.async` |
 | `--prefill-budget` | prompt columns per wave, on top of the decode rows |
 | `--prefix-cache` | materialize a shared prompt prefix once (batched server) |
 

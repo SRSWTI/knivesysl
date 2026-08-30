@@ -8,6 +8,96 @@ thinking off unless stated. vLLM comparisons are vLLM 0.27.1 serving
 
 ## Unreleased
 
+### TMA staging + a measured launch config for the NVFP4 GEMM
+
+The prefill GEMM was at 49% of the measured 2051 TFLOP/s `mxf4nvf4` issue roof against
+CUTLASS's 68%. Everything except one term had already been excluded by measurement:
+shared-memory bandwidth (warp-tile reshape 2mx16n -> 4mx8n, 1-2%), copy-issue parallelism
+(warp specialisation scaled LINEARLY with producer warps and never caught all-8-warps
+issue), and one of the two per-stage barriers (taken, ~2%). What remained was that all 8
+warps converge on a **CTA-wide barrier every stage** -- unavoidable with `cp.async`,
+because the warps that consume the data are the ones that issued it, so "bytes landed" is
+only observable collectively.
+
+`cp.async.bulk.tensor` breaks that coupling: one elected thread issues 4 box loads per
+stage, the DMA engine transfers, and completion lands on an **mbarrier** each warp waits
+on independently. A second barrier set (`empty[s]`, one arrival per warp) replaces the
+CTA fence for buffer reuse, so a warp that finishes early goes straight to the next
+stage instead of blocking on the slowest.
+
+| N (FLOP-weighted, 64 layers) | CUTLASS | cp.async | TMA | gain | vs CUTLASS |
+|--:|--:|--:|--:|--:|--:|
+| 64 | 293.5 | 565.2 | 566.2 | 1.00x | **1.93x** |
+| 128 | 599.2 | 712.1 | 760.8 | 1.07x | **1.27x** |
+| 256 | 935.8 | 848.1 | 922.0 | 1.09x | 0.99x |
+| 512 | 1185.4 | 846.5 | 930.1 | 1.10x | 0.78x |
+
+`mlp_down` @256 is **1104 TF = 1.33x CUTLASS**; `kv_proj` 1.80x. N=256 (the prefill wave)
+moves from 0.91x to **0.99x** of CUTLASS. Deterministic over 3 runs, all 28 harness cells
+and all 60 in-engine cells exact (9.8e-08).
+
+Two hardware constraints shaped it, both found by failing:
+
+1. **`cuTensorMapEncodeTiled` caps every box dimension at 256 ELEMENTS.** A stage is 2
+   k64 tiles = 288 u32 along the contiguous axis, so a stage is *two* box loads, not one.
+   That also splits the shared layout: TMA writes a box contiguously, so the two k-halves
+   are separate regions rather than interleaved at stride 288.
+2. **The shared destination must be 128-BYTE aligned.** B's k64 half is `NG*72` u32 --
+   aligned only for NG>=4. At NG=1/2 it landed at 288/576 B and the copy failed. The
+   standalone harness never caught it because its smallest N is 64 (NG=8); the in-engine
+   gate, which runs down to N=1, caught it immediately. Fixed by padding the half stride
+   to 32 u32, with `expect_tx` still counting the *unpadded* transferred bytes (the
+   barrier completes on byte count, so padding must not be counted).
+
+#### The bigger win the hunt exposed: split-K was mispriced
+
+End-to-end, TMA alone moved prefill ~2% -- far less than the kernel gain. The reason was
+not TMA: the engine's `(ks, stages)` heuristic disagreed with the harness optimum, so the
+kernel was measured at one operating point and shipped at another.
+
+| shape | mblocks | harness best | old heuristic |
+|---|--:|---|---|
+| `mlp_gate/up` | 136 | k1 | k2 |
+| `q_proj` | 96 | k1 | k2 |
+| `mlp_down` | 40 | k4 | k8 |
+| `lin_in_z` | 48 | k2 | k4 |
+
+The heuristic priced **SM occupancy only**. Split-K also adds a full reduce pass over
+`nvar*M` floats -- for `q_proj` at 256 columns that is ~25 MB of traffic against a 39 us
+GEMM, ~35% overhead -- so it over-split every large-M shape. Rather than fit a better
+guess, `nvf4_autotune` now **measures** `(ks, stages)` once at load, cached per `(M,K)`
+(the model has ~7 distinct projection shapes, so this is a few dozen timed launches). It
+reproduces the swept optimum exactly: `gate=k1s3 down=k4s3 lqkv=k2s3`.
+
+The tuner needed one guard that is worth stating, because the first version got it wrong:
+**a config that exceeds the opt-in shared limit fails to launch and therefore returns
+instantly, which a timing loop reports as the fastest config.** It duly picked stages=4 at
+NG=32 (110 KB against a 101 KB limit) and produced garbage. It now screens shared memory
+up front and verifies the warm launch actually ran.
+
+#### Measured
+
+| | FP6 | NVFP4 before | + autotune | + TMA |
+|---|--:|--:|--:|--:|
+| wide prefill 4096 tok | 4470 | 5138 | 5847 | **5970** |
+| paged prefill 2048, N=1 | 4441 | — | — | **5973** |
+| paged prefill, N=8 | 3609 | — | — | **4580** |
+| paged prefill, N=32 | 2204 | — | — | **2532** |
+| paged decode N=1 ms/step | 18.74 | — | — | **16.68** |
+| paged decode N=8 | 20.43 | — | — | **17.96** |
+| paged decode N=32 | 29.51 | — | — | **26.73** |
+| server-side prefill (HTTP) | — | 2678 | 3115 | **3336** |
+
+1.34x over FP6 on wide prefill, 1.35x on paged prefill at N=1, 1.10-1.14x on paged decode.
+`TQ_NVFP4_TMA=0` reverts to cp.async.
+
+One measurement caveat worth recording: `bench_rounds.py`, `tf_agreement.py` and
+`nvfp4_quality.py` all use `src/forward_qwen.cu` as their prompt corpus, so their absolute
+numbers drift as that file is edited. A 139.7 -> 133.7 decode-only tok/s "regression" was
+chased through three reference builds before this was the answer: all three, including the
+one that had measured 139.7, gave an identical 134.1 on the current corpus. Comparisons
+must be same-corpus, back to back.
+
 ### NVFP4 W4A4 tier (`TQ_W_NVFP4`)
 
 A second weight format alongside FP6, in NVIDIA's NVFP4 numerics: E2M1 codes + per-16
