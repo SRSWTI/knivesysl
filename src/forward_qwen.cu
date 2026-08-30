@@ -3387,6 +3387,16 @@ static int wide_attn_qrows(void) {
     return c;
 }
 
+// D.4 DeltaNet prep slab: state-independent per-token factors + Lmat/Amat, computed
+// in a fully-parallel launch. TQ_DN_PREP=0 reverts to computing them inside the scan.
+static float *g_dn_prep = nullptr;
+static int g_dn_prep_floats = 0;
+static int tq_dn_prep_enabled(void) {
+    static int c = -1;
+    if (c < 0) { const char *e = getenv("TQ_DN_PREP"); c = (e && e[0] && !atoi(e)) ? 0 : 1; }
+    return c;
+}
+
 static int wide_attn_mma_enabled(void) {
     static int c = -1;
     // ON by default. This was opt-in while the tensor-core prefill attention was being
@@ -18784,13 +18794,126 @@ static int launch_deltanet_chunk(int ck, float *core_out, float *recurrent_state
 //
 // Cross-value gated RMSNorm still cannot be done per stripe: this writes the RAW
 // core and k_tq_deltanet_norm finalises it.
+// ---------------------------------------------------------------------------------
+// D.4: hoisted DeltaNet prep. Everything the scan does that does NOT touch the
+// recurrent state, computed in its own fully-parallel launch.
+//
+// WHY: in the fused kernel the dominant phase is the (j,m) inner-product pair loop
+// that builds Lmat/Amat -- L*L pairs, each a serial 128-step walk over D. At CK=8
+// that is 64 pairs against (D/NSTRIPE)*G = 512 threads, so 448 threads idle through
+// the most expensive step. Worse, it is a pure function of q,k in the sub-chunk, so
+// every stripe of a head recomputes it identically: that duplication is why
+// nstripe 2 -> 4 measured 1.71x SLOWER despite doubling the block count (0.315 ->
+// 0.539 ms at N=256), and why the scan was pinned at 96 of 170 SMs.
+//
+// Split out, the prep grid is (nsub, value_heads) = 1536 blocks at N=256/CK=8, and
+// the scan keeps only the state-carrying steps -- which already use all threads.
+//
+// BIT-EXACT, by construction: one thread per (j,m) pair walking d in the same order,
+// one thread per token for the qfac/kfac L2 sums, one thread per sub-chunk for the
+// serial `cum` decay. Identical operands in identical order -> identical fp32.
+//
+// Layout of `prep` (floats), heads-major so each block writes contiguously:
+//   [0 .. h*N)          la      [head][token]
+//   [1*A .. 2*A)        beta
+//   [2*A .. 3*A)        qfac        A = value_heads * N
+//   [3*A .. 4*A)        kfac
+//   [4*A ..     )       Lmat/Amat   [head][sub][2][CK][CK]
+template<int CK, int D>
+__global__ __launch_bounds__(CK * CK, 1)
+void k_tq_deltanet_prep_hs(float *prep, const float *qkv_conv,
+                           const float *b_proj, const float *a_proj,
+                           const float *A_log, const uint16_t *dt_bias,
+                           int N, int value_heads, int key_heads) {
+    const int si = blockIdx.x;                   // sub-chunk index
+    const int head = blockIdx.y;
+    const int base = si * CK;
+    if (base >= N) return;
+    const int L = (N - base) < CK ? (N - base) : CK;
+    const int tid = threadIdx.x;
+    const int BS = CK * CK;
+
+    const int group = value_heads / key_heads;
+    const int key_head = head / group;
+    const int key_dim = key_heads * D;
+    const int conv_dim = 2 * key_dim + value_heads * D;
+    const size_t A = (size_t)value_heads * N;
+
+    float *la_g   = prep;
+    float *beta_g = prep + A;
+    float *qfac_g = prep + 2 * A;
+    float *kfac_g = prep + 3 * A;
+    const int nsub = (N + CK - 1) / CK;
+    float *LA = prep + 4 * A + ((size_t)head * nsub + si) * (2 * CK * CK);
+
+    __shared__ float kn_sh[CK][D];
+    __shared__ float qn_sh[CK][D];
+    __shared__ float la_sh[CK], beta_sh[CK], qfac_sh[CK], kfac_sh[CK];
+
+    // per-token inverse-L2 factors: one thread per token, serial over d.
+    if (tid < L) {
+        const float *q = qkv_conv + (size_t)(base + tid) * conv_dim + (size_t)key_head * D;
+        const float *k = q + key_dim;
+        float qss = 0.0f, kss = 0.0f;
+        for (int d = 0; d < D; d++) { float a = q[d]; qss += a * a; float b = k[d]; kss += b * b; }
+        float qf = rsqrtf(qss + 1.0e-6f) * rsqrtf((float)D);
+        float kf = rsqrtf(kss + 1.0e-6f);
+        qfac_sh[tid] = qf; kfac_sh[tid] = kf;
+        qfac_g[(size_t)head * N + base + tid] = qf;
+        kfac_g[(size_t)head * N + base + tid] = kf;
+    }
+    // beta + cumulative log-decay: ONE thread, serial from the sub-chunk start, so
+    // `cum` accumulates in the same order as the fused kernel.
+    if (tid == 0) {
+        float Alog = A_log[head];
+        float dtb = tq_bf16_to_float(dt_bias[head]);
+        float cum = 0.0f;
+        for (int j = 0; j < L; j++) {
+            int gt = base + j;
+            float bb = b_proj[(size_t)gt * value_heads + head];
+            float sp_arg = a_proj[(size_t)gt * value_heads + head] + dtb;
+            float sp = log1pf(expf(-fabsf(sp_arg))) + fmaxf(sp_arg, 0.0f);
+            cum += -expf(Alog) * sp;
+            float be = 1.0f / (1.0f + expf(-bb));
+            beta_sh[j] = be; la_sh[j] = cum;
+            beta_g[(size_t)head * N + gt] = be;
+            la_g[(size_t)head * N + gt] = cum;
+        }
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < L * D; idx += BS) {
+        int j = idx / D, d = idx % D;
+        const float *q = qkv_conv + (size_t)(base + j) * conv_dim + (size_t)key_head * D;
+        qn_sh[j][d] = q[d] * qfac_sh[j];
+        kn_sh[j][d] = q[key_dim + d] * kfac_sh[j];
+    }
+    __syncthreads();
+
+    // one thread per (j,m) pair, serial over d -- the phase this whole split exists for.
+    for (int idx = tid; idx < L * L; idx += BS) {
+        int j = idx / L, m = idx % L;
+        float dkk = 0.0f, dqk = 0.0f;
+        #pragma unroll 4
+        for (int d = 0; d < D; d++) {
+            float knm = kn_sh[m][d];
+            dkk += kn_sh[j][d] * knm;
+            dqk += qn_sh[j][d] * knm;
+        }
+        float decay = (m <= j) ? expf(la_sh[j] - la_sh[m]) : 0.0f;
+        LA[j * CK + m]                = (m < j)  ? beta_sh[j] * decay * dkk : 0.0f;
+        LA[CK * CK + j * CK + m]      = (m <= j) ? decay * dqk : 0.0f;
+    }
+}
+
 template<int CK, int D, int NSTRIPE, int G, int NMAX>
 __global__ __launch_bounds__((D / NSTRIPE) * G, 1)
 void k_tq_deltanet_chunk_hs(float *core_raw, float *recurrent_state,
                                        const float *qkv_conv,
                                        const float *b_proj, const float *a_proj,
                                        const float *A_log, const uint16_t *dt_bias,
-                                       int N, int value_heads, int key_heads, int dim) {
+                                       int N, int value_heads, int key_heads, int dim,
+                                       const float *prep) {
     const int SV = D / NSTRIPE;                  // value columns per stripe
     const int BS = SV * G;                       // threads per block
     const int KPT = D / G;                       // state rows held per thread
@@ -18829,8 +18952,20 @@ void k_tq_deltanet_chunk_hs(float *core_raw, float *recurrent_state,
     for (int s0 = 0; s0 < N; s0 += NMAX) {
         const int NB = (N - s0) < NMAX ? (N - s0) : NMAX;
 
-        // (b1) per-token q/k inverse-L2 factors: one thread per token, same serial
-        //      d-order as the single-thread version -> bit-identical.
+        // (b1/b2) per-token factors. Hoisted into k_tq_deltanet_prep_hs when `prep`
+        //   is live -- a straight copy here; otherwise computed in place (the
+        //   original fused path, kept for A/B and as the fallback).
+        if (prep) {
+            const size_t A = (size_t)value_heads * N;
+            const float *la_src   = prep + (size_t)head * N + s0;
+            const float *beta_src = prep + A + (size_t)head * N + s0;
+            const float *qfac_src = prep + 2 * A + (size_t)head * N + s0;
+            const float *kfac_src = prep + 3 * A + (size_t)head * N + s0;
+            for (int t = tid; t < NB; t += BS) {
+                la_all[t] = la_src[t]; beta_all[t] = beta_src[t];
+                qfac_all[t] = qfac_src[t]; kfac_all[t] = kfac_src[t];
+            }
+        } else {
         for (int t = tid; t < NB; t += BS) {
             int gt = s0 + t;
             const float *q = qkv_conv + (size_t)gt * conv_dim + (size_t)key_head * D;
@@ -18840,10 +18975,8 @@ void k_tq_deltanet_chunk_hs(float *core_raw, float *recurrent_state,
             qfac_all[t] = rsqrtf(qss + 1.0e-6f) * rsqrtf((float)D);
             kfac_all[t] = rsqrtf(kss + 1.0e-6f);
         }
-        // (b2) beta + cumulative log-decay: one thread per sub-chunk, and la still
-        //      accumulates serially from the sub-chunk start -> bit-identical.
-        const int nsub = (NB + CK - 1) / CK;
-        for (int si = tid; si < nsub; si += BS) {
+        const int nsub0 = (NB + CK - 1) / CK;
+        for (int si = tid; si < nsub0; si += BS) {
             int base = si * CK;
             int L = (NB - base) < CK ? (NB - base) : CK;
             float cum = 0.0f;
@@ -18856,6 +18989,7 @@ void k_tq_deltanet_chunk_hs(float *core_raw, float *recurrent_state,
                 beta_all[base + j] = 1.0f / (1.0f + expf(-bb));
                 la_all[base + j] = cum;
             }
+        }
         }
         __syncthreads();
 
@@ -18872,8 +19006,19 @@ void k_tq_deltanet_chunk_hs(float *core_raw, float *recurrent_state,
                 kn_sh[j][d] = qkv_conv[(size_t)gt * conv_dim + key_dim + (size_t)key_head * D + d] * kfac_all[sb + j];
             }
             __syncthreads();
-            // 2. decayed inner-product matrices L and A (one thread per (j,m) pair,
-            //    serial over d -> unchanged order).
+            // 2. decayed inner-product matrices L and A. Hoisted when `prep` is live
+            //    (this is the L*L-pairs-against-BS-threads phase the split exists
+            //    for); otherwise one thread per (j,m) pair, serial over d.
+            if (prep) {
+                const size_t A = (size_t)value_heads * N;
+                const int nsubT = (N + CK - 1) / CK;
+                const int siT = (s0 + sb) / CK;
+                const float *LA = prep + 4 * A + ((size_t)head * nsubT + siT) * (2 * CK * CK);
+                for (int idx = tid; idx < CK * CK; idx += BS) {
+                    Lmat[idx / CK][idx % CK] = LA[idx];
+                    Amat[idx / CK][idx % CK] = LA[CK * CK + idx];
+                }
+            } else {
             for (int idx = tid; idx < L * L; idx += BS) {
                 int j = idx / L, m = idx % L;
                 float dkk = 0.0f, dqk = 0.0f;
@@ -18886,6 +19031,7 @@ void k_tq_deltanet_chunk_hs(float *core_raw, float *recurrent_state,
                 float decay = (m <= j) ? expf(la_sh[j] - la_sh[m]) : 0.0f;
                 Lmat[j][m] = (m < j)  ? beta_sh[j] * decay * dkk : 0.0f;
                 Amat[j][m] = (m <= j) ? decay * dqk : 0.0f;
+            }
             }
             __syncthreads();
 
@@ -18988,6 +19134,34 @@ static int launch_deltanet_chunk_hs(int ck, int nstripe, int g,
     if (dim != 128) return -100;
     int sv = dim / nstripe;
     dim3 grid(value_heads * nstripe), blk(sv * g);
+
+    // D.4: hoist the state-independent prep into its own fully-parallel launch.
+    // Grid is (nsub, value_heads) -- 1536 blocks at N=256/CK=8 against the scan's 96
+    // -- and it removes the phase where 448 of 512 scan threads idled, plus the
+    // per-stripe duplication of it. TQ_DN_PREP=0 reverts to the fused kernel.
+    const float *prep = nullptr;
+    int nsub = (N + ck - 1) / ck;
+    // Only when the prep grid actually fills the card. The split's whole value is
+    // spreading the L*L pair work over nsub*value_heads blocks; below ~170 blocks
+    // there is nothing to spread and the extra launch is pure overhead. Ragged
+    // multi-client waves hit exactly that: 32 clients over a 256-column wave gives
+    // seg_len=8 per launch -> nsub=1 -> 48 blocks, and it measured 4.3% SLOWER at
+    // N=32 while 5.9% faster at N=1. nsub>=4 puts the grid at >=192 blocks.
+    if (tq_dn_prep_enabled() && nsub >= 4) {
+        size_t need = 4 * (size_t)value_heads * N + (size_t)value_heads * nsub * 2 * ck * ck;
+        if (ensure_float_buffer(&g_dn_prep, &g_dn_prep_floats, (int)need, "d_dn_prep") != 0) return -102;
+        dim3 pg(nsub, value_heads), pb(ck * ck);
+        int pok = 0;
+        switch (ck) {
+            case 4:  k_tq_deltanet_prep_hs<4, 128><<<pg, pb, 0, st>>>(g_dn_prep, qkv_conv, b_proj, a_proj, A_log, dt_bias, N, value_heads, key_heads); break;
+            case 8:  k_tq_deltanet_prep_hs<8, 128><<<pg, pb, 0, st>>>(g_dn_prep, qkv_conv, b_proj, a_proj, A_log, dt_bias, N, value_heads, key_heads); break;
+            case 16: k_tq_deltanet_prep_hs<16, 128><<<pg, pb, 0, st>>>(g_dn_prep, qkv_conv, b_proj, a_proj, A_log, dt_bias, N, value_heads, key_heads); break;
+            case 32: k_tq_deltanet_prep_hs<32, 128><<<pg, pb, 0, st>>>(g_dn_prep, qkv_conv, b_proj, a_proj, A_log, dt_bias, N, value_heads, key_heads); break;
+            default: pok = -1; break;
+        }
+        if (pok == 0 && cudaGetLastError() == cudaSuccess) prep = g_dn_prep;
+    }
+
     // NMAX = tokens covered by one prep pre-pass. Static smem is
     // CK*D*2 (kn/qn) + CK*CK*2 (L/A) + NMAX*4 floats, and must stay under the
     // 48 KB no-opt-in limit: CK=32 already spends 41 KB on the first two terms,
@@ -18996,7 +19170,7 @@ static int launch_deltanet_chunk_hs(int ck, int nstripe, int g,
     #define TQ_LAUNCH_DNC_HS_N(CKV, NS, GG, NM)                                        \
         k_tq_deltanet_chunk_hs<CKV, 128, NS, GG, NM><<<grid, blk, 0, st>>>(             \
             core_out, recurrent_state, qkv_conv, b_proj, a_proj,                        \
-            A_log, dt_bias, N, value_heads, key_heads, dim)
+            A_log, dt_bias, N, value_heads, key_heads, dim, prep)
     #define TQ_LAUNCH_DNC_HS(CKV, NS, GG) TQ_LAUNCH_DNC_HS_N(CKV, NS, GG, 512)
     int ok = 0;
     if (ck == 16) {
