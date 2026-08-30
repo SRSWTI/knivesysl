@@ -85,6 +85,14 @@ Engine-level (chunk 512, tok/s): FP6 4869/4821/4539/3190 and NVFP4-all
 lead grows with context: its flashattention prefill scales better than the
 wide-attention kernel, which is now the largest single deficit.
 
+Final gate sweep on the committed build: paged parity 11/11, NVFP4 numeric gate
+75 cells worst 9.8e-08, FP6 single-stream 4246 prefill / 135.9 decode-only
+(inside the 133.6-141.4 session band). Needle at 262k: 3/4 -- depth 8000 flips
+to a `<think>` preamble and exhausts the 32-token answer window. It flips
+IDENTICALLY with `TQ_DN_MM=0` (the untouched ck8 scan), so it is the documented
+near-tie trajectory class at 512-column waves, not a scan regression; depths
+1000/4000/11000 recover on both paths.
+
 ### Three levers closed by measurement, one small win
 
 Working the remaining prefill list. Two of the four turned out to be worth less than
