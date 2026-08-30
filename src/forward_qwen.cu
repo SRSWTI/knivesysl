@@ -16788,6 +16788,8 @@ extern "C" int qwn_copy_last_mtp_logits(float *out, int max_count) {
 // Public MTP step: uses the engine's current PRE-final-norm hidden (d_debug_x from
 // the preceding qwn_decode). Fills topk_ids/topk_vals (k entries) and returns top-1.
 extern "C" int qwn_mtp_step(int token_id, int pos, int *topk_ids, float *topk_vals, int k) {
+    if (g_nvf4_any) return -120;   // spec decode runs the fused persistent/GEMV route,
+                                  // which reads w->d_A -- freed by the NVFP4 repack.
     if (!g_qwen.d_debug_x) {
         fprintf(stderr, "qwn_mtp_step: no current hidden (call qwn_decode first)\n");
         return -30;
@@ -16849,6 +16851,8 @@ static int ensure_mtp_tree_buffers(void) {
 // state the validated on-policy path (tools/mtp_engine_smoke.py) builds, minus the
 // lm_head cost the trunk does not need.
 extern "C" int qwn_mtp_advance(int token_id, int pos) {
+    if (g_nvf4_any) return -120;   // spec decode runs the fused persistent/GEMV route,
+                                  // which reads w->d_A -- freed by the NVFP4 repack.
     if (!g_qwen.has_mtp_section) return -1;
     if (!g_qwen.d_debug_x) return -30;
     if (token_id < 0 || token_id >= g_qwen.V) return -2;
@@ -17006,6 +17010,8 @@ static int mtp_replay_expand(mtp_tree_ctx_t *c, int node_index, int node_token,
 extern "C" int qwn_mtp_tree_build(int seed_token, int pos, int depth, int k, float tau,
                                   int max_nodes, int *out_tokens, int *out_parents,
                                   int *out_depths, float *out_margins) {
+    if (g_nvf4_any) return -120;   // spec decode runs the fused persistent/GEMV route,
+                                  // which reads w->d_A -- freed by the NVFP4 repack.
     if (!g_qwen.has_mtp_section) return -1;
     if (!g_qwen.d_mtp_root_hidden) return -30;   // call qwn_mtp_snapshot_root first
     if (seed_token < 0 || seed_token >= g_qwen.V) return -2;
@@ -20141,6 +20147,8 @@ extern "C" int qwn_spec_copy_hidden_pre(float *out, int n) {
 
 extern "C" int qwn_spec_forward_test(const int *tok, const int *parent, const int *depth,
                                      const int *posv, int N, int *out_argmax, float *out_hidden) {
+    if (g_nvf4_any) return -120;   // spec decode runs the fused persistent/GEMV route,
+                                  // which reads w->d_A -- freed by the NVFP4 repack.
     if (!g_qwen.initialized) return -1;
     if (N < 1 || N > TQ_SPEC_MAX_N) return -2;
     int ret = run_spec_forward_n(tok, parent, depth, posv, N, g_qwen.L);
@@ -20531,6 +20539,8 @@ extern "C" int qwn_capture_spec_forward(const int *tok, const int *parent, const
 
 extern "C" int qwn_spec_forward_graph(const int *tok, const int *parent, const int *depth,
                                       const int *posv, int N, int *out_argmax, float *out_hidden) {
+    if (g_nvf4_any) return -120;   // spec decode runs the fused persistent/GEMV route,
+                                  // which reads w->d_A -- freed by the NVFP4 repack.
     if (!g_qwen.initialized) return -1;
     if (N < 1 || N > TQ_SPEC_MAX_N) return -2;
     if (!g_qwen.spec_graph_ready || !g_qwen.spec_graph_exec) {
@@ -20884,6 +20894,8 @@ static int mtp_advance_wave(const float *hidden_src, const int *node_idx, const 
 
 extern "C" int qwn_spec_round(int seed, int base_pos, int depth, int k, float tau,
                               int max_nodes, int *out_chain, int *io_state) {
+    if (g_nvf4_any) return -120;   // spec decode runs the fused persistent/GEMV route,
+                                  // which reads w->d_A -- freed by the NVFP4 repack.
     if (!g_qwen.initialized) return -1;
     if (max_nodes < 1 || max_nodes > TQ_SPEC_MAX_N) return -2;
     int tree_tok[TQ_SPEC_MAX_N], tree_par[TQ_SPEC_MAX_N], tree_dep[TQ_SPEC_MAX_N];
@@ -21117,6 +21129,8 @@ static int mtp_advance_wave(const float *hidden_src, const int *node_idx, const 
 
 // Exported: trunk advances for a prefill chunk (nodes are chunk-local hidden rows).
 extern "C" int qwn_mtp_advance_wave(const int *node_idx, const int *toks, int pos0, int m) {
+    if (g_nvf4_any) return -120;   // spec decode runs the fused persistent/GEMV route,
+                                  // which reads w->d_A -- freed by the NVFP4 repack.
     if (!g_qwen.has_mtp_section) return -1;
     if (m < 1 || m > 16) return -2;
     if (!(g_qwen.mtp_quant_ready && mtp_quant_enabled())) {
