@@ -10561,7 +10561,10 @@ void k_tq_nvf4_gemm(float *__restrict__ out, const uint32_t *__restrict__ a,
     const int kt_begin = split * kt_per;
     const int nst = kt_per >> 1;                  // 2 k64 tiles per stage
     const uint16_t zsel = 0;
-    if (ksplits > 1) out += (size_t)split * nvar * M;
+    // blockIdx.z = column tile (see the TMA kernel); no-op at gridDim.z == 1.
+    out += (size_t)blockIdx.z * nvar * M;
+    b += (size_t)blockIdx.z * (size_t)(nvar >> 3) * Kt64 * TQ_NVF4_BW;
+    if (ksplits > 1) out += (size_t)split * gridDim.z * (size_t)nvar * M;
 
     float c[MA][NA][4];
     #pragma unroll
@@ -10737,7 +10740,12 @@ void k_tq_nvf4_gemm_tma(const __grid_constant__ CUtensorMap mapA,
     const int kt_begin = split * kt_per;
     const int nst = kt_per >> 1;
     const uint16_t zsel = 0;
-    if (ksplits > 1) out += (size_t)split * nvar * M;
+    // blockIdx.z = column tile: one launch covers every full 256-col tile of a
+    // wide wave instead of a serial host loop, so tile 1's CTAs fill the tail
+    // of tile 0's grid wave. Exact no-op at gridDim.z == 1.
+    out += (size_t)blockIdx.z * nvar * M;
+    if (ksplits > 1) out += (size_t)split * gridDim.z * (size_t)nvar * M;
+    const int b_row = b_row0 + blockIdx.z * (nvar >> 3);
 
     // Two barrier sets. full[s] is completed by the TMA transfer itself (expect_tx), so
     // one arrival. empty[s] is arrived by each of the 8 consumer warps once it is done
@@ -10756,8 +10764,8 @@ void k_tq_nvf4_gemm_tma(const __grid_constant__ CUtensorMap mapA,
         tq_mbar_expect(&full[buf], TXB);
         tq_tma_2d(sA + (size_t)buf * AW,          &mapA, (kb + 0) * TQ_NVF4_AW, mblk * 8, &full[buf]);
         tq_tma_2d(sA + (size_t)buf * AW + AHALF,  &mapA, (kb + 1) * TQ_NVF4_AW, mblk * 8, &full[buf]);
-        tq_tma_2d(sB + (size_t)buf * BW,          &mapB, (kb + 0) * TQ_NVF4_BW, b_row0,   &full[buf]);
-        tq_tma_2d(sB + (size_t)buf * BW + BHALF,  &mapB, (kb + 1) * TQ_NVF4_BW, b_row0,   &full[buf]);
+        tq_tma_2d(sB + (size_t)buf * BW,          &mapB, (kb + 0) * TQ_NVF4_BW, b_row,    &full[buf]);
+        tq_tma_2d(sB + (size_t)buf * BW + BHALF,  &mapB, (kb + 1) * TQ_NVF4_BW, b_row,    &full[buf]);
     };
 
     float c[MA][NA][4];
@@ -12792,7 +12800,8 @@ static int tq_nvf4_use_tma(void) {
 
 // out is [nvar][M] column-major, same convention as the FP6 wide GEMM output.
 static int launch_nvf4_gemm_cfg(float *out, const tq_qmma_weight_t *w, const uint32_t *b,
-                                int nvar, int ks, int stages, cudaStream_t st) {
+                                int nvar, int ks, int stages, cudaStream_t st,
+                                int ztiles = 1) {
     const int M = w->M, Mt = w->Mt, Kt64 = w->Kt64;
     if (stages < 2) stages = 2;
     if (stages > 4) stages = 4;
@@ -12804,7 +12813,7 @@ static int launch_nvf4_gemm_cfg(float *out, const tq_qmma_weight_t *w, const uin
     const int per = (ks == 1) ? Kt64 : Kt64 / ks;
     float *dst = out;
     if (ks > 1) {
-        size_t need = (size_t)ks * nvar * M;
+        size_t need = (size_t)ks * ztiles * (size_t)nvar * M;
         if (need > g_nvf4_part_floats) {
             // same hazard as g_nvf4_b: the split-K reduce of a previously queued GEMM
             // may still be reading this slab, so drain before releasing it.
@@ -12840,7 +12849,7 @@ static int launch_nvf4_gemm_cfg(float *out, const tq_qmma_weight_t *w, const uin
         cudaGetLastError();
         primed[stages] = 1;
     }
-    dim3 gr((Mt + 7) / 8, ks);
+    dim3 gr((Mt + 7) / 8, ks, ztiles);
     // TMA when the descriptors exist. `b` is a group-offset view of g_nvf4_b, and a
     // descriptor base cannot be re-based per launch, so the offset becomes a box
     // coordinate: brow is the first 8-column group this tile covers.
@@ -12856,7 +12865,7 @@ static int launch_nvf4_gemm_cfg(float *out, const tq_qmma_weight_t *w, const uin
         else             { TQ_NVF4_DISPATCH_G(3) }
     }
     if (ks > 1) {
-        size_t n = (size_t)nvar * M;
+        size_t n = (size_t)ztiles * nvar * M;
         k_tq_nvf4_reduce<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(out, g_nvf4_part, (int)n, ks);
     }
     return 0;
@@ -12931,7 +12940,15 @@ static int nvf4_gemm_tiled(const tq_qmma_weight_t *w, float *out, int nvar,
     // Tuned config when available; the heuristic is only the pre-tune fallback.
     const int ks = w->nvf4_ks ? w->nvf4_ks
                               : tq_nvf4_ksplits(w->Mt, Kt64, tq_nvf4_stages());
-    for (int off = 0; off < nvar; off += TQ_NVF4_TILE) {
+    // Full 256-col tiles go up in ONE launch (blockIdx.z): tile 1's CTAs fill the
+    // tail of tile 0's wave instead of waiting behind a host-serialized launch.
+    const int full = nvar / TQ_NVF4_TILE;
+    const int stages = w->nvf4_stages ? w->nvf4_stages : tq_nvf4_stages();
+    if (full > 1) {
+        int rc = launch_nvf4_gemm_cfg(out, w, g_nvf4_b, TQ_NVF4_TILE, ks, stages, st, full);
+        if (rc != 0) return rc;
+    }
+    for (int off = full > 1 ? full * TQ_NVF4_TILE : 0; off < nvar; off += TQ_NVF4_TILE) {
         const int nt = (nvar - off < TQ_NVF4_TILE) ? (nvar - off) : TQ_NVF4_TILE;
         int rc = launch_nvf4_gemm(out + (size_t)off * w->M, w,
                                   g_nvf4_b + (size_t)(off / 8) * Kt64 * TQ_NVF4_BW,
