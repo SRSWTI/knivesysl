@@ -416,6 +416,13 @@ class BatchedEngine:
         # which only became expressible once the quantizer stopped capping a wave
         # at 128 columns.
         room = self.prefill_budget
+        # Depth-adaptive wave width: past 16k the wave is attention-dominated and
+        # wider waves amortize the weight read (64k prefill 4141 -> 4567 tok/s at
+        # 2048 cols), so widen to the engine cap for deep clients.
+        for st_deep in self.pref.values():
+            if st_deep[1] >= 16384:
+                room = max(room, WAVE_MAX_RUNTIME)
+                break
         if len(cols_tok) + room > WAVE_MAX_RUNTIME:
             room = max(0, WAVE_MAX_RUNTIME - len(cols_tok))
         pref_plan = []
@@ -870,7 +877,7 @@ def serve(args):
     if args.wave_cols is None:
         args.wave_cols = WAVE_MAX
     if args.prefill_budget is None:
-        args.prefill_budget = WAVE_MAX
+        args.prefill_budget = min(512, WAVE_MAX)   # shallow default; _work widens past 16k depth
     print(f"batched server: engine wave cap={WAVE_MAX} "
           f"wave_cols={args.wave_cols} prefill_budget={args.prefill_budget}", flush=True)
     eng = BatchedEngine(L, args.tqf, args.max_slots, args.num_blocks, args.page,

@@ -13569,12 +13569,13 @@ static int tq_wave_cap(void) {
     static int cap = 0;
     if (cap == 0) {
         const char *e = getenv("TQ_WAVE_MAX");
-        // Default raised 256 -> 512 (2 x TQ_WIDE_GEMM_TILE): the second 256-col
-        // GEMM pass re-reads each projection weight from L2, so a 512-col wave
-        // measured 7539 vs 7043 tok/s (+7%) on a 4096-token NVFP4 prefill once
-        // the scan/GEMM mix stopped hiding the weight re-stream. 768+ declines
-        // (attention's deepest-position charge grows with the wave).
-        cap = e ? atoi(e) : (tq_wide_gemm_tiled() ? 2 * TQ_WIDE_GEMM_TILE : 128);
+        // Cap is the MAXIMUM wave the engine accepts; wave BUILDERS choose the
+        // width per depth. Measured optimum: 512 cols shallow (8055 tok/s at a
+        // 2048-token prompt), 2048 cols deep (64k prefill 4141 -> 4567: four
+        // fewer weight passes once attention dominates anyway). Raised 512 ->
+        // 2048 so deep callers can go wide; python schedulers default 512
+        // until a client's cursor passes 16k.
+        cap = e ? atoi(e) : (tq_wide_gemm_tiled() ? 8 * TQ_WIDE_GEMM_TILE : 128);
         if (cap < 1) cap = 128;
     }
     return cap;
@@ -24095,23 +24096,63 @@ static int launch_paged_attn_q4_mma_prefill(
         block_table, max_blocks, page, page_log, nkv, hd, kv_m, g_qwen.eps, g_qwen.rope_theta);
     for (int k = 0; k < K; k++) {
         int off = seg_off[k], n = seg_len[k], slot = seg_slot[k];
-        int nqt = (n + 15) / 16;
         // key-split by this segment's own prefix depth (its last column's slot pos);
         // segments run sequentially on one stream, so the partial slab is reused
         int max_pos = col_pos_host ? col_pos_host[off + n - 1] : -1;
+        // Same adaptive tile as the wide-shared path: deep prefixes take
+        // 64-row (or 32-row) tiles so each KV byte feeds more query rows;
+        // this site ran QT=1 and read KV 4x more than the engine path at 64k.
+        int qr = wide_attn_qrows();
+        if (qr == 0) qr = (max_pos >= 24576) ? 64 : (max_pos >= 4096 ? 32 : 16);
+        if (qr > 16 && n < qr) qr = (n >= 32 && qr == 64) ? 32 : 16;
+        int nqt = (n + qr - 1) / qr;
         int S = wide_attn_split_S(max_pos);
-        if (S > 1 && ensure_wide_attn_part((size_t)nh * nqt * S * TQ_AMM_PART_F) != 0)
+        int part_f = 2 * qr + qr * 256;
+        if (S > 1 && ensure_wide_attn_part((size_t)nh * nqt * S * part_f) != 0)
             S = 1;
-        k_tq_wide_attn_mma<4, 1><<<dim3(nh, nqt, S), 256, 0, st>>>(
-            out + (size_t)off * attn_m, q_proj + (size_t)off * q_m, q_norm_w,
-            NULL, NULL, k4_pool, kq4s_pool, v8_pool, vscale_pool,
-            positions + off, slot, block_table, max_blocks, page, page_log,
-            n, nh, nkv, hd, q_m, attn_m, g_qwen.eps, g_qwen.rope_theta,
-            g_wide_attn_part);
-        if (S > 1)
-            k_tq_wide_attn_mma_merge<1><<<dim3(nh, nqt), 256, 0, st>>>(
-                out + (size_t)off * attn_m, q_proj + (size_t)off * q_m,
-                n, nh, hd, q_m, attn_m, S, g_wide_attn_part);
+        if (qr == 64) {
+            static int primed4 = 0;
+            const size_t wa4b = 13792u * 4u;
+            if (!primed4) {
+                cudaFuncSetAttribute(k_tq_wide_attn_mma4<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)wa4b);
+                cudaGetLastError();
+                primed4 = 1;
+            }
+            k_tq_wide_attn_mma4<4><<<dim3(nh, nqt, S), 256, wa4b, st>>>(
+                out + (size_t)off * attn_m, q_proj + (size_t)off * q_m, q_norm_w,
+                NULL, NULL, k4_pool, kq4s_pool, v8_pool, vscale_pool,
+                positions + off, slot, block_table, max_blocks, page, page_log,
+                n, nh, nkv, hd, q_m, attn_m, g_qwen.eps, g_qwen.rope_theta,
+                g_wide_attn_part);
+        } else if (qr == 32) {
+            k_tq_wide_attn_mma<4, 2><<<dim3(nh, nqt, S), 256, 0, st>>>(
+                out + (size_t)off * attn_m, q_proj + (size_t)off * q_m, q_norm_w,
+                NULL, NULL, k4_pool, kq4s_pool, v8_pool, vscale_pool,
+                positions + off, slot, block_table, max_blocks, page, page_log,
+                n, nh, nkv, hd, q_m, attn_m, g_qwen.eps, g_qwen.rope_theta,
+                g_wide_attn_part);
+        } else {
+            k_tq_wide_attn_mma<4, 1><<<dim3(nh, nqt, S), 256, 0, st>>>(
+                out + (size_t)off * attn_m, q_proj + (size_t)off * q_m, q_norm_w,
+                NULL, NULL, k4_pool, kq4s_pool, v8_pool, vscale_pool,
+                positions + off, slot, block_table, max_blocks, page, page_log,
+                n, nh, nkv, hd, q_m, attn_m, g_qwen.eps, g_qwen.rope_theta,
+                g_wide_attn_part);
+        }
+        if (S > 1) {
+            if (qr == 64)
+                k_tq_wide_attn_mma_merge<4><<<dim3(nh, nqt), 256, 0, st>>>(
+                    out + (size_t)off * attn_m, q_proj + (size_t)off * q_m,
+                    n, nh, hd, q_m, attn_m, S, g_wide_attn_part);
+            else if (qr == 32)
+                k_tq_wide_attn_mma_merge<2><<<dim3(nh, nqt), 256, 0, st>>>(
+                    out + (size_t)off * attn_m, q_proj + (size_t)off * q_m,
+                    n, nh, hd, q_m, attn_m, S, g_wide_attn_part);
+            else
+                k_tq_wide_attn_mma_merge<1><<<dim3(nh, nqt), 256, 0, st>>>(
+                    out + (size_t)off * attn_m, q_proj + (size_t)off * q_m,
+                    n, nh, hd, q_m, attn_m, S, g_wide_attn_part);
+        }
     }
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
