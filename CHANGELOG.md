@@ -8,6 +8,92 @@ thinking off unless stated. vLLM comparisons are vLLM 0.27.1 serving
 
 ## Unreleased
 
+### Three levers closed by measurement, one small win
+
+Working the remaining prefill list. Two of the four turned out to be worth less than
+estimated, and I would rather record the numbers than the plan.
+
+**Residual add folded into the post-norm (kept, +0.3-0.6%).** `k_tq_add_rmsnorm_b` existed
+for exactly this and was dead code: all seven `add_vec(resid, h, o)` -> `wide_mlp(...,
+resid, ...)` sites ran the add as its own kernel and then re-read `resid` in the post-norm.
+One launch and one full read of `resid` per layer-wave, gone. Wide prefill 6386 -> 6395,
+paged N=1 6300 -> 6322, N=8 4665 -> 4682, FP6 single-stream 3989 -> 4011. That is at the
+harness noise floor; kept because it is strictly less work with no extra compute and no
+change to any reduction order, not because the number is convincing.
+
+**Fusing silu*mul into the NVFP4 activation quantizer -- REVERTED, measured loss twice.**
+The idea was to drop the `[n x I]` fp32 intermediate (17.8 MB per layer at n=256). Two
+independent reasons it does not work:
+
+| attempt | prefill | vs baseline |
+|---|--:|--:|
+| baseline (materialised intermediate) | 6386 | — |
+| naive fusion | 6140 | **-3.4%** |
+| + stage values in smem | 5684 | -11.0% |
+| + pad smem to kill bank conflicts | 5766 | -9.7% |
+
+The quantizer reads its source **twice** (absmax pass, then encode), so fusing computes
+`expf` twice per element -- the transcendental, not the read, was the price. Staging the
+silu'd values in shared memory to compute it once moved that work into the kernel's
+*already serialized* 8-lane absmax phase (only lanes 0..7 own a column), while 24 lanes
+idle -- strictly worse. Padding the row stride to 65 floats recovered part of the
+bank-conflict loss but nowhere near baseline. Fixing this properly means restructuring the
+absmax so all 32 lanes participate, which changes the reduction order, for a kernel that
+is 6.9% of prefill with `silu_mul` at 2.1%. Not worth it.
+
+**Warp-specialized producer group over TMA -- not built, bounded under 0.6% of prefill.**
+I had estimated ~1.1x for this, reasoning that TMA removes the `cp.async` bandwidth wall
+that made the earlier attempt lose 3.7x. The wall is gone, but so is the prize: with TMA
+the producer's entire job is ~5 instructions per stage (4 box loads + an `expect_tx`), so
+there is almost nothing to dedicate a warp to. A producer warp removes issue *delay*;
+deeper staging adds issue *depth*, which is strictly more. Measured stage sensitivity of
+the shipped TMA kernel:
+
+| shape | st=2 | st=3 | st=4 | st=5 | st=3 -> 5 |
+|---|--:|--:|--:|--:|--:|
+| `mlp_down` @nt=128 | 883.0 | 900.2 | 910.3 | 913.9 | **+1.5%** |
+| `mlp_gate/up` @nt=128 | 806.0 | 835.8 | 850.0 | 850.0 | **+1.7%** |
+| `mlp_down` @nt=256 | 1103.1 | **1119.0** | smem | smem | — |
+
+Depth saturates at st=4 for +1.5-1.7%, and at the real nt=256 tile the shared-memory
+budget caps staging at 3 anyway. So the producer-warp ceiling is under 1.7% of the GEMM =
+**under 0.6% of prefill**. Warp specialization is the wrong lever on this chip for this
+kernel, in both its `cp.async` and TMA forms; the 46-54%-of-issue-roof gap is elsewhere.
+
+**Activation quantizer double-read of `x` -- moot.** That lever was the FP6 two-pass
+`bfrag_absmax_wide`/`quant_wide` pair. On the NVFP4 path it does not exist:
+`k_tq_nvf4_quant_x` is already single-pass. Dropped.
+
+#### NVFP4 spec decode: limitation made explicit, not fixed
+
+`qwn_decode`/`qwn_decode_graph` returned a documented `-120` under `TQ_W_NVFP4`, but the
+spec-decode surface -- `qwn_spec_round`, `qwn_spec_forward_test`/`_graph`, `qwn_mtp_step`,
+`qwn_mtp_advance`, `qwn_mtp_advance_wave`, `qwn_mtp_tree_build` -- did not. That is the
+path `serve_openai.py` drives for the flagship 133.7 tok/s. It failed rather than faulted,
+but with `-77`: an incidental format-gate rejection two levels down that would silently
+change meaning with any edit to the wide-path format checks. All seven now return `-120`
+with the reason inline. Actually supporting it needs the fused persistent layer kernel to
+read NVFP4 fragments -- real work, not done, and stated as such.
+
+#### Current prefill breakdown, for whoever picks this up
+
+At 6392 tok/s (4096 tokens, 256-column waves, `TQ_W_NVFP4=all`):
+
+| kernel | % |
+|---|--:|
+| `k_tq_nvf4_gemm_tma` | **34.8** |
+| `k_tq_deltanet_chunk_hs` | **29.7** |
+| `k_tq_wide_attn_mma` | 10.7 |
+| `k_tq_nvf4_quant_x` | 6.9 |
+| `k_tq_nvf4_reduce` | 2.9 |
+| `k_tq_deltanet_prep_hs` | 2.7 |
+| rmsnorm / silu_mul / add_vec | 2.2 / 2.1 / 2.1 |
+
+The two big ones are both at documented structural limits: the GEMM at parity with CUTLASS
+for the operating tile (0.99x at N=256) and 54% of the issue roof, and the scan at a
+1536-warp parallelism ceiling. Neither moves without a decomposition change -- a two-level
+associative scan for DeltaNet, and for the GEMM something other than warp specialization.
+
 ### DeltaNet: the state-independent prep hoisted out of the scan
 
 The scan's dominant phase built `Lmat`/`Amat` -- `L*L` inner-product pairs, each a serial
