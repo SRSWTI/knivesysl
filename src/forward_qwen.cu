@@ -12827,6 +12827,31 @@ extern "C" int qwn_hidden_size(void) { return g_qwen.H; }
 extern "C" int qwn_intermediate_size(void) { return g_qwen.I; }
 extern "C" int qwn_vocab_size(void) { return g_qwen.V; }
 extern "C" int qwn_num_layers(void) { return g_qwen.L; }
+
+// Prefill wave column cap. Hoisted out of qwn_paged_prefill_batch and exported because
+// the Python schedulers were hardcoding their own copy of the default: serve_batched.py
+// still assumed 128 after the engine's default moved to the tiled GEMM's column tile
+// (256), so it silently ran half-width waves and lost 1.2x of prefill. A cap that two
+// processes both guess at is a cap that drifts -- ask the engine.
+static int tq_wave_cap(void) {
+    static int cap = 0;
+    if (cap == 0) {
+        const char *e = getenv("TQ_WAVE_MAX");
+        cap = e ? atoi(e) : (tq_wide_gemm_tiled() ? TQ_WIDE_GEMM_TILE : 128);
+        if (cap < 1) cap = 128;
+    }
+    return cap;
+}
+extern "C" int qwn_wave_cap(void) { return tq_wave_cap(); }
+
+// Engine-side wave accounting. A Python caller timing the ctypes call also measures GIL
+// re-acquisition on return, so host-side numbers cannot separate "the engine was slow"
+// from "the interpreter took the lock back late". These counters are taken inside the
+// call, so the difference between them and the caller's view IS the interpreter's cost.
+static double g_wave_ms = 0.0;
+static long g_wave_n = 0;
+extern "C" double qwn_wave_ms(void) { return g_wave_ms; }
+extern "C" long qwn_wave_count(void) { return g_wave_n; }
 extern "C" int qwn_num_attention_heads(void) { return g_qwen.nh; }
 extern "C" int qwn_num_key_value_heads(void) { return g_qwen.nkv; }
 extern "C" int qwn_head_dim(void) { return g_qwen.hd; }
@@ -23068,18 +23093,19 @@ extern "C" int qwn_paged_prefill_batch(const int *tokens, const int *col_slot, c
     // native column tile, so a 256-column wave reads the ~20 GiB weight stripe once
     // for twice the prompt columns. The old 128 was inherited from the single-stream
     // wide path (whose batched attention really does cap at 128, -57).
-    static int wave_cap = 0;
-    if (wave_cap == 0) {
-        const char *e = getenv("TQ_WAVE_MAX");
-        wave_cap = e ? atoi(e) : (tq_wide_gemm_tiled() ? TQ_WIDE_GEMM_TILE : 128);
-        if (wave_cap < 1) wave_cap = 128;
-    }
-    if (T > wave_cap) return -6;
+    if (T > tq_wave_cap()) return -6;
     for (int k = 0; k < K; k++) {
         if (seg_slot[k] < 0 || seg_slot[k] >= g_pg_maxslots) return -4;
         if (seg_len[k] < 1) return -5;
     }
-    return run_paged_prefill_wave_core(tokens, col_slot, col_pos, seg_slot, seg_off, seg_len, seg_final, K, T, out_seed);
+    struct timespec ta, tb;
+    clock_gettime(CLOCK_MONOTONIC, &ta);
+    int rc = run_paged_prefill_wave_core(tokens, col_slot, col_pos, seg_slot, seg_off,
+                                         seg_len, seg_final, K, T, out_seed);
+    clock_gettime(CLOCK_MONOTONIC, &tb);
+    g_wave_ms += (tb.tv_sec - ta.tv_sec) * 1e3 + (tb.tv_nsec - ta.tv_nsec) * 1e-6;
+    g_wave_n++;
+    return rc;
 }
 
 // ============================ Chunked prefill ============================

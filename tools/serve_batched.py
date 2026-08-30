@@ -28,11 +28,12 @@ import argparse, ctypes, json, os, threading, time, queue, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-WAVE_MAX = 128   # legacy default prefill wave column cap
-# Runtime wave ceiling. The engine's own cap is TQ_WAVE_MAX (default 128); raising
-# it needs the two-pass activation quantizer (O(1) smem), which is now in.
-WAVE_MAX_RUNTIME = int(os.environ.get("TQ_WAVE_MAX", "128"))
-WAVE_MAX = WAVE_MAX_RUNTIME   # prefill wave column cap = the fast activation quantizer's smem limit
+# Prefill wave column cap. NEVER hardcode this: it is the engine's tiled-GEMM column
+# tile and it has moved (128 -> 256). This file's stale 128 silently halved every wave
+# and cost ~1.2x of prefill even when the operator passed a larger --prefill-budget.
+# load_lib() overwrites both from qwn_wave_cap(); these are only the pre-load fallback.
+WAVE_MAX_RUNTIME = 128
+WAVE_MAX = WAVE_MAX_RUNTIME
 
 
 def load_lib(path):
@@ -56,6 +57,12 @@ def load_lib(path):
                                    ctypes.POINTER(ctypes.c_int)]
     L.qwn_prefill_wide.restype = ctypes.c_int
     L.qwn_free.restype = ctypes.c_int
+    L.qwn_wave_cap.restype = ctypes.c_int
+    # Take the wave cap from the engine so the two can never disagree.
+    global WAVE_MAX_RUNTIME, WAVE_MAX
+    cap = L.qwn_wave_cap()
+    if cap >= 1:
+        WAVE_MAX_RUNTIME = WAVE_MAX = cap
     return L
 
 
@@ -156,6 +163,8 @@ class BatchedEngine:
         self.running = True
         self.steps = 0; self.decoded_tokens = 0
         self.prefill_waves = 0; self.prefilled_tokens = 0
+        # wave cost accounting (see _wave / _loop)
+        self.t_marshal = 0.0; self.t_engine = 0.0; self.t_loop = 0.0; self.t_idle = 0.0
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
@@ -283,11 +292,20 @@ class BatchedEngine:
         """One qwn_paged_prefill_batch call carrying decode rows AND prompt chunks:
         a decode row is a 1-column final segment, so both ride ONE pass over the
         weights (chunked prefill). out_seed[k] = that segment's argmax."""
+        # Split the wave cost three ways so it is knowable whether the scheduler
+        # language matters: marshalling (pure Python), the engine call (GPU + engine
+        # host work), and the rest of the loop. Reported by /v1/waveprof.
         K = len(seg_slot); T = len(cols_tok)
+        t0 = time.perf_counter()
         oseed = (ctypes.c_int * K)()
-        rc = self.L.qwn_paged_prefill_batch(
-            _ci(cols_tok), _ci(cols_slot), _ci(cols_pos),
-            _ci(seg_slot), _ci(seg_off), _ci(seg_len), _ci(seg_fin), K, T, oseed)
+        a_tok, a_slot, a_pos = _ci(cols_tok), _ci(cols_slot), _ci(cols_pos)
+        a_ss, a_so, a_sl, a_sf = _ci(seg_slot), _ci(seg_off), _ci(seg_len), _ci(seg_fin)
+        t1 = time.perf_counter()
+        rc = self.L.qwn_paged_prefill_batch(a_tok, a_slot, a_pos,
+                                            a_ss, a_so, a_sl, a_sf, K, T, oseed)
+        t2 = time.perf_counter()
+        self.t_marshal += t1 - t0
+        self.t_engine += t2 - t1
         if rc != 0:
             raise RuntimeError(f"fused wave rc={rc} (K={K} T={T})")
         self.prefill_waves += 1
@@ -442,6 +460,7 @@ class BatchedEngine:
                     print(f"[engine] admit error: {e}", flush=True)
                 have = bool(self.active) or bool(self.pref)
             if have:
+                _t = time.perf_counter()
                 try:
                     self._work()
                 except Exception as e:                  # never let the engine thread die
@@ -463,6 +482,7 @@ class BatchedEngine:
                                 pass
                             self.free_slots.append(s)
                             r.err = f"prefill failed: {e}"; r.done.set()
+                self.t_loop += time.perf_counter() - _t
 
     def shutdown(self):
         with self.cv:
@@ -663,6 +683,26 @@ def make_handler(eng, tok, args):
                                                   "hits": eng.pc_hits, "misses": eng.pc_misses,
                                                   "builds": eng.pc_builds,
                                                   "tokens_saved": eng.pc_saved}})
+            elif self.path.startswith("/waveprof"):
+                # Where a wave's wall time actually goes. `engine_inside` is measured by
+                # the engine itself; `engine` is what Python sees around the ctypes call,
+                # so their difference is interpreter cost (GIL re-acquisition) that no
+                # amount of scheduler tuning can remove.
+                w = max(eng.prefill_waves, 1)
+                other = max(eng.t_loop - eng.t_marshal - eng.t_engine, 0.0)
+                try:
+                    eng.L.qwn_wave_ms.restype = ctypes.c_double
+                    eng.L.qwn_wave_count.restype = ctypes.c_long
+                    e_ms, e_n = eng.L.qwn_wave_ms(), max(eng.L.qwn_wave_count(), 1)
+                except Exception:
+                    e_ms, e_n = 0.0, 1
+                self._json(200, {"waves": eng.prefill_waves, "engine_waves": e_n,
+                                 "ms_per_wave": {
+                                     "marshal": 1000.0 * eng.t_marshal / w,
+                                     "engine_seen_by_python": 1000.0 * eng.t_engine / w,
+                                     "engine_inside": e_ms / e_n,
+                                     "scheduler_other": 1000.0 * other / w,
+                                     "loop_total": 1000.0 * eng.t_loop / w}})
             else:
                 self._json(404, {"error": "not found"})
 
@@ -795,7 +835,16 @@ def make_handler(eng, tok, args):
 def serve(args):
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
-    eng = BatchedEngine(load_lib(args.lib), args.tqf, args.max_slots, args.num_blocks, args.page,
+    L = load_lib(args.lib)          # this also publishes the engine's wave cap
+    # argparse defaults are frozen at parse time, i.e. BEFORE the library is loaded, so
+    # wave-derived options must be resolved here or they keep the stale fallback.
+    if args.wave_cols is None:
+        args.wave_cols = WAVE_MAX
+    if args.prefill_budget is None:
+        args.prefill_budget = WAVE_MAX
+    print(f"batched server: engine wave cap={WAVE_MAX} "
+          f"wave_cols={args.wave_cols} prefill_budget={args.prefill_budget}", flush=True)
+    eng = BatchedEngine(L, args.tqf, args.max_slots, args.num_blocks, args.page,
                         wave_cols=args.wave_cols, max_prefill=args.max_prefill,
                         fuse=args.fuse, fuse_ratio=args.fuse_ratio,
                         decode_every=args.decode_every,
@@ -876,9 +925,9 @@ def main():
     ap.add_argument("--page", type=int, default=128)
     ap.add_argument("--max-slots", type=int, default=12)
     ap.add_argument("--num-blocks", type=int, default=1024)
-    ap.add_argument("--wave-cols", type=int, default=WAVE_MAX,
+    ap.add_argument("--wave-cols", type=int, default=None,
                     help="columns per scheduler iteration (decode rows + prompt chunks share "
-                         "one weight read; kernel cap 128)")
+                         "one weight read); default = the engine's own wave cap")
     ap.add_argument("--max-prefill", type=int, default=2,
                     help="max concurrently prefilling requests (TTFT fairness vs decode share)")
     ap.add_argument("--fuse", dest="fuse", action="store_true", default=True,
@@ -898,7 +947,7 @@ def main():
                     help="materialize a shared prompt prefix once and snapshot it into each new "
                          "slot (qwn_paged_load_client) instead of re-prefilling it (default ON)")
     ap.add_argument("--no-prefix-cache", dest="prefix_cache", action="store_false")
-    ap.add_argument("--prefill-budget", type=int, default=64,
+    ap.add_argument("--prefill-budget", type=int, default=None,
                     help="prompt columns per wave, ON TOP of the decode rows (which are "
                          "scheduled first). Needs TQ_WAVE_MAX >= rows + budget")
     ap.add_argument("--decode-min-rows", type=int, default=8,

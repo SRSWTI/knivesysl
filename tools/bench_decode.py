@@ -43,6 +43,8 @@ ap.add_argument("--cases", default="1:2048,4:2048,8:2048,16:2048,32:2048",
                 help="comma-separated <concurrency>:<context> cases")
 ap.add_argument("--wave", type=int, default=256, help="prefill columns per wave")
 ap.add_argument("--profile", action="store_true")
+ap.add_argument("--slots", type=int, default=0, help="force pool slots (0 = size to the case)")
+ap.add_argument("--blocks", type=int, default=0, help="force pool blocks (0 = size to the case)")
 args = ap.parse_args()
 
 
@@ -76,8 +78,11 @@ for c in args.cases.split(","):
 
 print(f"{'N':>4s} {'P':>7s} {'prefill s':>10s} {'pf tok/s':>9s} {'ms/step':>9s} {'tok/s':>9s} {'blocks':>11s}")
 for (N, P) in cases:
-    slots = N
-    blocks = N * ((P + args.page - 1) // args.page + 2)
+    # Pool geometry is an independent variable, not a function of the case: the server
+    # runs a big pool (many slots, many blocks) while this harness used to size one
+    # exactly to the case, which made the two incomparable.
+    slots = args.slots or N
+    blocks = args.blocks or N * ((P + args.page - 1) // args.page + 2)
     r = L.qwn_paged_init(slots, blocks, args.page)
     if r != 0:
         print(f"{N:4d} {P:7d}   paged_init rc={r} (slots={slots} blocks={blocks} "
