@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 #include <cuda.h>
 #include <cuda_fp16.h>
+#include <mma.h>
 
 #include <stdint.h>
 #include <stdio.h>
@@ -19362,7 +19363,9 @@ void k_tq_dnmm_prep(float *out, const float *qkv_conv,
     }
     __syncthreads();
     unsigned long long _c6 = clock64();
-    for (int idx = tid; idx < L * D; idx += BS) { int j = idx / D, d = idx % D; oKW[idx] = qn[j * DP + d]; oD0[idx] = kn[j * DP + d]; }
+    // KW stored NEGATED: both scans then compute Dl = D0 + KW@S, which lets the
+    // tf32 path seed its wmma accumulator straight from D0.
+    for (int idx = tid; idx < L * D; idx += BS) { int j = idx / D, d = idx % D; oKW[idx] = -qn[j * DP + d]; oD0[idx] = kn[j * DP + d]; }
     for (int idx = L * D + tid; idx < T * D; idx += BS) { oKW[idx] = 0.0f; oD0[idx] = 0.0f; }
     if (tid == 0) {
         oMeta[0] = dn_exp(la[L - 1]); oMeta[1] = (float)L;
@@ -19423,7 +19426,7 @@ void k_tq_dnmm_scan(float *core_raw, float *recurrent_state, const float *prep,
         const int L = (int)oAm[T * T + 1];
         for (int idx = tid; idx < T * T; idx += BS) Am[idx] = oAm[idx];
 
-        // Dl = D0 - KW @ S : rows j = jt*JR .. jt*JR+JR-1, cols c4..c4+3
+        // Dl = D0 + KW @ S (KW stored negated) : rows jt*JR.., cols c4..c4+3
         for (int js = 0; js < T; js += SLAB) {
             __syncthreads();
             for (int idx = tid; idx < SLAB * D; idx += BS) sl[idx] = KW[js * D + idx];
@@ -19438,8 +19441,8 @@ void k_tq_dnmm_scan(float *core_raw, float *recurrent_state, const float *prep,
                 for (int k = 0; k < D; k++) {
                     const float4 s4 = *(const float4 *)&S[k * VS + c4];
                     const float wk = w[k];
-                    acc.x -= wk * s4.x; acc.y -= wk * s4.y;
-                    acc.z -= wk * s4.z; acc.w -= wk * s4.w;
+                    acc.x += wk * s4.x; acc.y += wk * s4.y;
+                    acc.z += wk * s4.z; acc.w += wk * s4.w;
                 }
                 acc.x = dn_flush(acc.x); acc.y = dn_flush(acc.y);
                 acc.z = dn_flush(acc.z); acc.w = dn_flush(acc.w);
@@ -19518,6 +19521,126 @@ void k_tq_dnmm_scan(float *core_raw, float *recurrent_state, const float *prep,
         state[(size_t)(idx / VS) * D + v0 + idx % VS] = S[idx];
 }
 
+// tf32 wmma scan (TQ_DN_MM=3): identical structure to the fp32 scan but the
+// three matmul phases run on tensor cores (m16n16k8, fp32 accumulate). Only
+// the multiply INPUTS round to tf32 (10-bit mantissa); the state, the solve
+// and every prep quantity stay fp32. For calibration: vLLM's GDN chunk scan
+// runs these same contractions in bf16 (7-bit mantissa).
+template<int T, int D, int VS>
+__global__ __launch_bounds__(256, 2)
+void k_tq_dnmm_scan_tf32(float *core_raw, float *recurrent_state, const float *prep,
+                         int N, int value_heads) {
+    using namespace nvcuda;
+    const int nstripe = D / VS;                  // VS must be 32 here
+    const int head = blockIdx.x / nstripe;
+    const int stripe = blockIdx.x % nstripe;
+    if (head >= value_heads) return;
+    const int tid = threadIdx.x;
+    const int BS = 256;
+    const int warp = tid >> 5;
+    const int value_dim = value_heads * D;
+    const int v0 = stripe * VS;
+    const int nchunk = (N + T - 1) / T;
+    const size_t BLK = (size_t)(4 * T * D + T * T + 16);
+
+    extern __shared__ float sm_dnmm[];
+    float *S  = sm_dnmm;                         // [D][VS]
+    float *Dl = S + D * VS;                      // [T][VS]
+    float *Cs = Dl + T * VS;                     // [T][VS] core staging
+    float *state = recurrent_state + (size_t)head * D * D;
+    for (int idx = tid; idx < D * VS; idx += BS)
+        S[idx] = state[(size_t)(idx / VS) * D + v0 + idx % VS];
+    __syncthreads();
+
+    #define DNMM_TF32(frag) _Pragma("unroll") \
+        for (int _i = 0; _i < (int)frag.num_elements; _i++) frag.x[_i] = wmma::__float_to_tf32(frag.x[_i]);
+
+    for (int c = 0; c < nchunk; c++) {
+        const float *o = prep + ((size_t)head * nchunk + c) * BLK;
+        const float *KW = o, *D0 = o + T * D, *EQ = o + 2 * T * D, *KC = o + 3 * T * D;
+        const float *oAm = o + 4 * T * D;
+        const float gamma = oAm[T * T];
+        const int L = (int)oAm[T * T + 1];
+
+        // Dl = D0 + KW @ S  (KW pre-negated). 64x32 output = 4x2 tiles, 1/warp.
+        {
+            const int tm = warp >> 1, tn = warp & 1;
+            wmma::fragment<wmma::accumulator, 16, 16, 8, float> cf;
+            wmma::load_matrix_sync(cf, D0 + tm * 16 * D + v0 + tn * 16, D, wmma::mem_row_major);
+            wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> bf;
+            #pragma unroll
+            for (int k = 0; k < D; k += 8) {
+                wmma::load_matrix_sync(af, KW + tm * 16 * D + k, D);
+                wmma::load_matrix_sync(bf, S + k * VS + tn * 16, VS);
+                DNMM_TF32(af); DNMM_TF32(bf);
+                wmma::mma_sync(cf, af, bf, cf);
+            }
+            #pragma unroll
+            for (int i = 0; i < (int)cf.num_elements; i++) cf.x[i] = dn_flush(cf.x[i]);
+            wmma::store_matrix_sync(Dl + tm * 16 * VS + tn * 16, cf, VS, wmma::mem_row_major);
+        }
+        __syncthreads();
+
+        // core = EQ @ S + Am @ Dl -> staged in Cs, rows < L copied out.
+        {
+            const int tm = warp >> 1, tn = warp & 1;
+            wmma::fragment<wmma::accumulator, 16, 16, 8, float> cf;
+            wmma::fill_fragment(cf, 0.0f);
+            wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> bf;
+            #pragma unroll
+            for (int k = 0; k < D; k += 8) {
+                wmma::load_matrix_sync(af, EQ + tm * 16 * D + k, D);
+                wmma::load_matrix_sync(bf, S + k * VS + tn * 16, VS);
+                DNMM_TF32(af); DNMM_TF32(bf);
+                wmma::mma_sync(cf, af, bf, cf);
+            }
+            #pragma unroll
+            for (int k = 0; k < T; k += 8) {
+                wmma::load_matrix_sync(af, oAm + tm * 16 * T + k, T);
+                wmma::load_matrix_sync(bf, Dl + k * VS + tn * 16, VS);
+                DNMM_TF32(af); DNMM_TF32(bf);
+                wmma::mma_sync(cf, af, bf, cf);
+            }
+            wmma::store_matrix_sync(Cs + tm * 16 * VS + tn * 16, cf, VS, wmma::mem_row_major);
+        }
+        __syncthreads();
+        for (int idx = tid; idx < L * VS; idx += BS)
+            core_raw[(size_t)(c * T + idx / VS) * value_dim + (size_t)head * D + v0 + idx % VS] = Cs[idx];
+
+        // S = gamma * S + KC^T @ Dl. 128x32 = 8x2 tiles, 2/warp.
+        {
+            wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::col_major> af;
+            wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> bf;
+            #pragma unroll
+            for (int t2 = 0; t2 < 2; t2++) {
+                const int tile = warp * 2 + t2;
+                const int tm = tile >> 1, tn = tile & 1;   // tm 0..7 over D, tn 0..1
+                wmma::fragment<wmma::accumulator, 16, 16, 8, float> cf;
+                wmma::load_matrix_sync(cf, S + tm * 16 * VS + tn * 16, VS, wmma::mem_row_major);
+                #pragma unroll
+                for (int i = 0; i < (int)cf.num_elements; i++) cf.x[i] *= gamma;
+                #pragma unroll
+                for (int k = 0; k < T; k += 8) {
+                    wmma::load_matrix_sync(af, KC + k * D + tm * 16, D);
+                    wmma::load_matrix_sync(bf, Dl + k * VS + tn * 16, VS);
+                    DNMM_TF32(af); DNMM_TF32(bf);
+                    wmma::mma_sync(cf, af, bf, cf);
+                }
+                #pragma unroll
+                for (int i = 0; i < (int)cf.num_elements; i++) cf.x[i] = dn_flush(cf.x[i]);
+                __syncthreads();                     // all gamma*S loads done before stores
+                wmma::store_matrix_sync(S + tm * 16 * VS + tn * 16, cf, VS, wmma::mem_row_major);
+            }
+        }
+        __syncthreads();
+    }
+    #undef DNMM_TF32
+    for (int idx = tid; idx < D * VS; idx += BS)
+        state[(size_t)(idx / VS) * D + v0 + idx % VS] = S[idx];
+}
+
 // prep + scan + norm. vs = value-stripe width (32 or 64).
 static int launch_deltanet_chunk_mm(int vs, float *core_out, float *recurrent_state,
                                     const float *qkv_conv, const float *z,
@@ -19534,11 +19657,14 @@ static int launch_deltanet_chunk_mm(int vs, float *core_out, float *recurrent_st
     if (ensure_float_buffer(&g_dnmm, &g_dnmm_floats, (int)need, "d_dnmm") != 0) return -102;
 
     size_t psm = (size_t)(2 * T * (dim + 1) + T * T + 2 * T) * sizeof(float);  // 81 KB (DP pad, Am direct)
+    size_t ssm16 = (size_t)(dim * 16 + T * 16 + T * T + 16 * dim) * sizeof(float);  // 36 KB
     size_t ssm32 = (size_t)(dim * 32 + T * 32 + T * T + 16 * dim) * sizeof(float);  // 48 KB
     size_t ssm64 = (size_t)(dim * 64 + T * 64 + T * T + 16 * dim) * sizeof(float);  // 72 KB
     static int primed = 0;
     if (!primed) {
         cudaFuncSetAttribute(k_tq_dnmm_prep<64, 128>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)psm);
+        cudaFuncSetAttribute(k_tq_dnmm_scan<64, 128, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ssm16);
+        cudaFuncSetAttribute(k_tq_dnmm_scan_tf32<64, 128, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024);
         cudaFuncSetAttribute(k_tq_dnmm_scan<64, 128, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ssm32);
         cudaFuncSetAttribute(k_tq_dnmm_scan<64, 128, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ssm64);
         if (cudaGetLastError() != cudaSuccess) return -105;
@@ -19547,8 +19673,15 @@ static int launch_deltanet_chunk_mm(int vs, float *core_out, float *recurrent_st
     dim3 pg(nchunk, value_heads);
     k_tq_dnmm_prep<64, 128><<<pg, 256, psm, st>>>(g_dnmm, qkv_conv, b_proj, a_proj,
                                                   A_log, dt_bias, N, value_heads, key_heads);
-    if (vs == 64)
+    if (vs == 99) {
+        size_t ssmt = (size_t)(dim * 32 + T * 32 + T * 32) * sizeof(float);       // 32 KB
+        k_tq_dnmm_scan_tf32<64, 128, 32><<<value_heads * (dim / 32), 256, ssmt, st>>>(
+            core_out, recurrent_state, g_dnmm, N, value_heads);
+    } else if (vs == 64)
         k_tq_dnmm_scan<64, 128, 64><<<value_heads * (dim / 64), 256, ssm64, st>>>(
+            core_out, recurrent_state, g_dnmm, N, value_heads);
+    else if (vs == 16)
+        k_tq_dnmm_scan<64, 128, 16><<<value_heads * (dim / 16), 256, ssm16, st>>>(
             core_out, recurrent_state, g_dnmm, N, value_heads);
     else
         k_tq_dnmm_scan<64, 128, 32><<<value_heads * (dim / 32), 256, ssm32, st>>>(
@@ -19585,11 +19718,12 @@ static int launch_deltanet_chunk_hs(int ck, int nstripe, int g,
     // for N >= 128, where the serial dimension actually shrinks (2+ chunks) and
     // the prep grid fills the card. Falls back to the ck=8 path on any error.
     if (ck == 64)
-        return launch_deltanet_chunk_mm(nstripe == 1 ? 64 : 32, core_out, recurrent_state,
+        return launch_deltanet_chunk_mm(nstripe == 1 ? 64 : (nstripe == 4 ? 99 : 32), core_out, recurrent_state,
                                         qkv_conv, z, b_proj, a_proj, A_log, dt_bias,
                                         norm_weight, N, value_heads, key_heads, dim, eps, st);
     if (tq_dn_mm_mode() > 0 && N >= 128) {
-        int rc = launch_deltanet_chunk_mm(tq_dn_mm_mode() >= 2 ? 64 : 32, core_out,
+        int vs_sel = tq_dn_mm_mode() == 2 ? 64 : (tq_dn_mm_mode() == 3 ? 99 : 32);
+        int rc = launch_deltanet_chunk_mm(vs_sel, core_out,
                                           recurrent_state, qkv_conv, z, b_proj, a_proj,
                                           A_log, dt_bias, norm_weight, N, value_heads,
                                           key_heads, dim, eps, st);
