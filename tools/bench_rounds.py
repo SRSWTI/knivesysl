@@ -13,14 +13,17 @@ from __future__ import annotations
 import argparse, ctypes, os, sys, time
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
 from mtp_spec_smoke import load_lib, Eng, prefill, ck, BIGTEXT
 from transformers import AutoTokenizer
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--tqf", default="/workspace/models/Qwen3.6-27B/qwen3_6-27b-e2m3-mtp.tqf")
-ap.add_argument("--model-dir", default="/workspace/models/Qwen3.6-27B")
-ap.add_argument("--lib", default="/workspace/knivesysl/build-qwen/libforward_qwen.so")
+ap.add_argument("--tqf", default=os.environ.get("TQ_MODEL_TQF")
+                or "/workspace/models/Qwen3.6-27B/qwen3_6-27b-e2m3-mtp.tqf")
+ap.add_argument("--model-dir", default=os.environ.get("TQ_MODEL_DIR") or "/workspace/models/Qwen3.6-27B")
+ap.add_argument("--lib", default=os.environ.get("TQ_LIB")
+                or os.path.join(HERE, "..", "build-qwen", "libforward_qwen.so"))
 ap.add_argument("--prompt-tokens", type=int, default=1024)
 ap.add_argument("--rounds", type=int, default=200)
 ap.add_argument("--warmup", type=int, default=10)

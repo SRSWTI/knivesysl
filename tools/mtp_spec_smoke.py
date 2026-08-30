@@ -155,7 +155,15 @@ def prefill(e, ids, p, build_trunk=True, start=0, anchor=0):
     # length (contiguous Q4: 2.86x@8k 2.57x@16k 2.31x@32k ~1.8x@64k; paged: 2.1x@8k 2.9x@16k
     # 4.1x@32k) -> no upper crossover. So with MMA on the cap lifts to the full context (always
     # wide+MMA); with MMA off the 16k scalar cap stays. Explicit TQ_WIDE_MAX always overrides.
-    mma_on = os.environ.get("TQ_WIDE_ATTN_MMA", "") not in ("", "0")
+    # NEVER mirror the engine default here: ask the library. This used to read
+    # `TQ_WIDE_ATTN_MMA` from the environment and assume "unset == off", which silently
+    # capped the wide path at 16384 tokens once the engine defaulted MMA on -- long
+    # prompts then fell through to the chunked ABI and failed.
+    try:
+        e.L.qwn_wide_attn_mma.restype = ctypes.c_int
+        mma_on = e.L.qwn_wide_attn_mma() != 0
+    except AttributeError:
+        mma_on = os.environ.get("TQ_WIDE_ATTN_MMA", "") not in ("", "0")
     wide_max = int(os.environ.get("TQ_WIDE_MAX", str(10**9 if mma_on else 16384)))
     kv_fp8_only = (os.environ.get("TQ_KV_FP8", "") not in ("", "0")
                    and os.environ.get("TQ_KV_Q4", "") in ("", "0"))

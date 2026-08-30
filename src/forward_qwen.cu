@@ -3389,7 +3389,13 @@ static int wide_attn_qrows(void) {
 
 static int wide_attn_mma_enabled(void) {
     static int c = -1;
-    if (c < 0) { const char *e = getenv("TQ_WIDE_ATTN_MMA"); c = (e && atoi(e)) ? 1 : 0; }
+    // ON by default. This was opt-in while the tensor-core prefill attention was being
+    // brought up, and the flag then outlived the bring-up: `serve_openai.py` set it and
+    // `bench_decode.py` set it, but `serve_batched.py` did NOT -- so every published
+    // number came from the MMA path while the multi-client paged server silently ran the
+    // memory-bound decode kernel across prompt columns. Measured on the paged prefill
+    // wave: k_tq_wide_attn_mma 0.30 ms/launch vs k_tq_paged_attn_q4_split_gqa 1.89.
+    if (c < 0) { const char *e = getenv("TQ_WIDE_ATTN_MMA"); c = (e && e[0] && !atoi(e)) ? 0 : 1; }
     return c;
 }
 
@@ -13221,6 +13227,10 @@ static int tq_wave_cap(void) {
     return cap;
 }
 extern "C" int qwn_wave_cap(void) { return tq_wave_cap(); }
+// Also published, for the same reason the wave cap is: the Python harnesses used to
+// mirror this default to decide the wide-prefill token cap, and the mirror went stale
+// the moment the engine default moved. Ask, never assume.
+extern "C" int qwn_wide_attn_mma(void) { return wide_attn_mma_enabled(); }
 
 // Engine-side wave accounting. A Python caller timing the ctypes call also measures GIL
 // re-acquisition on return, so host-side numbers cannot separate "the engine was slow"
