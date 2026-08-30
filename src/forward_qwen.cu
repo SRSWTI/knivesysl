@@ -3350,6 +3350,311 @@ __global__ void k_tq_wide_attn_mma_merge(
     }
 }
 
+// ===== QT=4 (64-query-row) wide-prefill attention =====
+// Same math and fragment floor plan as k_tq_wide_attn_mma, generalized to FOUR
+// 16-row query tiles per CTA and dynamic shared memory (55 KB). WHY: the kernel
+// is KV-bandwidth-bound and KV traffic scales as total_query_rows / M_tile x
+// depth. FA2's hd256 config runs M=64 but is smem-capped there by its bf16 KV
+// tiles (96 KB); our int4-K / e4m3-V tiles are 4-8x smaller, so M=64 fits with
+// room to spare and each KV byte feeds 2x the queries the QT=2 kernel fed.
+// Per query row the numerics are IDENTICAL to the QT=1/2 kernels (same fragment
+// layout, same reduction order); only the per-CTA row count changes.
+template <int MODE>
+__global__ __launch_bounds__(256, 1)
+void k_tq_wide_attn_mma4(
+    float *out, const float *q_proj_base, const uint16_t *q_norm_w,
+    const float *k_cache, const float *v_cache,
+    const uint8_t *k4, const float *kq4s, const uint8_t *v8, const float *vscale,
+    const int *positions, int slot, const int *block_table, int max_blocks,
+    int page, int page_log, int N, int nh, int nkv, int hd, int q_m, int attn_m,
+    float eps, float rope_theta, float *part) {
+    constexpr int QQ = 4, QROWS = 64;
+    constexpr int OFF_QA   = 0;                       // 4 x 2048
+    constexpr int OFF_PST  = 8192;                    // 4 x 1024
+    constexpr int OFF_WMAX = 12288;                   // 8 x 64
+    constexpr int OFF_WSUM = 12800;
+    constexpr int OFF_MST  = 13312;
+    constexpr int OFF_LST  = 13376;
+    constexpr int OFF_ALPH = 13440;
+    constexpr int OFF_QTMP = 13504;
+    constexpr int OFF_REDC = 13760;
+    constexpr int ZERCAP   = 12288;
+    extern __shared__ uint32_t sm_wa4[];
+    uint32_t *sm = sm_wa4;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int gr = lane >> 2, t4 = lane & 3;
+    int head = blockIdx.x, qtile = blockIdx.y, qtile_base = qtile * QROWS;
+    if (head >= nh) return;
+    const int group = nh / nkv, kv_head = head / group;
+    const size_t cstride = (size_t)nkv * hd;
+    const uint8_t *kcb4 = k4 ? k4 + (size_t)kv_head * (hd >> 1) : NULL;
+    const float *ksz4 = kq4s ? q4s_adv(kq4s, (size_t)kv_head * 16) : NULL;
+    const uint8_t *vcb8 = v8 ? v8 + (size_t)kv_head * hd : NULL;
+    const float *vscb = vscale ? vscale + kv_head : NULL;
+    const size_t cstride4 = cstride >> 1, szstride = (size_t)nkv * 16;
+    float *qtmp = (float *)(sm + OFF_QTMP);
+    float *red = (float *)(sm + OFF_REDC);
+    float *wmax = (float *)(sm + OFF_WMAX), *wsum = (float *)(sm + OFF_WSUM);
+    float *mst = (float *)(sm + OFF_MST), *lst = (float *)(sm + OFF_LST);
+    float *alph = (float *)(sm + OFF_ALPH);
+    int nvalid = N - qtile_base; if (nvalid > QROWS) nvalid = QROWS;
+    int maxpos = positions[qtile_base + nvalid - 1];
+    for (int i = tid; i < ZERCAP; i += 256) sm[i] = 0;
+    if (tid < QROWS) { mst[tid] = TQ_AMM_NINF; lst[tid] = 0.0f; }
+    __syncthreads();
+    // ---- Q prep (identical per row to the QT=1/2 kernel) ----
+    for (int n = 0; n < nvalid; n++) {
+        const float *q_proj = q_proj_base + (size_t)(qtile_base + n) * q_m;
+        int pos = positions[qtile_base + n];
+        float qv = q_proj[head * (2 * hd) + tid];
+        float qsum = qv * qv;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) qsum += __shfl_down_sync(0xffffffffu, qsum, o);
+        if (lane == 0) red[warp] = qsum;
+        __syncthreads();
+        if (tid < 8) { float v = red[tid]; for (int o = 4; o > 0; o >>= 1) v += __shfl_down_sync(0xffu, v, o); if (tid == 0) red[8] = v; }
+        __syncthreads();
+        float qss = red[8];
+        qv = qv * rsqrtf(qss / (float)hd + eps) * (1.0f + tq_bf16_to_float(q_norm_w[tid]));
+        if (tid < 64) {
+            int idx = tid & 31;
+            float freq = powf(rope_theta, -((float)(2 * idx) / 64.0f));
+            float angle = (float)pos * freq, c = cosf(angle), sn = sinf(angle);
+            float q_pair = q_proj[head * (2 * hd) + ((tid < 32) ? tid + 32 : tid - 32)];
+            q_pair = q_pair * rsqrtf(qss / (float)hd + eps) * (1.0f + tq_bf16_to_float(q_norm_w[(tid < 32) ? tid + 32 : tid - 32]));
+            float q_rot = (tid < 32) ? -q_pair : q_pair;
+            qv = qv * c + q_rot * sn;
+        }
+        __syncthreads();
+        qtmp[tid] = qv;
+        __syncthreads();
+        if (MODE != 1) tq_fwht256(qtmp, tid);
+        if (tid < 128) {
+            int c16 = tid >> 3, tt = (tid >> 1) & 3, rsel = tid & 1;
+            int d0 = 16 * c16 + 2 * tt + 8 * rsel;
+            int nn = n & 15;
+            int l = 4 * (nn & 7) + tt, r = ((nn >> 3) & 1) + 2 * rsel;
+            sm[OFF_QA + (n >> 4) * 2048 + (c16 * 32 + l) * 4 + r] = tq_pack_bf16(qtmp[d0], qtmp[d0 + 1]);
+        }
+        __syncthreads();
+    }
+    // ---- main loop over 128-key super-tiles ----
+    float oacc[QQ][4][4];
+    #pragma unroll
+    for (int q = 0; q < QQ; q++)
+        for (int f = 0; f < 4; f++)
+            for (int j = 0; j < 4; j++) oacc[q][f][j] = 0.0f;
+    const float rsc = rsqrtf((float)hd);
+    int nst_all = (maxpos + 128) >> 7;
+    int it_lo = 0, nst = nst_all;
+    if (gridDim.z > 1) {
+        int per = (nst_all + gridDim.z - 1) / gridDim.z;
+        it_lo = blockIdx.z * per;
+        int hi = it_lo + per;
+        nst = hi < nst_all ? hi : nst_all;
+    }
+    for (int it = it_lo; it < nst; it++) {
+        const int t0 = it << 7;
+        size_t pr0 = 0;
+        if (MODE == 4) {
+            int phys = block_table[(size_t)slot * max_blocks + (t0 >> page_log)];
+            pr0 = (size_t)phys * page + (size_t)(t0 & (page - 1));
+        }
+#define TQ_PROW4(lp) (MODE == 4 ? (pr0 + (size_t)(min((lp), maxpos) - t0)) : (size_t)min((lp), maxpos))
+        float sA[QQ][4], sB[QQ][4];
+        #pragma unroll
+        for (int q = 0; q < QQ; q++)
+            for (int j = 0; j < 4; j++) { sA[q][j] = 0.0f; sB[q][j] = 0.0f; }
+        const int tp = t0 + warp * 16;
+        int p0 = tp + gr, p1 = tp + 8 + gr;
+        {
+            const uint8_t *kr0 = kcb4 + TQ_PROW4(p0) * cstride4;
+            const uint8_t *kr1 = kcb4 + TQ_PROW4(p1) * cstride4;
+            const float *sz0 = q4s_adv(ksz4, TQ_PROW4(p0) * szstride);
+            const float *sz1 = q4s_adv(ksz4, TQ_PROW4(p1) * szstride);
+            #pragma unroll
+            for (int g = 0; g < 8; g++) {
+                float2 p0s = q4s_pair(sz0, 2 * g);
+                float2 p1s = q4s_pair(sz1, 2 * g);
+                float sc0 = p0s.x, zp0 = p0s.y;
+                float sc1 = p1s.x, zp1 = p1s.y;
+                uint4 kp0 = *(const uint4 *)(kr0 + 16 * g);
+                uint4 kp1 = *(const uint4 *)(kr1 + 16 * g);
+                uint32_t w0[4] = {kp0.x, kp0.y, kp0.z, kp0.w};
+                uint32_t w1[4] = {kp1.x, kp1.y, kp1.z, kp1.w};
+                const uint8_t *b0 = (const uint8_t *)w0;
+                const uint8_t *b1 = (const uint8_t *)w1;
+                #pragma unroll
+                for (int cc = 0; cc < 2; cc++) {
+                    int c = 2 * g + cc;
+                    int bi = (8 * c + t4) & 15;
+                    uint8_t a0 = b0[bi], a8 = b0[bi + 4];
+                    uint8_t e0 = b1[bi], e8 = b1[bi + 4];
+                    uint32_t bk00 = tq_pack_bf16(((float)(a0 & 15) - zp0) * sc0, ((float)(a0 >> 4) - zp0) * sc0);
+                    uint32_t bk08 = tq_pack_bf16(((float)(a8 & 15) - zp0) * sc0, ((float)(a8 >> 4) - zp0) * sc0);
+                    uint32_t bk10 = tq_pack_bf16(((float)(e0 & 15) - zp1) * sc1, ((float)(e0 >> 4) - zp1) * sc1);
+                    uint32_t bk18 = tq_pack_bf16(((float)(e8 & 15) - zp1) * sc1, ((float)(e8 >> 4) - zp1) * sc1);
+                    #pragma unroll
+                    for (int q = 0; q < QQ; q++) {
+                        const uint32_t *a = &sm[OFF_QA + q * 2048 + (c * 32 + lane) * 4];
+                        tq_mma_bf16_m16n8k16(sA[q], a, bk00, bk08);
+                        tq_mma_bf16_m16n8k16(sB[q], a, bk10, bk18);
+                    }
+                }
+            }
+        }
+        // scale + causal staircase mask
+        #pragma unroll
+        for (int q = 0; q < QQ; q++) {
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                int qrow = ((j < 2) ? gr : (gr + 8)) + q * 16;
+                int qpos = (qrow < nvalid) ? positions[qtile_base + qrow] : -1;
+                int k0 = tp + 2 * t4 + (j & 1), k1 = tp + 8 + 2 * t4 + (j & 1);
+                sA[q][j] = (k0 <= qpos) ? sA[q][j] * rsc : TQ_AMM_NINF;
+                sB[q][j] = (k1 <= qpos) ? sB[q][j] * rsc : TQ_AMM_NINF;
+            }
+        }
+        #pragma unroll
+        for (int q = 0; q < QQ; q++) {
+            float lm_lo = fmaxf(fmaxf(sA[q][0], sA[q][1]), fmaxf(sB[q][0], sB[q][1]));
+            float lm_hi = fmaxf(fmaxf(sA[q][2], sA[q][3]), fmaxf(sB[q][2], sB[q][3]));
+            #pragma unroll
+            for (int o = 1; o <= 2; o <<= 1) {
+                lm_lo = fmaxf(lm_lo, __shfl_xor_sync(0xffffffffu, lm_lo, o));
+                lm_hi = fmaxf(lm_hi, __shfl_xor_sync(0xffffffffu, lm_hi, o));
+            }
+            if (t4 == 0) {
+                wmax[warp * QROWS + q * 16 + gr] = lm_lo;
+                wmax[warp * QROWS + q * 16 + 8 + gr] = lm_hi;
+            }
+        }
+        __syncthreads();
+        if (warp == 0) {
+            for (int r = lane; r < QROWS; r += 32) {
+                float m_old = mst[r], m_new = m_old;
+                for (int w = 0; w < 8; w++) m_new = fmaxf(m_new, wmax[w * QROWS + r]);
+                alph[r] = expf(m_old - m_new); mst[r] = m_new;
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int q = 0; q < QQ; q++) {
+            float mn_lo = mst[q * 16 + gr], mn_hi = mst[q * 16 + 8 + gr];
+            float p00 = expf(sA[q][0] - mn_lo), p01 = expf(sA[q][1] - mn_lo);
+            float p02 = expf(sA[q][2] - mn_hi), p03 = expf(sA[q][3] - mn_hi);
+            float p10 = expf(sB[q][0] - mn_lo), p11 = expf(sB[q][1] - mn_lo);
+            float p12 = expf(sB[q][2] - mn_hi), p13 = expf(sB[q][3] - mn_hi);
+            float ls_lo = p00 + p01 + p10 + p11, ls_hi = p02 + p03 + p12 + p13;
+            #pragma unroll
+            for (int o = 1; o <= 2; o <<= 1) {
+                ls_lo += __shfl_xor_sync(0xffffffffu, ls_lo, o);
+                ls_hi += __shfl_xor_sync(0xffffffffu, ls_hi, o);
+            }
+            if (t4 == 0) {
+                wsum[warp * QROWS + q * 16 + gr] = ls_lo;
+                wsum[warp * QROWS + q * 16 + 8 + gr] = ls_hi;
+            }
+            if (MODE != 1) {
+                int p0c = t0 + warp * 16 + 2 * t4, p1c = p0c + 8;
+                float v00 = vscb[TQ_PROW4(p0c) * nkv];
+                float v01 = vscb[TQ_PROW4(p0c + 1) * nkv];
+                float v10 = vscb[TQ_PROW4(p1c) * nkv];
+                float v11 = vscb[TQ_PROW4(p1c + 1) * nkv];
+                p00 *= v00; p01 *= v01; p02 *= v00; p03 *= v01;
+                p10 *= v10; p11 *= v11; p12 *= v10; p13 *= v11;
+            }
+            uint32_t *pst = &sm[OFF_PST + q * 1024 + (warp * 32 + lane) * 4];
+            pst[0] = tq_pack_bf16(p00, p01); pst[1] = tq_pack_bf16(p02, p03);
+            pst[2] = tq_pack_bf16(p10, p11); pst[3] = tq_pack_bf16(p12, p13);
+        }
+        __syncthreads();
+        if (warp == 0) {
+            for (int r = lane; r < QROWS; r += 32) {
+                float l = lst[r] * alph[r];
+                for (int w = 0; w < 8; w++) l += wsum[w * QROWS + r];
+                lst[r] = l;
+            }
+        }
+        #pragma unroll
+        for (int q = 0; q < QQ; q++) {
+            float a_lo = alph[q * 16 + gr], a_hi = alph[q * 16 + 8 + gr];
+            #pragma unroll
+            for (int f = 0; f < 4; f++) {
+                oacc[q][f][0] *= a_lo; oacc[q][f][1] *= a_lo;
+                oacc[q][f][2] *= a_hi; oacc[q][f][3] *= a_hi;
+            }
+        }
+        for (int tt = 0; tt < 8; tt++) {
+            uint32_t aq[QQ][4];
+            #pragma unroll
+            for (int q = 0; q < QQ; q++) {
+                const uint32_t *pa = &sm[OFF_PST + q * 1024 + (tt * 32 + lane) * 4];
+                aq[q][0] = pa[0]; aq[q][1] = pa[1]; aq[q][2] = pa[2]; aq[q][3] = pa[3];
+            }
+            #pragma unroll
+            for (int f = 0; f < 4; f++) {
+                int col = warp * 32 + f * 8 + gr;
+                int r0 = t0 + tt * 16 + 2 * t4;
+                uint32_t b0, b1;
+                b0 = tq_pack_bf16(tq_e4m3_dec_fast(vcb8[TQ_PROW4(r0) * cstride + col]),
+                                  tq_e4m3_dec_fast(vcb8[TQ_PROW4(r0 + 1) * cstride + col]));
+                b1 = tq_pack_bf16(tq_e4m3_dec_fast(vcb8[TQ_PROW4(r0 + 8) * cstride + col]),
+                                  tq_e4m3_dec_fast(vcb8[TQ_PROW4(r0 + 9) * cstride + col]));
+                #pragma unroll
+                for (int q = 0; q < QQ; q++) tq_mma_bf16_m16n8k16(oacc[q][f], aq[q], b0, b1);
+            }
+        }
+#undef TQ_PROW4
+        __syncthreads();
+    }
+    // ---- key-split partials ----
+    if (gridDim.z > 1) {
+        constexpr int PART_F = 2 * QROWS + QROWS * 256;
+        float *ps = part + (size_t)((head * gridDim.y + qtile) * gridDim.z + blockIdx.z) * PART_F;
+        if (tid < QROWS) { ps[tid] = mst[tid]; ps[QROWS + tid] = lst[tid]; }
+        float *po = ps + 2 * QROWS;
+        #pragma unroll
+        for (int q = 0; q < QQ; q++) {
+            #pragma unroll
+            for (int f = 0; f < 4; f++) {
+                int col = warp * 32 + f * 8 + 2 * t4;
+                #pragma unroll
+                for (int j = 0; j < 2; j++) {
+                    po[(size_t)(q * 16 + gr) * 256 + col + j] = oacc[q][f][j];
+                    po[(size_t)(q * 16 + 8 + gr) * 256 + col + j] = oacc[q][f][2 + j];
+                }
+            }
+        }
+        return;
+    }
+    // ---- epilogue ----
+    #pragma unroll
+    for (int q = 0; q < QQ; q++) {
+        float inv_lo = 1.0f / lst[q * 16 + gr], inv_hi = 1.0f / lst[q * 16 + 8 + gr];
+        #pragma unroll
+        for (int f = 0; f < 4; f++) {
+            int col = warp * 32 + f * 8 + 2 * t4;
+            #pragma unroll
+            for (int j = 0; j < 2; j++) {
+                int r_lo = q * 16 + gr, r_hi = q * 16 + 8 + gr;
+                if (r_lo < nvalid) {
+                    const float *q_proj = q_proj_base + (size_t)(qtile_base + r_lo) * q_m;
+                    float gate = q_proj[head * (2 * hd) + hd + col + j];
+                    out[(size_t)(qtile_base + r_lo) * attn_m + head * hd + col + j] =
+                        oacc[q][f][j] * inv_lo * (1.0f / (1.0f + expf(-gate)));
+                }
+                if (r_hi < nvalid) {
+                    const float *q_proj = q_proj_base + (size_t)(qtile_base + r_hi) * q_m;
+                    float gate = q_proj[head * (2 * hd) + hd + col + j];
+                    out[(size_t)(qtile_base + r_hi) * attn_m + head * hd + col + j] =
+                        oacc[q][f][2 + j] * inv_hi * (1.0f / (1.0f + expf(-gate)));
+                }
+            }
+        }
+    }
+}
+
 // S key-chunks for a wide-prefill attention launch over prefix [0..max_pos]:
 // 1 (bit-identical single pass) until the prefix outgrows what nh x nqt blocks
 // keep parallel, then ~1 chunk per TQ_WIDE_ATTN_SPLIT positions, capped at 8.
@@ -3384,7 +3689,11 @@ static int ensure_wide_attn_part(size_t floats) {
 // (escape: TQ_WIDE_ATTN_QROWS=16).
 static int wide_attn_qrows(void) {
     static int c = -1;
-    if (c < 0) { const char *e = getenv("TQ_WIDE_ATTN_QROWS"); c = (e && atoi(e) == 16) ? 16 : 32; }
+    if (c < 0) {
+        const char *e = getenv("TQ_WIDE_ATTN_QROWS");
+        int v = e ? atoi(e) : 0;
+        c = (v == 16 || v == 32 || v == 64) ? v : 0;   // 0 = auto (by prefix depth)
+    }
     return c;
 }
 
@@ -22614,12 +22923,28 @@ static int launch_batched_attn_q4(float *out, const float *q_proj, const uint16_
     bool wide_shared = (k4_stride == 0 && kq4s_stride == 0 && v8_stride == 0 && vscale_stride == 0);
     if (wide_shared && wide_attn_mma_enabled()) {
         int qr = wide_attn_qrows();
+        // auto: 64-row tiles once the prefix is deep enough that KV streaming
+        // dominates (each KV byte then feeds 2x the query rows); 32 below.
+        if (qr == 0) qr = (max_pos >= 24576) ? 64 : 32;
         int nqt = (N + qr - 1) / qr;
         int S = wide_attn_split_S(max_pos);
         int part_f = 2 * qr + qr * 256;
         if (S > 1 && ensure_wide_attn_part((size_t)nh * nqt * S * part_f) != 0)
             S = 1;
-        if (qr == 32)
+        if (qr == 64) {
+            static int primed3 = 0;
+            const size_t wa4b = 13792u * 4u;
+            if (!primed3) {
+                cudaFuncSetAttribute(k_tq_wide_attn_mma4<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)wa4b);
+                cudaFuncSetAttribute(k_tq_wide_attn_mma4<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)wa4b);
+                cudaGetLastError();
+                primed3 = 1;
+            }
+            k_tq_wide_attn_mma4<3><<<dim3(nh, nqt, S), 256, wa4b, st>>>(
+                out, q_proj, q_norm_w, NULL, NULL, k4_base, kq4s_base, v8_base, vscale_base, positions,
+                0, NULL, 0, 0, 0, N, nh, nkv, hd, q_m, attn_m, g_qwen.eps, g_qwen.rope_theta,
+                g_wide_attn_part);
+        } else if (qr == 32)
             k_tq_wide_attn_mma<3, 2><<<dim3(nh, nqt, S), 256, 0, st>>>(
                 out, q_proj, q_norm_w, NULL, NULL, k4_base, kq4s_base, v8_base, vscale_base, positions,
                 0, NULL, 0, 0, 0, N, nh, nkv, hd, q_m, attn_m, g_qwen.eps, g_qwen.rope_theta,
@@ -22630,7 +22955,10 @@ static int launch_batched_attn_q4(float *out, const float *q_proj, const uint16_
                 0, NULL, 0, 0, 0, N, nh, nkv, hd, q_m, attn_m, g_qwen.eps, g_qwen.rope_theta,
                 g_wide_attn_part);
         if (S > 1)
-            if (qr == 32)
+            if (qr == 64)
+                k_tq_wide_attn_mma_merge<4><<<dim3(nh, nqt), 256, 0, st>>>(
+                    out, q_proj, N, nh, hd, q_m, attn_m, S, g_wide_attn_part);
+            else if (qr == 32)
                 k_tq_wide_attn_mma_merge<2><<<dim3(nh, nqt), 256, 0, st>>>(
                     out, q_proj, N, nh, hd, q_m, attn_m, S, g_wide_attn_part);
             else
