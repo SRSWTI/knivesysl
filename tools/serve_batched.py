@@ -116,14 +116,14 @@ def ck(r, what):
 
 class Request:
     __slots__ = ("ids", "max_new", "eos", "out", "done", "slot", "pos", "next_tok",
-                 "started", "t_admit", "t_first", "t_done", "n_prompt", "err",
+                 "started", "t_admit", "t_first", "t_done", "t_tok", "n_prompt", "err",
                  "progress", "cancel")
 
     def __init__(self, ids, max_new, eos):
         self.ids = ids; self.max_new = max_new; self.eos = set(eos)
         self.out = []; self.done = threading.Event(); self.slot = -1
         self.pos = 0; self.next_tok = 0; self.started = False
-        self.t_admit = self.t_first = self.t_done = 0.0; self.n_prompt = len(ids); self.err = None
+        self.t_admit = self.t_first = self.t_done = self.t_tok = 0.0; self.n_prompt = len(ids); self.err = None
         # progress: set by the engine when out grows, so a streaming handler wakes
         # per committed token instead of only at completion.
         # cancel: set by the handler when the client is gone -- the engine detaches
@@ -133,8 +133,8 @@ class Request:
 
 class BatchedEngine:
     def __init__(self, lib, tqf, max_slots, num_blocks, page, wave_cols=WAVE_MAX,
-                 max_prefill=2, fuse=True, fuse_ratio=0.0, decode_every=0,
-                 prefix_cache=True, prefix_cache_min=256,
+                 max_prefill=2, fuse=True, fuse_ratio=0.0, fuse_idle_ms=125.0,
+                 decode_every=0, prefix_cache=True, prefix_cache_min=256,
                  decode_min_rows=8, decode_max_idle_ms=250.0, prefill_budget=96):
         self.L = lib
         ck(self.L.qwn_init(tqf.encode()), "init")
@@ -145,6 +145,7 @@ class BatchedEngine:
         self.decode_every = max(0, decode_every); self.starve = 0
         self.decode_min_rows = max(1, decode_min_rows)
         self.prefill_budget = max(1, prefill_budget)
+        self.fuse_idle_ms = max(0.0, fuse_idle_ms)
         self.decode_max_idle_ms = max(1.0, decode_max_idle_ms)
         self.last_decode = time.time()
         self.pc_enabled = prefix_cache; self.pc_min = max(1, prefix_cache_min)
@@ -165,6 +166,9 @@ class BatchedEngine:
         self.prefill_waves = 0; self.prefilled_tokens = 0
         # wave cost accounting (see _wave / _loop)
         self.t_marshal = 0.0; self.t_engine = 0.0; self.t_loop = 0.0; self.t_idle = 0.0
+        # per-wave timeline for scheduler diagnosis: (t_end, engine_ms, pref_cols,
+        # dec_rows, segs, kind 0=fused wave 1=pure decode step). /v1/wavelog dumps it.
+        self.wavelog = []
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
@@ -186,6 +190,7 @@ class BatchedEngine:
     def _activate(self, req, slot, seed):
         req.slot = slot; req.pos = req.n_prompt; req.next_tok = seed
         req.out.append(seed); req.started = True; req.t_admit = time.time(); req.t_first = req.t_admit
+        req.t_tok = req.t_admit
         self.active[slot] = req
         if seed in req.eos or len(req.out) >= req.max_new:
             self._detach(slot)
@@ -306,6 +311,8 @@ class BatchedEngine:
         t2 = time.perf_counter()
         self.t_marshal += t1 - t0
         self.t_engine += t2 - t1
+        if len(self.wavelog) < 65536:
+            self.wavelog.append((t2, (t2 - t1) * 1e3, T - len(dec_slots), len(dec_slots), K, 0))
         if rc != 0:
             raise RuntimeError(f"fused wave rc={rc} (K={K} T={T})")
         self.prefill_waves += 1
@@ -313,9 +320,10 @@ class BatchedEngine:
         self.decoded_tokens += len(dec_slots)
         self.steps += 1
         finished = []
+        _tnow = time.time()
         for j, s in enumerate(dec_slots):                # decode segments come first
             req = self.active[s]; o = oseed[j]
-            req.out.append(o); req.pos += 1; req.next_tok = o
+            req.out.append(o); req.pos += 1; req.next_tok = o; req.t_tok = _tnow
             req.progress.set()
             if req.cancel or o in req.eos or len(req.out) >= req.max_new:
                 finished.append(s)
@@ -360,11 +368,18 @@ class BatchedEngine:
         pref_maxpos = 0
         for st in self.pref.values():
             pref_maxpos = max(pref_maxpos, st[1] + min(self.wave_cols, st[0].n_prompt - st[1]))
-        # fuse_ratio=0 -> always fuse: decode rows now cost ONE batched attention
-        # launch inside the wave (engine change), not one launch per row, so a
-        # decode row rides the prompt wave's weight read essentially for free.
-        fuse = bool(self.fuse and self.active
-                    and (self.fuse_ratio <= 0.0 or pref_maxpos * self.fuse_ratio >= dec_maxpos))
+        # Riding is NOT free: measured 1.2 ms/row/wave inflation (N=8 sync batch,
+        # 225 ridden tokens = 0.27 s) while the tail step count is set by the LAST
+        # client and a step's cost is row-invariant -- so rides that merely give
+        # early finishers a head start buy nothing. Ride ONLY rows that are
+        # starving (no token for fuse_idle_ms); that keeps the ITL bound for
+        # continuous arrival at ~6x less inflation for synchronized batches.
+        now = time.time()
+        ride = []
+        if self.fuse and self.active and (self.fuse_ratio <= 0.0 or pref_maxpos * self.fuse_ratio >= dec_maxpos):
+            ride = [s for s in self.active
+                    if (now - self.active[s].t_tok) * 1000.0 >= self.fuse_idle_ms]
+        fuse = bool(ride)
         self.starve += 1
         # A decode step costs one full pass over ~20 GiB of weights whatever the row
         # count, so running it at low occupancy WASTES a weight read. Measured under
@@ -373,13 +388,15 @@ class BatchedEngine:
         # wall-clock starvation deadline so ITL stays bounded for admitted requests.
         rows = len(self.active)
         idle_ms = (time.time() - self.last_decode) * 1000.0
+        # With fuse on, gated rides ARE the starvation bound (1.2 ms/row vs a 17 ms
+        # row-invariant weight read), so the min-rows and every-N clauses only apply
+        # when riding is disabled; the wall-clock deadline stays as the safety net.
         due = bool(self.active) and (
-            rows >= self.decode_min_rows                 # fat enough to amortize
-            or idle_ms >= self.decode_max_idle_ms        # someone is starving
-            or not self.q                                # nothing else waiting: drain
-            or (self.decode_every > 0 and self.starve >= self.decode_every))
+            (not self.fuse and rows >= self.decode_min_rows)
+            or idle_ms >= self.decode_max_idle_ms
+            or (not self.fuse and self.decode_every > 0 and self.starve >= self.decode_every))
         if fuse:
-            dec_slots = list(self.active.keys())
+            dec_slots = ride
             for s in dec_slots:
                 req = self.active[s]
                 seg_off.append(len(cols_tok)); seg_slot.append(s); seg_len.append(1); seg_fin.append(1)
@@ -434,13 +451,18 @@ class BatchedEngine:
         sid = (ctypes.c_int * n)(*slots)
         pos = (ctypes.c_int * n)(*[self.active[s].pos for s in slots])
         out = (ctypes.c_int * n)()
+        _t1 = time.perf_counter()
         ck(self.L.qwn_paged_decode_step(toks, sid, pos, n, out), "paged_step")
+        _t2 = time.perf_counter()
+        if len(self.wavelog) < 65536:
+            self.wavelog.append((_t2, (_t2 - _t1) * 1e3, 0, n, n, 1))
         self.steps += 1; self.decoded_tokens += n
         finished = []
+        _tnow = time.time()
         for j, s in enumerate(slots):
             req = self.active[s]
             o = out[j]
-            req.out.append(o); req.pos += 1; req.next_tok = o
+            req.out.append(o); req.pos += 1; req.next_tok = o; req.t_tok = _tnow
             req.progress.set()
             if req.cancel or o in req.eos or len(req.out) >= req.max_new:
                 finished.append(s)
@@ -703,6 +725,13 @@ def make_handler(eng, tok, args):
                                      "engine_inside": e_ms / e_n,
                                      "scheduler_other": 1000.0 * other / w,
                                      "loop_total": 1000.0 * eng.t_loop / w}})
+            elif self.path.startswith("/v1/wavelog"):
+                # Raw wave timeline. Host gap between consecutive engine calls is
+                # rec[i].t_end - rec[i-1].t_end - rec[i].engine_ms.
+                self._json(200, {"log": [list(r) for r in eng.wavelog]})
+            elif self.path.startswith("/v1/wavereset"):
+                eng.wavelog = []
+                self._json(200, {"ok": True})
             else:
                 self._json(404, {"error": "not found"})
 
@@ -846,7 +875,7 @@ def serve(args):
           f"wave_cols={args.wave_cols} prefill_budget={args.prefill_budget}", flush=True)
     eng = BatchedEngine(L, args.tqf, args.max_slots, args.num_blocks, args.page,
                         wave_cols=args.wave_cols, max_prefill=args.max_prefill,
-                        fuse=args.fuse, fuse_ratio=args.fuse_ratio,
+                        fuse=args.fuse, fuse_ratio=args.fuse_ratio, fuse_idle_ms=args.fuse_idle_ms,
                         decode_every=args.decode_every,
                         prefix_cache=args.prefix_cache, prefix_cache_min=args.prefix_cache_min,
                         decode_min_rows=args.decode_min_rows,
@@ -937,6 +966,11 @@ def main():
     ap.add_argument("--fuse-ratio", type=float, default=0.0,
                     help="fuse only if prompt_chunk_depth * RATIO >= decode_depth; the paged attn "
                          "kernel charges every column the wave's deepest position")
+    ap.add_argument("--fuse-idle-ms", type=float, default=125.0,
+                    help="ride a decode row on a prompt wave only when that client has had no "
+                         "token for this long; riding costs ~1.2 ms/row/wave, a tail step is "
+                         "row-invariant, so eager riding buys nothing for synchronized batches "
+                         "(0 = ride every wave, the old behavior)")
     ap.add_argument("--decode-every", type=int, default=4,
                     help="while prompts are pending, force a decode step every N prefill waves. "
                          "0 = pure prefill-priority, which STARVES decode under continuous "
