@@ -216,6 +216,63 @@ the mamba page size and then cannot fit even a minimal profiling KV cache in 32 
 its decode runs without CUDA graphs; and it ran at `--max-model-len 8192` where we ran
 `TQ_CTX=16384`. Its prefill numbers are unaffected by both.
 
+#### Two quantizer changes measured and NOT built
+
+`tools/quant_study.py` reproduces all three quantizers exactly (E2M3, NVFP4 weight,
+NVFP4 activation) in fp64 and reports error on the **product** `W@x`, not on the weight
+-- a rotation changes what "weight error" means, and the product is what the model
+consumes. Activations come from `tools/dump_activations.py`, which pulls the engine's
+**real** residual stream, because this decision cannot be made on synthetic data (see
+below). Both take repo-relative / env-overridable paths.
+
+**1. Emitting NVFP4 from the converter: real but small, so deferred.** The shipped tier
+repacks weights that are already E2M3, paying two rounding steps; a converter emitting
+NVFP4 would pay one. Measured product-error ratio: **1.03-1.09x**. The 4-bit E2M1 grid
+dominates the error, not the intermediate E2M3 step -- so a format change on both sides
+plus a 22.6 GB re-conversion buys under 10%. Not worth it yet; recorded so the next
+person does not re-derive it.
+
+**2. Hadamard rotation: actively HARMFUL here. Do not add it.** This is the interesting
+one, because it contradicts the standard recipe (QuaRot, and QuTLASS/vLLM's own
+"NVFP4 + Hadamard" curves). `W@x == (W@H) @ (H.T@x)` for orthogonal H, and rotating
+along K is supposed to flatten outlier channels. The engine even already ships a 256-wide
+FWHT for the K cache, so it would have been cheap to wire up.
+
+First, the outliers are real and severe -- per-channel peak/median of the residual
+stream, measured on this model:
+
+| depth | peak / median |
+|---|--:|
+| layer 0 (embedding) | 1.9x |
+| layer 8 | 81x |
+| layer 32 | **245x** |
+
+And yet rotation makes it worse, monotonically in the rotation block size (product error,
+real layer-32 activations):
+
+| tensor | shipped | no rotation | had16 | had32 | had64 | had256 |
+|---|--:|--:|--:|--:|--:|--:|
+| `mlp.gate_proj` | 0.1167 | **0.1068** | 0.1242 | 0.1306 | 0.1276 | 0.1547 |
+| `mlp.down_proj` | 0.1052 | **0.0997** | 0.1112 | 0.1143 | 0.1222 | 0.1407 |
+| `linear_attn.in_proj_qkv` | 0.1055 | **0.1014** | 0.1115 | 0.1126 | 0.1183 | 0.1391 |
+
+**Why: NVFP4's scale group is only 16 elements.** An outlier damages exactly its own
+group of 16 and none of the other 319; a rotation SPREADS it across every group in the
+block, raising all of their scales. Localizing an outlier beats diluting it once the
+scale granularity is at or below the outlier's own footprint. The monotonic rise with
+block size is the mechanism showing itself -- and even `had16`, matched exactly to the
+scale group, loses, because mixing turns one large-plus-fifteen-small group (which E2M1's
+8 magnitudes represent well) into sixteen mid-magnitude values (which it does not).
+
+Rotation is the right tool for per-tensor or per-channel scaling. At per-16 it is a
+pessimization, and the ~1-2% activation-FWHT cost would have been paid for negative
+quality. This is why the study ran before the implementation.
+
+**A caution on how this was almost gotten wrong:** the first pass used Gaussian synthetic
+activations and reported Hadamard as a flat 1.03-1.05x -- i.e. "no effect". That was not a
+result, it was a broken experiment: a Gaussian has no outlier channels, so nothing exists
+to flatten and any rotation must look neutral. Real activations were required to see that
+the effect is not merely absent but negative.
 
 ### Hot kernels: prefill GEMM, DeltaNet scan, paged decode attention
 

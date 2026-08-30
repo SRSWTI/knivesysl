@@ -309,6 +309,9 @@ tools/inspect_tqf.py       inspect a .tqf
 tools/bench_coding.py      cold/follow-up coding-workload benchmark
 tools/bench_decode.py      paged decode sweep (concurrency x context depth)
 tools/tf_agreement.py      teacher-forced top-1 agreement between two libs/configs
+tools/bench_endpoint.py    http endpoint sweep (any engine, unique vs shared prefix)
+tools/quant_study.py       quantizer error on W@x: repack vs direct vs rotations
+tools/dump_activations.py  real activations for quant_study (synthetic data lies)
 tools/nvfp4_check.py       nvfp4 numeric gate (fp64 decode of the packed bytes)
 tools/nvfp4_quality.py     nvfp4 wide-path argmax agreement (tf_agreement can't reach it)
 ```
