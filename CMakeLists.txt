@@ -19,6 +19,8 @@ set_target_properties(knivesysl-forward-qwen PROPERTIES
 )
 target_link_libraries(knivesysl-forward-qwen PRIVATE
     CUDA::cudart_static
+    # cuTensorMapEncodeTiled (TMA descriptors for the NVFP4 GEMM) is driver API.
+    CUDA::cuda_driver
 )
 target_compile_options(knivesysl-forward-qwen PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3>

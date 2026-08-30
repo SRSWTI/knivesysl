@@ -5,6 +5,7 @@
  * runtime. Full Qwen forward kernels will build on this state layout.
  */
 #include <cuda_runtime.h>
+#include <cuda.h>
 #include <cuda_fp16.h>
 
 #include <stdint.h>
@@ -126,6 +127,17 @@ typedef struct {
     uint32_t *d_nvf4_a;
     float *d_nvf4_global;
     int nvf4;
+    // TMA descriptor for d_nvf4_a, viewed as 2D [Mt][Kt64*TQ_NVF4_AW] u32. Built ONCE at
+    // repack (cuTensorMapEncodeTiled is a driver call, far too costly per launch) and held
+    // BY POINTER, not by value: CUtensorMap is 128-BYTE aligned, so embedding it grew this
+    // struct from 136 to 512 bytes and every tq_layer_t with it. The decode path walks the
+    // layer array per layer per step and lost ~4% of tok/s to the extra cache traffic.
+    CUtensorMap *nvf4_map;
+    // Autotuned launch config, measured once at load (0 = not tuned). The heuristic it
+    // replaces priced only SM occupancy and ignored that split-K adds a full reduce pass
+    // over nvar*M floats, so it over-split every large-M shape (it chose k2 for
+    // mlp_gate/up and q_proj where k1 is measurably faster).
+    int nvf4_ks, nvf4_stages;
     int Kt64;
 } tq_qmma_weight_t;
 
@@ -10628,6 +10640,176 @@ void k_tq_nvf4_gemm(float *__restrict__ out, const uint32_t *__restrict__ a,
     }
 }
 
+// ---------------------------------------------------------------- mbarrier + TMA
+static __device__ __forceinline__ void tq_mbar_init(uint64_t *b, int cnt) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+                 :: "r"((uint32_t)__cvta_generic_to_shared(b)), "r"(cnt) : "memory");
+}
+static __device__ __forceinline__ void tq_mbar_expect(uint64_t *b, uint32_t bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
+                 :: "r"((uint32_t)__cvta_generic_to_shared(b)), "r"(bytes) : "memory");
+}
+// Plain arrive, used by consumers to release a buffer back to the producer.
+static __device__ __forceinline__ void tq_mbar_arrive(uint64_t *b) {
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];"
+                 :: "r"((uint32_t)__cvta_generic_to_shared(b)) : "memory");
+}
+// Every warp waits independently: no CTA-wide barrier, which is the whole point.
+static __device__ __forceinline__ void tq_mbar_wait(uint64_t *b, uint32_t phase) {
+    asm volatile("{ .reg .pred p;\n"
+                 "  TMAW: mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
+                 "  @!p bra TMAW;\n }"
+                 :: "r"((uint32_t)__cvta_generic_to_shared(b)), "r"(phase) : "memory");
+}
+static __device__ __forceinline__ void tq_tma_2d(void *smem, const CUtensorMap *map,
+                                              int c0, int c1, uint64_t *bar) {
+    asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global"
+                 ".mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
+                 :: "r"((uint32_t)__cvta_generic_to_shared(smem)), "l"(map),
+                    "r"(c0), "r"(c1), "r"((uint32_t)__cvta_generic_to_shared(bar))
+                 : "memory");
+}
+
+// ---------------------------------------------------------------- the GEMM (TMA)
+
+// ---------------------------------------------------------------- the GEMM (TMA)
+// Same block tile and warp partition as the cp.async kernel: 128 rows x NG*8 cols,
+// 8 warps as WM(M) x (8/WM)(N). Only the staging mechanism differs.
+template <int NG, int STAGES, int WM>
+__global__ __launch_bounds__(256, 1)
+void k_tq_nvf4_gemm_tma(const __grid_constant__ CUtensorMap mapA,
+                     const __grid_constant__ CUtensorMap mapB,
+                     float *__restrict__ out, const float *__restrict__ wglobal,
+                     int M, int Mt, int Kt64, int nvar, int kt_per, int ksplits,
+                     int b_row0) {
+    constexpr int WN = 8 / WM;
+    constexpr int MA = 8 / WM;
+    constexpr int NA = (NG / WN) < 1 ? 1 : (NG / WN);
+    // TMA requires a 128-BYTE-ALIGNED shared destination, so each k64 half must start on
+    // a 32-u32 boundary. A's half is 8*144 = 1152 words, always aligned. B's is NG*72,
+    // which is only aligned for NG >= 4 -- at NG=1/2 (the decode and short-prompt regime)
+    // the second half landed at 288/576 B and the copy failed. Pad the half stride.
+    constexpr int AHALF = 8 * TQ_NVF4_AW;         // u32 per k64 half of an A stage
+    constexpr int BHALF = ((NG * TQ_NVF4_BW + 31) / 32) * 32;   // padded to 128 B
+    constexpr int AW = 2 * AHALF;
+    constexpr int BW = 2 * BHALF;
+    // expect_tx must be the bytes the TMA actually MOVES, not the padded stride:
+    // the barrier completes on transferred-byte count, so padding must not be counted.
+    constexpr uint32_t TXB = (uint32_t)(2 * AHALF + 2 * NG * TQ_NVF4_BW) * 4u;
+
+    extern __shared__ __align__(128) uint32_t sm[];
+    uint32_t *sA = sm;
+    uint32_t *sB = sm + (size_t)STAGES * AW;
+    // mbarriers live after the tiles; 8-byte aligned.
+    uint64_t *bars = (uint64_t *)(sB + (size_t)STAGES * BW);
+
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int wm = warp / WN, wn = warp % WN;
+    const int mblk = blockIdx.x, split = blockIdx.y;
+    const int kt_begin = split * kt_per;
+    const int nst = kt_per >> 1;
+    const uint16_t zsel = 0;
+    if (ksplits > 1) out += (size_t)split * nvar * M;
+
+    // Two barrier sets. full[s] is completed by the TMA transfer itself (expect_tx), so
+    // one arrival. empty[s] is arrived by each of the 8 consumer warps once it is done
+    // reading buffer s, and the producer waits on it before refilling -- that is what
+    // replaces the CTA-wide __syncthreads(). A warp that finishes early goes straight to
+    // the next stage's full[] wait instead of blocking on the slowest warp, which is the
+    // whole reason TMA is worth having over cp.async.
+    uint64_t *full = bars, *empty = bars + STAGES;
+    if (tid == 0)
+        for (int s = 0; s < STAGES; s++) { tq_mbar_init(&full[s], 1); tq_mbar_init(&empty[s], 8); }
+    __syncthreads();                            // once, for mbarrier init only
+
+    // One elected thread issues a whole stage: 4 bulk copies, no warp does any copying.
+    auto issue = [&](int buf, int stg) {
+        const int kb = kt_begin + stg * 2;
+        tq_mbar_expect(&full[buf], TXB);
+        tq_tma_2d(sA + (size_t)buf * AW,          &mapA, (kb + 0) * TQ_NVF4_AW, mblk * 8, &full[buf]);
+        tq_tma_2d(sA + (size_t)buf * AW + AHALF,  &mapA, (kb + 1) * TQ_NVF4_AW, mblk * 8, &full[buf]);
+        tq_tma_2d(sB + (size_t)buf * BW,          &mapB, (kb + 0) * TQ_NVF4_BW, b_row0,   &full[buf]);
+        tq_tma_2d(sB + (size_t)buf * BW + BHALF,  &mapB, (kb + 1) * TQ_NVF4_BW, b_row0,   &full[buf]);
+    };
+
+    float c[MA][NA][4];
+    #pragma unroll
+    for (int i = 0; i < MA; i++)
+        #pragma unroll
+        for (int j = 0; j < NA; j++) { c[i][j][0] = c[i][j][1] = c[i][j][2] = c[i][j][3] = 0.f; }
+
+    const int a_sf_word = 128 + ((lane >> 2) + 8 * (lane & 1));
+    const int b_sf_word = 64 + (lane >> 2);
+
+    if (tid == 0)
+        for (int s = 0; s < STAGES && s < nst; s++) issue(s, s);
+
+    for (int stg = 0; stg < nst; stg++) {
+        const int buf = stg % STAGES;
+        // Phase flips every time a barrier is reused; try_wait.parity compares against it.
+        const uint32_t phase = (uint32_t)((stg / STAGES) & 1);
+        tq_mbar_wait(&full[buf], phase);
+        const uint32_t *pA = sA + (size_t)buf * AW;
+        const uint32_t *pB = sB + (size_t)buf * BW;
+        #pragma unroll
+        for (int kk = 0; kk < 2; kk++) {
+            const uint32_t *bA = pA + kk * AHALF;      // TMA box is contiguous, so the
+            const uint32_t *bB = pB + kk * BHALF;      // two k-halves are separate regions
+            uint32_t af[MA][4], sfa[MA];
+            #pragma unroll
+            for (int i = 0; i < MA; i++) {
+                const uint32_t *t = bA + (size_t)(wm * MA + i) * TQ_NVF4_AW;
+                const uint4 v = *(const uint4 *)(t + lane * 4);
+                af[i][0] = v.x; af[i][1] = v.y; af[i][2] = v.z; af[i][3] = v.w;
+                sfa[i] = t[a_sf_word];
+            }
+            uint32_t bf[NA][2], sfb[NA];
+            #pragma unroll
+            for (int j = 0; j < NA; j++) {
+                const uint32_t *t = bB + (size_t)(wn * NA + j) * TQ_NVF4_BW;
+                bf[j][0] = t[lane * 2 + 0];
+                bf[j][1] = t[lane * 2 + 1];
+                sfb[j] = t[b_sf_word];
+            }
+            #pragma unroll
+            for (int i = 0; i < MA; i++)
+                #pragma unroll
+                for (int j = 0; j < NA; j++)
+                    TQ_NVF4_MMA(af[i][0], af[i][1], af[i][2], af[i][3], bf[j][0], bf[j][1],
+                             sfa[i], sfb[j],
+                             c[i][j][0], c[i][j][1], c[i][j][2], c[i][j][3]);
+        }
+        // Release this buffer: one arrive per warp, no CTA-wide fence. Warps that got
+        // here first proceed straight to the next stage's full[] wait.
+        if (lane == 0) tq_mbar_arrive(&empty[buf]);
+        if (tid == 0 && stg + STAGES < nst) {
+            tq_mbar_wait(&empty[buf], phase);       // all 8 warps have released buf
+            issue(buf, stg + STAGES);
+        }
+    }
+
+    const float gs = wglobal[mblk];
+    const int qc = lane & 3, gr = lane >> 2;
+    #pragma unroll
+    for (int i = 0; i < MA; i++) {
+        if (mblk * 8 + wm * MA + i >= Mt) continue;
+        const int rowbase = mblk * 128 + (wm * MA + i) * 16 + gr;
+        #pragma unroll
+        for (int j = 0; j < NA; j++) {
+            const int cola = (wn * NA + j) * 8 + 2 * qc;
+            if (cola < nvar) {
+                out[(size_t)cola * M + rowbase]     = c[i][j][0] * gs;
+                out[(size_t)cola * M + rowbase + 8] = c[i][j][2] * gs;
+            }
+            if (cola + 1 < nvar) {
+                out[(size_t)(cola + 1) * M + rowbase]     = c[i][j][1] * gs;
+                out[(size_t)(cola + 1) * M + rowbase + 8] = c[i][j][3] * gs;
+            }
+        }
+    }
+}
+
+
 __global__ void k_tq_nvf4_reduce(float *out, const float *part, int n, int ks) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -12409,6 +12591,30 @@ static int nvf4_convert_weight(tq_qmma_weight_t *w, const char *what) {
     w->d_nvf4_global = d_g;
     w->nvf4 = 1;
     w->Kt64 = Kt64;
+    // TMA descriptor over the packed weight. Box is {TQ_NVF4_AW, 8} = the 8 m16-tiles of
+    // ONE k64 tile: the driver caps every box dimension at 256 elements, and a full
+    // 2-tile stage is 288 u32, so a stage is two box loads rather than one.
+    w->nvf4_map = NULL;
+    {
+        CUtensorMap *mp = (CUtensorMap *)aligned_alloc(128, sizeof(CUtensorMap));
+        uint64_t gdim[2] = { (uint64_t)Kt64 * TQ_NVF4_AW, (uint64_t)Mt };
+        uint64_t gstr[1] = { (uint64_t)Kt64 * TQ_NVF4_AW * 4u };   // row pitch in BYTES
+        uint32_t bdim[2] = { TQ_NVF4_AW, 8 };
+        uint32_t estr[2] = { 1, 1 };
+        CUresult cr = mp ? cuTensorMapEncodeTiled(mp, CU_TENSOR_MAP_DATA_TYPE_UINT32,
+                                            2, d_a, gdim, gstr, bdim, estr,
+                                            CU_TENSOR_MAP_INTERLEAVE_NONE,
+                                            CU_TENSOR_MAP_SWIZZLE_NONE,
+                                            CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+                                            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE)
+                         : CUDA_ERROR_OUT_OF_MEMORY;
+        if (cr == CUDA_SUCCESS) w->nvf4_map = mp;
+        else {
+            free(mp);
+            fprintf(stderr, "TQ_W_NVFP4: %s tensormap failed (%d), TMA path disabled\n",
+                    what, (int)cr);
+        }
+    }
     g_qwen.device_bytes -= freed;
     g_qwen.device_bytes += abytes + (size_t)nrb * sizeof(float);
     return 1;
@@ -12462,6 +12668,7 @@ static void maybe_nvf4_convert_all(void) {
 
 static uint32_t *g_nvf4_b = NULL;      // quantized activation tiles
 static size_t g_nvf4_b_words = 0;
+static int g_nvf4_b_groups = 0;   // groups the buffer spans (for the TMA descriptor)
 static float *g_nvf4_part = NULL;      // split-K partials
 static size_t g_nvf4_part_floats = 0;
 
@@ -12497,6 +12704,55 @@ static int tq_nvf4_ksplits(int Mt, int Kt64, int stages) {
 // (a silent out-of-bounds shared read -- the numeric gate caught exactly this at N=8).
 // NG=1 -> WM=8, NG=2 -> WM=4, NG>=4 -> WM=2 (the squarest tile that fits, fewest
 // shared loads per MMA).
+// Activation TMA descriptor. Rebuilt only when the quantized buffer moves or its group
+// count changes; it describes the WHOLE buffer because a column tile is reached by a box
+// coordinate, not by re-basing the descriptor (which a descriptor cannot do).
+static CUtensorMap g_nvf4_bmap;
+static const uint32_t *g_nvf4_bmap_base = NULL;
+static int g_nvf4_bmap_g = 0, g_nvf4_bmap_kt = 0, g_nvf4_bmap_ng = 0, g_nvf4_bmap_ok = 0;
+
+// The box's ROW count must be exactly the kernel's NG: the kernel sizes its B stage at
+// NG*TQ_NVF4_BW words, and a box with more rows than that overruns shared memory. NG
+// varies per launch (it tracks the column count), so the descriptor is keyed on it.
+static int tq_nvf4_bmap_ensure(const uint32_t *base, int groups, int Kt64, int NG) {
+    if (g_nvf4_bmap_ok && g_nvf4_bmap_base == base && g_nvf4_bmap_g == groups
+        && g_nvf4_bmap_kt == Kt64 && g_nvf4_bmap_ng == NG) return 1;
+    if (NG > groups) return 0;                 // descriptor cannot cover the box
+    uint64_t gdim[2] = { (uint64_t)Kt64 * TQ_NVF4_BW, (uint64_t)groups };
+    uint64_t gstr[1] = { (uint64_t)Kt64 * TQ_NVF4_BW * 4u };
+    uint32_t bdim[2] = { TQ_NVF4_BW, (uint32_t)NG };
+    uint32_t estr[2] = { 1, 1 };
+    CUresult cr = cuTensorMapEncodeTiled(&g_nvf4_bmap, CU_TENSOR_MAP_DATA_TYPE_UINT32, 2,
+                                        (void *)base, gdim, gstr, bdim, estr,
+                                        CU_TENSOR_MAP_INTERLEAVE_NONE,
+                                        CU_TENSOR_MAP_SWIZZLE_NONE,
+                                        CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+                                        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    g_nvf4_bmap_ok = (cr == CUDA_SUCCESS);
+    if (g_nvf4_bmap_ok) {
+        g_nvf4_bmap_base = base; g_nvf4_bmap_g = groups;
+        g_nvf4_bmap_kt = Kt64; g_nvf4_bmap_ng = NG;
+    }
+    return g_nvf4_bmap_ok;
+}
+// TQ_NVFP4_TMA=0 reverts to cp.async. TMA wins because the copy costs no warp AND the
+// per-stage CTA barrier becomes per-warp mbarrier waits.
+static int tq_nvf4_use_tma(void) {
+    static int c = -1;
+    if (c < 0) { const char *e = getenv("TQ_NVFP4_TMA"); c = (e && !atoi(e)) ? 0 : 1; }
+    return c;
+}
+
+#define TQ_NVF4_TARGS *w->nvf4_map, g_nvf4_bmap, dst, w->d_nvf4_global, M, Mt, Kt64, \
+                      nvar, per, ks, brow
+#define TQ_NVF4_DISPATCH_T(S) switch (G) {                                                     \
+    case 1:  k_tq_nvf4_gemm_tma<1, S,8><<<gr,256,tbytes,st>>>(TQ_NVF4_TARGS); break;           \
+    case 2:  k_tq_nvf4_gemm_tma<2, S,4><<<gr,256,tbytes,st>>>(TQ_NVF4_TARGS); break;           \
+    case 4:  k_tq_nvf4_gemm_tma<4, S,2><<<gr,256,tbytes,st>>>(TQ_NVF4_TARGS); break;           \
+    case 8:  k_tq_nvf4_gemm_tma<8, S,2><<<gr,256,tbytes,st>>>(TQ_NVF4_TARGS); break;           \
+    case 16: k_tq_nvf4_gemm_tma<16,S,2><<<gr,256,tbytes,st>>>(TQ_NVF4_TARGS); break;           \
+    default: k_tq_nvf4_gemm_tma<32,S,2><<<gr,256,tbytes,st>>>(TQ_NVF4_TARGS); break; }
+
 #define TQ_NVF4_ARGS dst, w->d_nvf4_a, b, w->d_nvf4_global, M, Mt, Kt64, nvar, per, ks
 #define TQ_NVF4_DISPATCH_G(S) switch (G) {                                                    \
     case 1:  k_tq_nvf4_gemm<1, S,8><<<gr,256,bytes,st>>>(TQ_NVF4_ARGS); break;                \
@@ -12507,12 +12763,16 @@ static int tq_nvf4_ksplits(int Mt, int Kt64, int stages) {
     default: k_tq_nvf4_gemm<32,S,2><<<gr,256,bytes,st>>>(TQ_NVF4_ARGS); break; }
 
 // out is [nvar][M] column-major, same convention as the FP6 wide GEMM output.
-static int launch_nvf4_gemm(float *out, const tq_qmma_weight_t *w, const uint32_t *b,
-                            int nvar, int ks, cudaStream_t st) {
+static int launch_nvf4_gemm_cfg(float *out, const tq_qmma_weight_t *w, const uint32_t *b,
+                                int nvar, int ks, int stages, cudaStream_t st) {
     const int M = w->M, Mt = w->Mt, Kt64 = w->Kt64;
-    const int stages = tq_nvf4_stages();
+    if (stages < 2) stages = 2;
+    if (stages > 4) stages = 4;
     const int G = tq_nvf4_wide_ng(nvar < TQ_NVF4_TILE ? nvar : TQ_NVF4_TILE);
-    const size_t bytes = (size_t)stages * (8 * 2 * TQ_NVF4_AW + G * 2 * TQ_NVF4_BW) * 4;
+    // B's k64 half is padded up to 128 B for TMA (see the kernel), so the shared
+    // budget must use the PADDED stride or the launch under-allocates at NG<4.
+    const int bhalf = ((G * TQ_NVF4_BW + 31) / 32) * 32;
+    const size_t bytes = (size_t)stages * (8 * 2 * TQ_NVF4_AW + 2 * bhalf) * 4;
     const int per = (ks == 1) ? Kt64 : Kt64 / ks;
     float *dst = out;
     if (ks > 1) {
@@ -12529,15 +12789,22 @@ static int launch_nvf4_gemm(float *out, const tq_qmma_weight_t *w, const uint32_
         dst = g_nvf4_part;
     }
     // Opt-in dynamic smem, once per stage count, for exactly the (NG,WM) pairs the
-    // dispatch can launch. The NG=32 budget dominates, so one size covers all.
+    // dispatch can launch. The NG=32 budget dominates, so one size covers all. The TMA
+    // kernel needs 2*STAGES extra mbarriers (8 B each) on top of the tiles.
+    const size_t tbytes = bytes + (size_t)stages * 2 * 8;
     static int primed[6] = {0, 0, 0, 0, 0, 0};
     if (!primed[stages]) {
         size_t mx = (size_t)stages * (8 * 2 * TQ_NVF4_AW + 32 * 2 * TQ_NVF4_BW) * 4;
+        size_t mt = mx + (size_t)stages * 2 * 8;
         #define TQ_NVF4_PRIME(NGV, WMV) do {                                              \
             cudaFuncSetAttribute(k_tq_nvf4_gemm<NGV, 2, WMV>,                             \
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)mx);   \
             cudaFuncSetAttribute(k_tq_nvf4_gemm<NGV, 3, WMV>,                             \
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)mx);   \
+            cudaFuncSetAttribute(k_tq_nvf4_gemm_tma<NGV, 2, WMV>,                         \
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)mt);   \
+            cudaFuncSetAttribute(k_tq_nvf4_gemm_tma<NGV, 3, WMV>,                         \
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)mt);   \
         } while (0)
         TQ_NVF4_PRIME(1, 8); TQ_NVF4_PRIME(2, 4); TQ_NVF4_PRIME(4, 2);
         TQ_NVF4_PRIME(8, 2); TQ_NVF4_PRIME(16, 2); TQ_NVF4_PRIME(32, 2);
@@ -12546,13 +12813,41 @@ static int launch_nvf4_gemm(float *out, const tq_qmma_weight_t *w, const uint32_
         primed[stages] = 1;
     }
     dim3 gr((Mt + 7) / 8, ks);
-    if (stages == 2)      { TQ_NVF4_DISPATCH_G(2) }
-    else                  { TQ_NVF4_DISPATCH_G(3) }
+    // TMA when the descriptors exist. `b` is a group-offset view of g_nvf4_b, and a
+    // descriptor base cannot be re-based per launch, so the offset becomes a box
+    // coordinate: brow is the first 8-column group this tile covers.
+    const int brow = (g_nvf4_b && b >= g_nvf4_b)
+                   ? (int)((size_t)(b - g_nvf4_b) / ((size_t)Kt64 * TQ_NVF4_BW)) : 0;
+    const int tma = tq_nvf4_use_tma() && w->nvf4_map
+                 && tq_nvf4_bmap_ensure(g_nvf4_b, g_nvf4_b_groups, Kt64, G);
+    if (tma) {
+        if (stages == 2)  { TQ_NVF4_DISPATCH_T(2) }
+        else              { TQ_NVF4_DISPATCH_T(3) }
+    } else {
+        if (stages == 2) { TQ_NVF4_DISPATCH_G(2) }
+        else             { TQ_NVF4_DISPATCH_G(3) }
+    }
     if (ks > 1) {
         size_t n = (size_t)nvar * M;
         k_tq_nvf4_reduce<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(out, g_nvf4_part, (int)n, ks);
     }
     return 0;
+}
+
+// Config comes from the per-weight autotune once it has run, else the fallback.
+static int launch_nvf4_gemm(float *out, const tq_qmma_weight_t *w, const uint32_t *b,
+                            int nvar, int ks, cudaStream_t st) {
+    const int stages = w->nvf4_stages ? w->nvf4_stages : tq_nvf4_stages();
+    return launch_nvf4_gemm_cfg(out, w, b, nvar, ks, stages, st);
+}
+
+// Deterministic synthetic activations for the gate (no host transfer, reproducible).
+__global__ void k_tq_nvf4_fill_x(float *x, long n, unsigned salt) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    unsigned h = (unsigned)i * 2654435761u + salt * 40503u + 1013904223u;
+    h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
+    x[i] = ((float)(h & 0xffffu) / 32768.0f) - 1.0f;
 }
 
 // The activation quantization is memoized: several projections consume the SAME
@@ -12595,6 +12890,7 @@ static int nvf4_quant_ensure(const float *d_x, int K, int N, cudaStream_t st) {
                         (Gtot - (size_t)ng8) * Kt64 * TQ_NVF4_BW * sizeof(uint32_t), st);
     k_tq_nvf4_quant_x<<<(unsigned)((size_t)ng8 * Kt64), 32, 0, st>>>(
         g_nvf4_b, d_x, N, K, ng8, Kt64);
+    g_nvf4_b_groups = (int)Gtot;
     g_nvf4_qsrc = d_x; g_nvf4_qK = K; g_nvf4_qN = N; g_nvf4_qvalid = 1;
     return 0;
 }
@@ -12604,7 +12900,9 @@ static int nvf4_gemm_tiled(const tq_qmma_weight_t *w, float *out, int nvar,
                            cudaStream_t st) {
     if (!w->nvf4 || !w->d_nvf4_a) return -90;
     const int Kt64 = w->Kt64;
-    const int ks = tq_nvf4_ksplits(w->Mt, Kt64, tq_nvf4_stages());
+    // Tuned config when available; the heuristic is only the pre-tune fallback.
+    const int ks = w->nvf4_ks ? w->nvf4_ks
+                              : tq_nvf4_ksplits(w->Mt, Kt64, tq_nvf4_stages());
     for (int off = 0; off < nvar; off += TQ_NVF4_TILE) {
         const int nt = (nvar - off < TQ_NVF4_TILE) ? (nvar - off) : TQ_NVF4_TILE;
         int rc = launch_nvf4_gemm(out + (size_t)off * w->M, w,
@@ -12615,6 +12913,93 @@ static int nvf4_gemm_tiled(const tq_qmma_weight_t *w, float *out, int nvar,
     return 0;
 }
 
+// Autotune (ks, stages) per weight by MEASUREMENT, once at load. Configs are cached by
+// (M,K) because the model has only ~7 distinct projection shapes, so this is a handful of
+// timed launches, not one per weight. Replaces a heuristic that mispriced split-K: it
+// counted SM occupancy but not the reduce pass over nvar*M floats that split-K adds.
+static int nvf4_autotune(tq_qmma_weight_t *w, int nvar, cudaStream_t st) {
+    // Own synthetic activation: the tuner runs at load, before any real one exists, and
+    // K differs per shape so the quantized buffer must be built for this weight's K.
+    float *d_x = NULL;
+    if (cudaMalloc(&d_x, (size_t)nvar * w->K * sizeof(float)) != cudaSuccess) return -1;
+    k_tq_nvf4_fill_x<<<(unsigned)(((size_t)nvar * w->K + 255) / 256), 256, 0, st>>>(
+        d_x, (long)nvar * w->K, 4242u);
+    nvf4_quant_invalidate();
+    if (nvf4_quant_ensure(d_x, w->K, nvar, st) != 0) { cudaFree(d_x); return -1; }
+    struct Ent { int M, K, ks, stages; };
+    static Ent cache[16];
+    static int ncache = 0;
+    for (int i = 0; i < ncache; i++)
+        if (cache[i].M == w->M && cache[i].K == w->K) {
+            w->nvf4_ks = cache[i].ks; w->nvf4_stages = cache[i].stages; return 0;
+        }
+    float *d_out = NULL;
+    if (cudaMalloc(&d_out, (size_t)nvar * w->M * sizeof(float)) != cudaSuccess) return -1;
+    const int Kt64 = w->Kt64;
+    int best_ks = 1, best_st = 3; double best = 1e30;
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    // Shared-memory precheck FIRST. A config that exceeds the opt-in limit fails to
+    // launch and therefore returns instantly -- which a timing loop happily reports as
+    // the fastest config. That is how the tuner first picked stages=4 at NG=32 (110 KB
+    // against a 101 KB limit) and produced garbage. Screen it, then also verify the warm
+    // launch actually ran.
+    const int Gt = tq_nvf4_wide_ng(nvar < TQ_NVF4_TILE ? nvar : TQ_NVF4_TILE);
+    const int bh = ((Gt * TQ_NVF4_BW + 31) / 32) * 32;
+    size_t smem_cap = 101376;
+    { int v = 0; if (cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0)
+                     == cudaSuccess && v > 0) smem_cap = (size_t)v; }
+    for (int stages = 2; stages <= 4; stages++) {
+        const size_t need = (size_t)stages * (8 * 2 * TQ_NVF4_AW + 2 * bh) * 4
+                          + (size_t)stages * 2 * 8;
+        if (need > smem_cap) continue;
+        for (int ks = 1; ks <= 8; ks <<= 1) {
+            if (Kt64 % (2 * ks) != 0) continue;
+            if (Kt64 / ks < 2 * stages) continue;
+            // one warm launch, then time a few -- but only trust it if it really ran
+            int rc = launch_nvf4_gemm_cfg(d_out, w, g_nvf4_b, nvar, ks, stages, st);
+            if (rc != 0 || cudaGetLastError() != cudaSuccess
+                || cudaStreamSynchronize(st) != cudaSuccess) { cudaGetLastError(); continue; }
+            cudaEventRecord(e0, st);
+            for (int r = 0; r < 5; r++)
+                launch_nvf4_gemm_cfg(d_out, w, g_nvf4_b, nvar, ks, stages, st);
+            cudaEventRecord(e1, st);
+            if (cudaEventSynchronize(e1) != cudaSuccess) { cudaGetLastError(); continue; }
+            if (cudaGetLastError() != cudaSuccess) { cudaGetLastError(); continue; }
+            float ms = 0.f; cudaEventElapsedTime(&ms, e0, e1);
+            if (ms > 0.f && ms < best) { best = ms; best_ks = ks; best_st = stages; }
+        }
+    }
+    cudaEventDestroy(e0); cudaEventDestroy(e1);
+    cudaFree(d_out); cudaFree(d_x);
+    nvf4_quant_invalidate();
+    w->nvf4_ks = best_ks; w->nvf4_stages = best_st;
+    if (ncache < 16) { cache[ncache++] = { w->M, w->K, best_ks, best_st }; }
+    return 0;
+}
+
+// Tune every converted weight once. Cached per (M,K), so this is a few dozen timed
+// launches for the whole model, not one per weight.
+static void nvf4_autotune_all(void) {
+    if (!g_nvf4_any) return;
+    for (int i = 0; i < g_qwen.L; i++) {
+        tq_layer_t *l = &g_qwen.layers[i];
+        tq_qmma_weight_t *ws[12] = { &l->mlp_gate, &l->mlp_up, &l->mlp_down,
+                                     &l->q_proj, &l->k_proj, &l->v_proj, &l->o_proj,
+                                     &l->linear_in_qkv, &l->linear_in_z,
+                                     &l->linear_in_b, &l->linear_in_a, &l->linear_out };
+        for (int j = 0; j < 12; j++)
+            if (ws[j]->nvf4 && ws[j]->d_nvf4_a && !ws[j]->nvf4_ks)
+                nvf4_autotune(ws[j], TQ_NVF4_TILE, g_qwen.stream);
+    }
+    tq_layer_t *l0 = &g_qwen.layers[0];
+    fprintf(stderr, "TQ_W_NVFP4: autotuned launch config @%d cols:", TQ_NVF4_TILE);
+    if (l0->mlp_gate.nvf4) fprintf(stderr, " gate=k%ds%d", l0->mlp_gate.nvf4_ks, l0->mlp_gate.nvf4_stages);
+    if (l0->mlp_down.nvf4) fprintf(stderr, " down=k%ds%d", l0->mlp_down.nvf4_ks, l0->mlp_down.nvf4_stages);
+    if (l0->linear_in_qkv.nvf4) fprintf(stderr, " lqkv=k%ds%d", l0->linear_in_qkv.nvf4_ks, l0->linear_in_qkv.nvf4_stages);
+    fprintf(stderr, "\n");
+}
+
 static int nvf4_proj(const tq_qmma_weight_t *w, const float *d_x, float *out, int nvar,
                      cudaStream_t st) {
     if (!w->nvf4 || !w->d_nvf4_a) return -90;
@@ -12623,14 +13008,6 @@ static int nvf4_proj(const tq_qmma_weight_t *w, const float *d_x, float *out, in
     return nvf4_gemm_tiled(w, out, nvar, st);
 }
 
-// Deterministic synthetic activations for the gate (no host transfer, reproducible).
-__global__ void k_tq_nvf4_fill_x(float *x, long n, unsigned salt) {
-    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    unsigned h = (unsigned)i * 2654435761u + salt * 40503u + 1013904223u;
-    h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
-    x[i] = ((float)(h & 0xffffu) / 32768.0f) - 1.0f;
-}
 
 // Reference: decode the PACKED NVFP4 bytes back and contract in DOUBLE. Validates the
 // fragment layout, the scale-group mapping and the MMA all at once -- this is the check
@@ -12808,6 +13185,7 @@ extern "C" int qwn_init(const char *path) {
     maybe_byte_convert_all();
     maybe_e2m1_convert_all();
     maybe_nvf4_convert_all();   // after e2m1/byte: those tiers opt out of NVFP4
+    nvf4_autotune_all();        // measure (ks,stages) instead of guessing
     maybe_ldsm_convert_all();
     {
         // Default ON since 2026-07-08: bit-exact by construction (deadlock-free
