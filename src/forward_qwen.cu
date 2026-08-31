@@ -3378,6 +3378,7 @@ void k_tq_wide_attn_mma4(
     constexpr int OFF_ALPH = 13440;
     constexpr int OFF_QTMP = 13504;
     constexpr int OFF_REDC = 13760;
+    constexpr int OFF_SV   = 13792;                   // 128 keys x 256 V8 bytes (8192 words)
     constexpr int ZERCAP   = 12288;
     extern __shared__ uint32_t sm_wa4[];
     uint32_t *sm = sm_wa4;
@@ -3461,6 +3462,21 @@ void k_tq_wide_attn_mma4(
             pr0 = (size_t)phys * page + (size_t)(t0 & (page - 1));
         }
 #define TQ_PROW4(lp) (MODE == 4 ? (pr0 + (size_t)(min((lp), maxpos) - t0)) : (size_t)min((lp), maxpos))
+        // Stage this super-tile's V8 bytes via cp.async NOW: the whole K-dequant +
+        // QK-mma phase runs while the copy lands, and the V phase then reads smem
+        // instead of scattered per-byte global gathers (which over-fetched ~2x in
+        // 32 B sectors). Same bytes, clamped rows stage the same duplicate row:
+        // bit-identical output.
+        {
+            uint8_t *sv = (uint8_t *)(sm + OFF_SV);
+            const uint32_t svb = (uint32_t)__cvta_generic_to_shared(sv);
+            for (int idx = tid; idx < 128 * (256 / 16); idx += 256) {
+                const int key = idx >> 4, seg = idx & 15;
+                tq_cp_async16(svb + (uint32_t)(key * 256 + seg * 16),
+                              vcb8 + TQ_PROW4(t0 + key) * cstride + seg * 16);
+            }
+            asm volatile("cp.async.commit_group;\n");
+        }
         float sA[QQ][4], sB[QQ][4];
         #pragma unroll
         for (int q = 0; q < QQ; q++)
@@ -3585,6 +3601,9 @@ void k_tq_wide_attn_mma4(
                 oacc[q][f][2] *= a_hi; oacc[q][f][3] *= a_hi;
             }
         }
+        asm volatile("cp.async.wait_group 0;\n");
+        __syncthreads();
+        const uint8_t *sv = (const uint8_t *)(sm + OFF_SV);
         for (int tt = 0; tt < 8; tt++) {
             uint32_t aq[QQ][4];
             #pragma unroll
@@ -3595,12 +3614,12 @@ void k_tq_wide_attn_mma4(
             #pragma unroll
             for (int f = 0; f < 4; f++) {
                 int col = warp * 32 + f * 8 + gr;
-                int r0 = t0 + tt * 16 + 2 * t4;
+                int lr = tt * 16 + 2 * t4;
                 uint32_t b0, b1;
-                b0 = tq_pack_bf16(tq_e4m3_dec_fast(vcb8[TQ_PROW4(r0) * cstride + col]),
-                                  tq_e4m3_dec_fast(vcb8[TQ_PROW4(r0 + 1) * cstride + col]));
-                b1 = tq_pack_bf16(tq_e4m3_dec_fast(vcb8[TQ_PROW4(r0 + 8) * cstride + col]),
-                                  tq_e4m3_dec_fast(vcb8[TQ_PROW4(r0 + 9) * cstride + col]));
+                b0 = tq_pack_bf16(tq_e4m3_dec_fast(sv[(lr) * 256 + col]),
+                                  tq_e4m3_dec_fast(sv[(lr + 1) * 256 + col]));
+                b1 = tq_pack_bf16(tq_e4m3_dec_fast(sv[(lr + 8) * 256 + col]),
+                                  tq_e4m3_dec_fast(sv[(lr + 9) * 256 + col]));
                 #pragma unroll
                 for (int q = 0; q < QQ; q++) tq_mma_bf16_m16n8k16(oacc[q][f], aq[q], b0, b1);
             }
@@ -22966,7 +22985,7 @@ static int launch_batched_attn_q4(float *out, const float *q_proj, const uint16_
             S = 1;
         if (qr == 64) {
             static int primed3 = 0;
-            const size_t wa4b = 13792u * 4u;
+            const size_t wa4b = (13792u + 8192u) * 4u;
             if (!primed3) {
                 cudaFuncSetAttribute(k_tq_wide_attn_mma4<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)wa4b);
                 cudaFuncSetAttribute(k_tq_wide_attn_mma4<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)wa4b);
@@ -24144,7 +24163,7 @@ static int launch_paged_attn_q4_mma_prefill(
             S = 1;
         if (qr == 64) {
             static int primed4 = 0;
-            const size_t wa4b = 13792u * 4u;
+            const size_t wa4b = (13792u + 8192u) * 4u;
             if (!primed4) {
                 cudaFuncSetAttribute(k_tq_wide_attn_mma4<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)wa4b);
                 cudaGetLastError();
