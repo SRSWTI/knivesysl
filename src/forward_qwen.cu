@@ -4142,7 +4142,7 @@ static int wide_attn_split_S(int max_pos) {
     static int chunk = -1;
     if (chunk < 0) {
         const char *e = getenv("TQ_WIDE_ATTN_SPLIT");
-        chunk = e ? atoi(e) : 16384;
+        chunk = e ? atoi(e) : 8192;                    // 8192 measured best on the GQA kernel (64k: +3%)
         if (chunk == 0) chunk = 1 << 30;               // 0 = never split
         if (chunk < 2048) chunk = 2048;
     }

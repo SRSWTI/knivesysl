@@ -11,6 +11,59 @@ driven by the same client (`tools/bench_endpoint.py`).
 
 ## Unreleased
 
+### GQA-shared prefill attention: the 16k-96k campaign
+
+**`k_tq_wide_attn_mma6`** -- one CTA per KV HEAD instead of per query head: the
+six query heads of a GQA group are packed into the MMA's M dimension as six
+16-row tiles (QROWS=96), so ONE K dequant and ONE V read feed all of them.
+K4 rows stage through smem via cp.async at a 144 B conflict-free stride, with
+the NEXT super-tile's copy issued right after the wmax barrier (it lands under
+the score+V phases); Q prep runs 8 rows per pass with shared barriers. Default
+ON (`TQ_WIDE_ATTN_GQA=0` reverts); wired on both the engine wide path and the
+paged server path. Split default moves 16384 -> 8192 (measured on this kernel).
+
+Bit-exact by construction and by gate: same fragment layout, same key walk,
+same reduction order per row -- 65/65 argmax vs the per-head qr64 kernel on
+the same build, TF identical on FP6, paged parity 11/11, needle 2/3 at a 128k
+haystack (identical to baseline, including the documented 120k think-preamble
+miss).
+
+**Probe-driven development.** `TQ_WIDE_ATTN_PROBE` template scaffolds (default
+off, WRONG numerics, timing only) decompose the 64k attention cost:
+K loads 1.57 s | MMA issue 1.35 s | Q prep 0.58 s | expf 0.17 s | K-dequant
+ALU 0.14 s | V decode 0.12 s. Two hypotheses died honestly: dequant ALU is 1%
+(not the tax), and a first V-staging attempt lost at 64k because the pair-round
+refactor tripled the e4m3 decode count. MMA issue is the sm120 floor
+(m16n8k16 is the widest bf16 shape; no wgmma on consumer Blackwell).
+
+**Engine (NVFP4-all, same chunk both sides):** 2k 8624->8737 | 4k 8316->8559 |
+8k 7681->8122 | 16k 6828->7334 | 32k 5966->6381 | 64k 4806->5189 |
+96k 3975->4306 | 128k 3383->3659. Gains grow with depth (+1.3% -> +8.3%).
+
+**Server, cold, same client, both servers fresh, vLLM prefix cache OFF**
+(their cache-ON runs emitted 84.8k/125.5k "tok/s" cells -- prefix hits,
+discarded):
+
+| P | vllm | knivesysl | ratio |
+|---|--:|--:|--:|
+| 16384 | 9173 | 6881 | 1.33x |
+| 32768 | 7978 | 5971 | 1.34x |
+| 65536 | 6090 | 4843 | 1.26x |
+| 98304 | 4908 | 4054 | 1.21x |
+| 114688 | 4487 | -- | their max-len |
+| 131072 | HTTP 400 | 3424 | ours alone |
+
+The band moves from 1.28-1.60x behind to **1.21-1.34x**, still narrowing with
+depth. Remaining deficit by probe arithmetic: the MMA-issue floor plus GEMM
+(down-projection) and DeltaNet shares -- i.e. the megakernel/TMA-GEMM lever,
+not further attention scheduling.
+
+**Harness lesson, paid twice now:** `nvfp4_quality` defaulted its prompt to
+the LIVE SOURCE FILE; the first in-window edit of the session (a helper at
+line 656) shifted every gate from token ~9.8k and burned four kernel bisects
+on phantom flips (the flips started at sample 39/65 = the file offset of the
+edit). The tool now defaults to the pinned `tf_corpus_e3cdb42.txt`.
+
 ### 128k: memory truth, V staging, and the capability line
 
 **The "6.5 GB NVFP4 accounting bug" decomposed into a leak and a mirage.** The

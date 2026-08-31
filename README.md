@@ -145,9 +145,14 @@ decode:
 | prefill 4096, unique, fully warm | 16080 | 7544 | 2.13x theirs |
 | prefill 4096, shared prefix, warm | 40282 | **174093** | **4.32x ours** |
 | prefill 16384 (conc 2) | 10104 | 6157 | 1.64x theirs |
-| prefill 65536 | 7162 | 4480 | 1.60x theirs |
-| prefill 98304 | 4834 | 3790 | 1.28x theirs |
-| prefill 131072 | **cannot (max-len 116032)** | **3259** | ours alone |
+| prefill 16384 | 9173 | 6881 | 1.33x theirs |
+| prefill 32768 | 7978 | 5971 | 1.34x theirs |
+| prefill 65536 | 6090 | 4843 | 1.26x theirs |
+| prefill 98304 | 4908 | 4054 | 1.21x theirs |
+| prefill 131072 | **cannot (max-len 116032)** | **3424** | ours alone |
+
+(cold, same client, both servers fresh, vllm prefix cache off; the gqa-shared
+attention kernel narrowed the long-context band from 1.28-1.60x to 1.21-1.34x)
 | ttft p50, 8 clients x 2048 | 1.425 s | **1.230 s** | ours |
 | decode n=1, paged | 69.2 | 61.1 | 1.13x theirs |
 | decode n=1, fp6 mtp spec decode | 69.2 | **141.4** | **2.04x ours** |
@@ -320,7 +325,10 @@ turns.
 | `TQ_NVFP4_STAGES` | nvfp4 gemm pipeline depth fallback (autotuned per shape at load) |
 | `TQ_NVFP4_TMA=0` | revert the nvfp4 gemm from `cp.async.bulk.tensor` to `cp.async` |
 | `TQ_WIDE_ATTN_MMA=0` | revert prefill attention to the scalar/split-k decode kernel |
-| `TQ_WIDE_ATTN_QROWS` | force 16/32/64-row attention tiles (default: auto by prefix depth) |
+| `TQ_WIDE_ATTN_QROWS` | force 16/32/64-row per-head attention tiles (only when gqa is off) |
+| `TQ_WIDE_ATTN_GQA=0` | revert to per-query-head attention ctas (default on: one cta per kv head, 96 packed rows) |
+| `TQ_WIDE_ATTN_SPLIT` | key-split chunk for the prefill attention (default 8192, S capped at 8) |
+| `TQ_WIDE_ATTN_PROBE` | timing scaffolds for the gqa kernel (WRONG numerics; cost attribution only) |
 | `TQ_DN_MM` | deltanet chunk-64 matmul scan: 3 = tf32 wmma (default, gates at the eps band), 1 = fp32 scan (conservative), 0 = ck8 head-split scan |
 | `--fuse-idle-ms` | ride a decode row on a prompt wave only after this idle time (default 125; riding costs 1.2 ms/row/wave) |
 | `--prefill-budget` | prompt columns per wave, on top of the decode rows |
@@ -362,9 +370,12 @@ see `CHANGELOG.md` for the measurement log behind every number here.
 
 ## where this is going
 
-**now: the 16k-96k prefill attention gap** - gqa-shared cta rewrite of the wide
-attention kernel (attention is 54% of a 64k prefill and re-reads kv 6x; one cta
-per kv head with the 6 query heads packed into the mma's m dimension).
+**done: the gqa-shared attention rewrite** (`k_tq_wide_attn_mma6`, default on) -
+one cta per kv head, six query heads packed into the mma's m dimension, cp.async
+K staging, 8-row batched q prep. engine +1.3% at 2k growing to +8.3% at 96k;
+the server band vs vllm narrowed to 1.21-1.34x. `TQ_WIDE_ATTN_PROBE` scaffolds
+attribute the remaining cost: the mma-issue floor + gemm + deltanet - i.e. the
+megakernel/tma lever below, not more attention scheduling.
 
 **next steps, in order:**
 
