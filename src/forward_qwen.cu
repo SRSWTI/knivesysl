@@ -24878,7 +24878,7 @@ static int     *g_slot_ids = NULL, *g_iota = NULL;
 static int     *g_pf_colslot = NULL; static int g_pf_colslot_cap = 0;  // prefill wave column->slot
 static float   *g_pg_logits = NULL;
 static int     *g_pg_argmax = NULL;
-static int     *h_free = NULL, *h_slot_nb = NULL;
+static int     *h_free = NULL, *h_slot_nb = NULL, *h_blk_ref = NULL;
 static int      g_pg_nfree = 0;
 static int      g_pg_page = 0, g_pg_plog = 0, g_pg_nblocks = 0, g_pg_maxslots = 0, g_pg_maxblk = 0;
 static int      g_pg_ready = 0;
@@ -24903,11 +24903,25 @@ static void paged_free_all(void) {
     if (h_block_table) { free(h_block_table); h_block_table = NULL; }
     if (h_free) { free(h_free); h_free = NULL; }
     if (h_slot_nb) { free(h_slot_nb); h_slot_nb = NULL; }
+    if (h_blk_ref) { free(h_blk_ref); h_blk_ref = NULL; }
+    void paged_ckpt_drop_all(void);
+    paged_ckpt_drop_all();
     g_pg_nfree = 0; g_pg_page = 0; g_pg_plog = 0; g_pg_nblocks = 0;
     g_pg_maxslots = 0; g_pg_maxblk = 0; g_pg_ready = 0;
 }
 
-static int paged_alloc_block(void) { return g_pg_nfree > 0 ? h_free[--g_pg_nfree] : -1; }
+static int paged_alloc_block(void) {
+    if (g_pg_nfree <= 0) return -1;
+    int b = h_free[--g_pg_nfree];
+    h_blk_ref[b] = 1;
+    return b;
+}
+// Content-addressed sharing: full blocks are refcounted; a block returns to the
+// free list only when its LAST holder (slot or checkpoint) lets go.
+static void paged_block_unref(int b) {
+    if (b < 0 || b >= g_pg_nblocks) return;
+    if (--h_blk_ref[b] <= 0) { h_blk_ref[b] = 0; h_free[g_pg_nfree++] = b; }
+}
 
 static int paged_ensure_blocks(int slot, int pos) {
     int need = (pos >> g_pg_plog) + 1;
@@ -24964,7 +24978,9 @@ extern "C" int qwn_paged_init(int max_slots, int num_blocks, int page) {
     h_block_table = (int *)malloc(btn * sizeof(int));
     h_free = (int *)malloc((size_t)num_blocks * sizeof(int));
     h_slot_nb = (int *)malloc((size_t)max_slots * sizeof(int));
-    if (!h_block_table || !h_free || !h_slot_nb) { paged_free_all(); return -7; }
+    h_blk_ref = (int *)malloc((size_t)num_blocks * sizeof(int));
+    if (!h_block_table || !h_free || !h_slot_nb || !h_blk_ref) { paged_free_all(); return -7; }
+    for (int i = 0; i < num_blocks; i++) h_blk_ref[i] = 0;
     for (size_t i = 0; i < btn; i++) h_block_table[i] = -1;
     for (int i = 0; i < num_blocks; i++) h_free[i] = num_blocks - 1 - i;   // pop low ids first
     g_pg_nfree = num_blocks;
@@ -24987,7 +25003,7 @@ extern "C" int qwn_paged_reset_slot(int slot) {
     if (!g_pg_ready || slot < 0 || slot >= g_pg_maxslots) return -1;
     int *row = h_block_table + (size_t)slot * g_pg_maxblk;
     for (int lb = 0; lb < h_slot_nb[slot]; lb++) {
-        if (row[lb] >= 0) h_free[g_pg_nfree++] = row[lb];
+        if (row[lb] >= 0) paged_block_unref(row[lb]);   // shared prefixes survive
         row[lb] = -1;
     }
     h_slot_nb[slot] = 0;
@@ -25040,6 +25056,185 @@ extern "C" int qwn_paged_load_client(int slot, int upto_pos) {
         }
     }
     return cudaStreamSynchronize(g_qwen.stream) == cudaSuccess ? 0 : -7;
+}
+
+// ================= prefix checkpoints: the hybrid's APC (see CHANGELOG) =================
+// A checkpoint = REFERENCES to the full (immutable) KV blocks of [0, pos) plus COPIES of
+// the two things that cannot be shared: the partial tail block's rows (the donor keeps
+// appending into its own tail) and the O(1) DeltaNet recurrent+conv state (~145 MB, the
+// hybrid's non-rewindable part). adopt() hands a fresh slot the exact state at `pos` for
+// one D2D copy; the suffix then prefills normally. Same-stream ordering makes save safe
+// against in-flight prefill writes and later donor mutation.
+#define TQ_PG_MAX_CKPT 24
+typedef struct {
+    int used, pos, nfull, tail_blk, tail_rows;
+    int *blocks;             // host list of nfull shared phys ids (one ref each)
+    float *state;            // device slab: per LINEAR layer [recur_f][conv_f], layer order
+} tq_pg_ckpt;
+static tq_pg_ckpt g_pg_ck[TQ_PG_MAX_CKPT];
+
+void paged_ckpt_drop_all(void) {
+    for (int i = 0; i < TQ_PG_MAX_CKPT; i++) {
+        if (g_pg_ck[i].blocks) free(g_pg_ck[i].blocks);
+        if (g_pg_ck[i].state) cudaFree(g_pg_ck[i].state);
+        g_pg_ck[i].used = 0; g_pg_ck[i].blocks = NULL; g_pg_ck[i].state = NULL;
+    }
+}
+
+static size_t paged_state_floats(void) {
+    size_t recur_f = (size_t)batched_recur_floats(), conv_f = (size_t)batched_conv_floats();
+    size_t n = 0;
+    for (int L = 0; L < g_qwen.L; L++)
+        if (g_qwen.layer_types[L] == TQ_LAYER_LINEAR_ATTENTION) n += recur_f + conv_f;
+    return n;
+}
+
+// Copy `cnt` leading rows of one attention layer's block src -> dst (all four pools).
+static void paged_copy_attn_rows(int L, int src_phys, int dst_phys, int cnt) {
+    int kv_m = g_qwen.nkv * g_qwen.hd, nkv = g_qwen.nkv;
+    size_t qe = batched_q4s_elem_bytes();
+    size_t so = (size_t)src_phys * g_pg_page, dd = (size_t)dst_phys * g_pg_page;
+    cudaMemcpyAsync(g_pool_k4[L] + dd * (kv_m >> 1), g_pool_k4[L] + so * (kv_m >> 1),
+                    (size_t)cnt * (kv_m >> 1), cudaMemcpyDeviceToDevice, g_qwen.stream);
+    cudaMemcpyAsync((char *)g_pool_kq4s[L] + dd * nkv * 16 * qe,
+                    (char *)g_pool_kq4s[L] + so * nkv * 16 * qe,
+                    (size_t)cnt * nkv * 16 * qe, cudaMemcpyDeviceToDevice, g_qwen.stream);
+    cudaMemcpyAsync(g_pool_v8[L] + dd * kv_m, g_pool_v8[L] + so * kv_m,
+                    (size_t)cnt * kv_m, cudaMemcpyDeviceToDevice, g_qwen.stream);
+    cudaMemcpyAsync(g_pool_vscale[L] + dd * nkv, g_pool_vscale[L] + so * nkv,
+                    (size_t)cnt * nkv * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
+}
+
+static void paged_state_slot_to(float *slab, int slot) {
+    size_t recur_f = (size_t)batched_recur_floats(), conv_f = (size_t)batched_conv_floats();
+    size_t off = 0;
+    for (int L = 0; L < g_qwen.L; L++) {
+        if (g_qwen.layer_types[L] != TQ_LAYER_LINEAR_ATTENTION) continue;
+        cudaMemcpyAsync(slab + off, g_pg_recur[L] + (size_t)slot * recur_f,
+                        recur_f * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
+        off += recur_f;
+        cudaMemcpyAsync(slab + off, g_pg_conv[L] + (size_t)slot * conv_f,
+                        conv_f * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
+        off += conv_f;
+    }
+}
+static void paged_state_to_slot(const float *slab, int slot) {
+    size_t recur_f = (size_t)batched_recur_floats(), conv_f = (size_t)batched_conv_floats();
+    size_t off = 0;
+    for (int L = 0; L < g_qwen.L; L++) {
+        if (g_qwen.layer_types[L] != TQ_LAYER_LINEAR_ATTENTION) continue;
+        cudaMemcpyAsync(g_pg_recur[L] + (size_t)slot * recur_f, slab + off,
+                        recur_f * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
+        off += recur_f;
+        cudaMemcpyAsync(g_pg_conv[L] + (size_t)slot * conv_f, slab + off,
+                        conv_f * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
+        off += conv_f;
+    }
+}
+
+// Save slot's prefix state at position pos (pos tokens, [0, pos)). Returns ckpt id, or
+// -1 not ready / bad slot, -2 pos not covered by the slot's blocks, -3 registry full,
+// -4 allocation failure (tail block or state slab).
+extern "C" int qwn_paged_ckpt_save(int slot, int pos) {
+    if (!g_pg_ready || slot < 0 || slot >= g_pg_maxslots) return -1;
+    if (pos < 1 || ((pos - 1) >> g_pg_plog) + 1 > h_slot_nb[slot]) return -2;
+    int id = -1;
+    for (int i = 0; i < TQ_PG_MAX_CKPT; i++) if (!g_pg_ck[i].used) { id = i; break; }
+    if (id < 0) return -3;
+    tq_pg_ckpt *c = &g_pg_ck[id];
+    int nfull = pos >> g_pg_plog, tail = pos & (g_pg_page - 1);
+    int *row = h_block_table + (size_t)slot * g_pg_maxblk;
+    c->blocks = nfull ? (int *)malloc((size_t)nfull * sizeof(int)) : NULL;
+    if (nfull && !c->blocks) return -4;
+    c->tail_blk = -1;
+    if (tail > 0) {
+        c->tail_blk = paged_alloc_block();
+        if (c->tail_blk < 0) { free(c->blocks); c->blocks = NULL; return -4; }
+        for (int L = 0; L < g_qwen.L; L++)
+            if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION)
+                paged_copy_attn_rows(L, row[nfull], c->tail_blk, tail);
+    }
+    size_t sf = paged_state_floats();
+    if (cudaMalloc(&c->state, sf * sizeof(float)) != cudaSuccess) {
+        if (c->tail_blk >= 0) paged_block_unref(c->tail_blk);
+        free(c->blocks); c->blocks = NULL; c->state = NULL; return -4;
+    }
+    paged_state_slot_to(c->state, slot);
+    for (int lb = 0; lb < nfull; lb++) { c->blocks[lb] = row[lb]; h_blk_ref[row[lb]]++; }
+    c->used = 1; c->pos = pos; c->nfull = nfull; c->tail_rows = tail;
+    return id;
+}
+
+// Hand an EMPTY slot the checkpoint's state: full blocks shared by reference, tail rows
+// and DeltaNet state copied. Returns the position (prefill continues from there), or
+// -1 not ready / bad ids, -2 slot not empty, -3 unused ckpt, -4 tail alloc failure.
+extern "C" int qwn_paged_ckpt_adopt(int slot, int id) {
+    if (!g_pg_ready || slot < 0 || slot >= g_pg_maxslots ||
+        id < 0 || id >= TQ_PG_MAX_CKPT) return -1;
+    if (h_slot_nb[slot] != 0) return -2;
+    tq_pg_ckpt *c = &g_pg_ck[id];
+    if (!c->used) return -3;
+    int *row = h_block_table + (size_t)slot * g_pg_maxblk;
+    if (c->tail_rows > 0) {
+        int b = paged_alloc_block();
+        if (b < 0) return -4;
+        for (int L = 0; L < g_qwen.L; L++)
+            if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION)
+                paged_copy_attn_rows(L, c->tail_blk, b, c->tail_rows);
+        row[c->nfull] = b;
+    }
+    for (int lb = 0; lb < c->nfull; lb++) { row[lb] = c->blocks[lb]; h_blk_ref[c->blocks[lb]]++; }
+    h_slot_nb[slot] = c->nfull + (c->tail_rows > 0 ? 1 : 0);
+    paged_state_to_slot(c->state, slot);
+    return c->pos;
+}
+
+extern "C" int qwn_paged_ckpt_free(int id) {
+    if (!g_pg_ready || id < 0 || id >= TQ_PG_MAX_CKPT) return -1;
+    tq_pg_ckpt *c = &g_pg_ck[id];
+    if (!c->used) return -2;
+    for (int lb = 0; lb < c->nfull; lb++) paged_block_unref(c->blocks[lb]);
+    if (c->tail_blk >= 0) paged_block_unref(c->tail_blk);
+    if (c->state) cudaFree(c->state);          // implicit sync covers in-flight adopts
+    free(c->blocks);
+    c->blocks = NULL; c->state = NULL; c->used = 0;
+    return 0;
+}
+
+// Fork a LIVE slot into an empty one at position pos: the subagent-spawn primitive.
+// Shares full blocks, copies src's tail rows + DeltaNet state directly. Same return
+// convention as adopt.
+extern "C" int qwn_paged_fork(int src, int dst, int pos) {
+    if (!g_pg_ready || src < 0 || src >= g_pg_maxslots ||
+        dst < 0 || dst >= g_pg_maxslots || src == dst) return -1;
+    if (h_slot_nb[dst] != 0) return -2;
+    if (pos < 1 || ((pos - 1) >> g_pg_plog) + 1 > h_slot_nb[src]) return -3;
+    int nfull = pos >> g_pg_plog, tail = pos & (g_pg_page - 1);
+    int *srow = h_block_table + (size_t)src * g_pg_maxblk;
+    int *drow = h_block_table + (size_t)dst * g_pg_maxblk;
+    if (tail > 0) {
+        int b = paged_alloc_block();
+        if (b < 0) return -4;
+        for (int L = 0; L < g_qwen.L; L++)
+            if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION)
+                paged_copy_attn_rows(L, srow[nfull], b, tail);
+        drow[nfull] = b;
+    }
+    for (int lb = 0; lb < nfull; lb++) { drow[lb] = srow[lb]; h_blk_ref[srow[lb]]++; }
+    h_slot_nb[dst] = nfull + (tail > 0 ? 1 : 0);
+    {
+        size_t recur_f = (size_t)batched_recur_floats(), conv_f = (size_t)batched_conv_floats();
+        for (int L = 0; L < g_qwen.L; L++) {
+            if (g_qwen.layer_types[L] != TQ_LAYER_LINEAR_ATTENTION) continue;
+            cudaMemcpyAsync(g_pg_recur[L] + (size_t)dst * recur_f,
+                            g_pg_recur[L] + (size_t)src * recur_f,
+                            recur_f * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
+            cudaMemcpyAsync(g_pg_conv[L] + (size_t)dst * conv_f,
+                            g_pg_conv[L] + (size_t)src * conv_f,
+                            conv_f * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
+        }
+    }
+    return 0;
 }
 
 // One paged decode step over N active columns. column j -> slot_ids[j] (persistent slot);
