@@ -22860,6 +22860,18 @@ static int wide_quant_input(const float *d_x, int K, int N) {
     return 0;
 }
 
+// Cross-call hygiene: the pending-activation record is strictly intra-call
+// producer->consumer state. A wave that errors out between the two must not
+// leak pend_* into the next call: every later first projection would see a
+// stale/mismatched record and fail -94 forever (the fleet poison loop).
+// Called at each paged entry point; costs nothing.
+static void wide_quant_reset(void) {
+    g_wq_pend_x = NULL; g_wq_pend_gate = NULL; g_wq_pend_up = NULL;
+    g_wq_pend_K = 0; g_wq_pend_N = 0;
+    g_wq_fp6_done = 0;
+    nvf4_quant_invalidate();
+}
+
 // run one wide projection from the prepared activation (call wide_quant_input first).
 // Weight format decides which activation quantization is materialised here.
 // TQ_NVFP4_DEBUG=1 syncs after every wide projection and names the one that faults.
@@ -25073,12 +25085,23 @@ typedef struct {
 } tq_pg_ckpt;
 static tq_pg_ckpt g_pg_ck[TQ_PG_MAX_CKPT];
 
+// State slabs are pool-backed: ONE up-front allocation (first save, all-or-
+// nothing with halving fallback) instead of a ~145 MB cudaMalloc per save.
+// Unbudgeted per-save mallocs under fleet load ate VRAM until an in-wave
+// scratch alloc failed (the rc=-94 cascade). Lazy-at-first-save on purpose:
+// it orders the pool AFTER the first deep prefill's scratch high-water, so
+// wave scratch always wins the memory race and the pool shrinks instead.
+static float *g_pg_ck_pool = NULL;
+static int    g_pg_ck_pool_n = -1;   // usable ckpt ids; -1 = not yet allocated
+static size_t g_pg_ck_sf = 0;        // floats per slab at alloc time
+
 void paged_ckpt_drop_all(void) {
     for (int i = 0; i < TQ_PG_MAX_CKPT; i++) {
         if (g_pg_ck[i].blocks) free(g_pg_ck[i].blocks);
-        if (g_pg_ck[i].state) cudaFree(g_pg_ck[i].state);
         g_pg_ck[i].used = 0; g_pg_ck[i].blocks = NULL; g_pg_ck[i].state = NULL;
     }
+    if (g_pg_ck_pool) cudaFree(g_pg_ck_pool);
+    g_pg_ck_pool = NULL; g_pg_ck_pool_n = -1; g_pg_ck_sf = 0;
 }
 
 static size_t paged_state_floats(void) {
@@ -25087,6 +25110,25 @@ static size_t paged_state_floats(void) {
     for (int L = 0; L < g_qwen.L; L++)
         if (g_qwen.layer_types[L] == TQ_LAYER_LINEAR_ATTENTION) n += recur_f + conv_f;
     return n;
+}
+
+static int paged_ckpt_pool_init(void) {
+    if (g_pg_ck_pool_n >= 0) return g_pg_ck_pool_n;
+    const char *e = getenv("TQ_CKPT_POOL");
+    int want = e ? atoi(e) : 6;
+    if (want > TQ_PG_MAX_CKPT) want = TQ_PG_MAX_CKPT;
+    g_pg_ck_sf = paged_state_floats();
+    for (int n = want; n > 0; n >>= 1) {
+        if (cudaMalloc(&g_pg_ck_pool, (size_t)n * g_pg_ck_sf * sizeof(float)) == cudaSuccess) {
+            g_pg_ck_pool_n = n;
+            fprintf(stderr, "[paged] ckpt state pool: %d slabs x %.1f MB\n",
+                    n, g_pg_ck_sf * sizeof(float) / 1048576.0);
+            return n;
+        }
+    }
+    g_pg_ck_pool = NULL; g_pg_ck_pool_n = 0;
+    fprintf(stderr, "[paged] ckpt state pool: no VRAM, state saves disabled\n");
+    return 0;
 }
 
 // Copy `cnt` leading rows of one attention layer's block src -> dst (all four pools).
@@ -25138,8 +25180,10 @@ static void paged_state_to_slot(const float *slab, int slot) {
 extern "C" int qwn_paged_ckpt_save(int slot, int pos) {
     if (!g_pg_ready || slot < 0 || slot >= g_pg_maxslots) return -1;
     if (pos < 1 || ((pos - 1) >> g_pg_plog) + 1 > h_slot_nb[slot]) return -2;
+    int npool = paged_ckpt_pool_init();
+    if (npool < 1) return -3;                    // no state pool: saves disabled
     int id = -1;
-    for (int i = 0; i < TQ_PG_MAX_CKPT; i++) if (!g_pg_ck[i].used) { id = i; break; }
+    for (int i = 0; i < npool; i++) if (!g_pg_ck[i].used) { id = i; break; }
     if (id < 0) return -3;
     tq_pg_ckpt *c = &g_pg_ck[id];
     int nfull = pos >> g_pg_plog, tail = pos & (g_pg_page - 1);
@@ -25154,11 +25198,7 @@ extern "C" int qwn_paged_ckpt_save(int slot, int pos) {
             if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION)
                 paged_copy_attn_rows(L, row[nfull], c->tail_blk, tail);
     }
-    size_t sf = paged_state_floats();
-    if (cudaMalloc(&c->state, sf * sizeof(float)) != cudaSuccess) {
-        if (c->tail_blk >= 0) paged_block_unref(c->tail_blk);
-        free(c->blocks); c->blocks = NULL; c->state = NULL; return -4;
-    }
+    c->state = g_pg_ck_pool + (size_t)id * g_pg_ck_sf;   // pool-backed slab
     paged_state_slot_to(c->state, slot);
     for (int lb = 0; lb < nfull; lb++) { c->blocks[lb] = row[lb]; h_blk_ref[row[lb]]++; }
     c->used = 1; c->pos = pos; c->nfull = nfull; c->tail_rows = tail;
@@ -25195,7 +25235,8 @@ extern "C" int qwn_paged_ckpt_free(int id) {
     if (!c->used) return -2;
     for (int lb = 0; lb < c->nfull; lb++) paged_block_unref(c->blocks[lb]);
     if (c->tail_blk >= 0) paged_block_unref(c->tail_blk);
-    if (c->state) cudaFree(c->state);          // implicit sync covers in-flight adopts
+    // state is pool-backed: the slab is reclaimed by id reuse; same-stream
+    // ordering serializes an in-flight adopt copy before a later save's write.
     free(c->blocks);
     c->blocks = NULL; c->state = NULL; c->used = 0;
     return 0;
@@ -25321,6 +25362,7 @@ extern "C" int qwn_paged_decode_step(const int *tokens, const int *slot_ids, con
                                      int N, int *out_argmax) {
     if (!g_pg_ready) return -1;
     if (N < 1 || N > g_pg_maxslots) return -2;
+    wide_quant_reset();
     if (!g_qwen.kv_q4) return -3;
     int ret = run_paged_decode_step_core(tokens, slot_ids, positions, N);
     if (ret != 0) return ret;
@@ -25549,6 +25591,7 @@ extern "C" int qwn_paged_prefill_batch(const int *tokens, const int *col_slot, c
                                        const int *seg_slot, const int *seg_off, const int *seg_len,
                                        const int *seg_final, int K, int T, int *out_seed) {
     if (!g_pg_ready) return -1;
+    wide_quant_reset();
     if (!g_qwen.kv_q4) return -2;
     if (K < 1 || T < 1) return -3;
     // Wave column cap. The FP6 GEMMs already N-tile internally at 128 columns

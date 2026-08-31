@@ -225,7 +225,8 @@ class BatchedEngine:
             return False
         lru = min(self.cks, key=lambda c: c["t_hit"])
         self.cks.remove(lru)
-        self.L.qwn_paged_ckpt_free(lru["id"])
+        rc = self.L.qwn_paged_ckpt_free(lru["id"])
+        print(f"[ckpt] evict id={lru['id']} pos={lru['pos']} rc={rc}", flush=True)
         return True
 
     def _ck_targets(self, req, cursor):
@@ -248,8 +249,16 @@ class BatchedEngine:
         for n in sorted(cands):
             if n < self.pc_min or n <= cursor:
                 continue
-            if any(c["pos"] == n and c["ids"] == req.ids[:n] for c in self.cks):
-                continue                         # this exact prefix is already cached
+            # Near-dedup within 2*trim: a boundary within 16 tokens BELOW serves
+            # the same adopters at <=16 extra suffix tokens, so saving both burns
+            # TWO registry slots per turn (the LCP and n-8 land 8 apart, halving
+            # the LRU's effective turn depth -- measured: resends of turn 1 missed
+            # because turns 4-5's pairs evicted it).
+            near = n - 2 * self.ck_trim
+            if any(near <= c["pos"] <= n and c["ids"] == req.ids[:c["pos"]] for c in self.cks):
+                continue
+            if out and out[-1] > near:
+                continue
             out.append(n)
         return out
 
@@ -261,7 +270,9 @@ class BatchedEngine:
         if cid < 0 and self._ck_evict_one():     # registry/VRAM pressure: retry once
             cid = self.L.qwn_paged_ckpt_save(slot, pos)
         if cid < 0:
+            print(f"[ckpt] save pos={pos} rc={cid} FAILED", flush=True)
             return                               # optimization only; never fatal
+        print(f"[ckpt] save pos={pos} -> id={cid}", flush=True)
         self.cks.append({"id": cid, "pos": pos, "ids": list(req.ids[:pos]),
                          "t_hit": time.time()})
         self.pc_builds += 1
@@ -273,18 +284,38 @@ class BatchedEngine:
         free_blk = self._free_blocks()
         for st in self.pref.values():                    # blocks the in-flight prefills still need
             free_blk -= (st[0].n_prompt - st[1] + self.page - 1) // self.page
-        while self.q and self.free_slots:
-            req = self.q[0]
+        qi = 0
+        while qi < len(self.q) and self.free_slots:
+            req = self.q[qi]
+            # Cache-aware admission: if an IN-FLIGHT prefill is about to checkpoint a
+            # boundary this request shares, wait the few waves for it instead of
+            # re-prefilling the whole shared prefix (the concurrent fan-out race:
+            # 6 subagents arriving together all missed and paid 24k tokens each).
+            # No deadlock: the donor always progresses or is torn down, and the
+            # hold lasts only while the target is ahead of the donor's cursor.
+            # Held requests are SKIPPED (qi advances): no head-of-line blocking.
+            if self._ck_match(req) is None:
+                waiting = False
+                for st in self.pref.values():
+                    for t in (st[2] if len(st) > 2 else []):
+                        if st[1] < t and req.n_prompt > t and req.ids[:t] == st[0].ids[:t]:
+                            waiting = True
+                            break
+                    if waiting:
+                        break
+                if waiting:
+                    qi += 1
+                    continue
             if req.n_prompt < 1:
-                self.q.pop(0); req.err = "empty prompt"; req.done.set(); continue
+                self.q.pop(qi); req.err = "empty prompt"; req.done.set(); continue
             need = (req.n_prompt + self.page - 1) // self.page
             if need > self.max_blocks_per_seq:
-                self.q.pop(0); req.err = "prompt exceeds context"; req.done.set(); continue
+                self.q.pop(qi); req.err = "prompt exceeds context"; req.done.set(); continue
             if need > free_blk:
                 break                                   # pool full -> wait (admission control)
             if len(self.pref) >= self.max_prefill:
                 break                                   # cap concurrent prefills (TTFT fairness)
-            self.q.pop(0); slot = self.free_slots.pop()
+            self.q.pop(qi); slot = self.free_slots.pop()
             try:
                 ck(self.L.qwn_paged_reset_slot(slot), "reset_slot")
                 free_blk -= need
@@ -521,8 +552,17 @@ class BatchedEngine:
                 _t = time.perf_counter()
                 try:
                     self._work()
+                    self.err_streak = 0
                 except Exception as e:                  # never let the engine thread die
                     print(f"[engine] step error: {e}", flush=True)
+                    self.err_streak = getattr(self, "err_streak", 0) + 1
+                    if self.err_streak >= 8:
+                        # 8 consecutive failed steps = the CUDA context is gone
+                        # (sticky error): every future wave fails identically.
+                        # Die loudly so a supervisor restart yields a live engine
+                        # instead of a zombie serving 100% errors.
+                        print("[engine] FATAL: 8 consecutive step errors, exiting", flush=True)
+                        os._exit(70)
                     with self.cv:
                         for s in list(self.active.keys()):
                             r = self.active.pop(s)

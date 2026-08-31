@@ -31,3 +31,8 @@ internal/
 probes/
 bench/
 
+
+# Third-party reference checkouts stay local; keep only their inventory and updater.
+vendor/**
+!vendor/README.md
+!vendor/vendor_pull_report.sh
