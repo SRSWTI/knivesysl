@@ -699,7 +699,17 @@ def make_handler(eng, tok, args):
 
         def do_GET(self):
             if self.path.startswith("/v1/models"):
-                self._json(200, {"object": "list", "data": [{"id": args.model_name, "object": "model"}]})
+                ctx_max = int(os.environ.get("TQ_CTX", "262144"))
+                self._json(200, {"object": "list", "data": [{
+                    "id": args.model_name, "object": "model", "created": int(time.time()),
+                    "owned_by": "knivesysl", "root": args.model_name, "parent": None,
+                    "max_model_len": ctx_max,
+                    "permission": [{"id": "modelperm-ksl", "object": "model_permission",
+                                    "created": int(time.time()), "allow_create_engine": False,
+                                    "allow_sampling": True, "allow_logprobs": False,
+                                    "allow_search_indices": False, "allow_view": True,
+                                    "allow_fine_tuning": False, "organization": "*",
+                                    "group": None, "is_blocking": False}]}]})
             elif self.path.startswith("/health"):
                 fb, tb, _, _ = eng._stats()
                 self._json(200, {"status": "ok", "free_blocks": fb, "total_blocks": tb,
@@ -750,8 +760,10 @@ def make_handler(eng, tok, args):
             # OpenAI chat sends max_completion_tokens (guidellm's chat handler does);
             # /v1/completions sends max_tokens; Responses-style clients send
             # max_output_tokens. Reading only one silently halves the requested length.
-            max_new = int(body.get("max_tokens") or body.get("max_completion_tokens")
-                          or body.get("max_output_tokens") or 128)
+            # No field at all -> vLLM semantics: generate into the remaining window
+            # (capped at 16k; the old default of 128 truncated every agent reply).
+            mt_raw = (body.get("max_tokens") or body.get("max_completion_tokens")
+                      or body.get("max_output_tokens"))
             stream = bool(body.get("stream", False))
             is_chat = self.path.startswith("/v1/chat")
             tools = body.get("tools") or None
@@ -767,10 +779,13 @@ def make_handler(eng, tok, args):
                                 fn["arguments"] = json.loads(fn["arguments"])
                             except Exception:
                                 pass
-                # Default ON (TQ_THINK=0 or per-request "enable_thinking": false to
-                # disable): agent clients rarely send the field, and the reasoning
-                # tier is the point of hosting this model for one's own workloads.
-                think = bool(body.get("enable_thinking", os.environ.get("TQ_THINK", "1") != "0"))
+                # Default ON (TQ_THINK=0 to flip). vLLM's actual API for this is
+                # chat_template_kwargs={"enable_thinking": ...}; the bare top-level
+                # field is kept as a convenience alias.
+                ctk = body.get("chat_template_kwargs") or {}
+                think = bool(ctk.get("enable_thinking",
+                                     body.get("enable_thinking",
+                                              os.environ.get("TQ_THINK", "1") != "0")))
                 try:
                     tmpl = tok.apply_chat_template(msgs, tools=tools, add_generation_prompt=True,
                                                    tokenize=False, enable_thinking=think)
@@ -780,6 +795,13 @@ def make_handler(eng, tok, args):
                 ids = tok(tmpl, add_special_tokens=False).input_ids
             else:
                 ids = tok(body.get("prompt", ""), add_special_tokens=False).input_ids
+            ctx_max = int(os.environ.get("TQ_CTX", "262144"))
+            max_new = int(mt_raw) if mt_raw else max(16, min(16384, ctx_max - len(ids) - 8))
+            # stop strings, vLLM semantics: applied to the RAW generation (thinking
+            # included), earliest match truncates and finishes with "stop".
+            stop_raw = body.get("stop")
+            stops = ([stop_raw] if isinstance(stop_raw, str)
+                     else [s0 for s0 in (stop_raw or []) if isinstance(s0, str) and s0])
             # ignore_eos: benchmark/eval harnesses (guidellm) pin the output length by
             # sending max_tokens + ignore_eos, so every request does equal work.
             req_eos = [] if bool(body.get("ignore_eos", False)) else eos
@@ -806,19 +828,53 @@ def make_handler(eng, tok, args):
                     if is_chat:
                         _sse({**base, "choices": [{"index": 0, "delta": {"role": "assistant"},
                                                    "finish_reason": None}]})
+                    # The completion STARTS inside <think> (the template appends the
+                    # opener), so text up to </think> streams as delta.reasoning_content
+                    # and the rest as delta.content -- the split vLLM's qwen3 reasoning
+                    # parser performs. A 7-char holdback avoids emitting a partial
+                    # "</think"; stop strings get the same holdback treatment.
+                    in_think = is_chat and think
+                    up, stopped, content_open = 0, False, not (is_chat and think)
                     sent_txt, sent_tok, deadline = "", 0, time.time() + args.timeout
                     while True:
                         done = req.done.is_set()
                         n_out = len(req.out)
                         if n_out > sent_tok:
                             full = tok.decode(req.out[:n_out], skip_special_tokens=True)
-                            delta = full[len(sent_txt):]
+                            for st0 in stops:
+                                i2 = full.find(st0)
+                                if i2 >= 0:
+                                    full = full[:i2]; stopped = True; req.cancel = True
+                            fin = done or stopped
+                            if in_think:
+                                b = full.find("</think>")
+                                if b < 0:
+                                    safe = len(full) if fin else max(up, len(full) - 7)
+                                    if safe > up:
+                                        _sse({**base, "choices": [{"index": 0, "delta": {"reasoning_content": full[up:safe]}, "finish_reason": None}]})
+                                        up = safe
+                                else:
+                                    if b > up:
+                                        _sse({**base, "choices": [{"index": 0, "delta": {"reasoning_content": full[up:b]}, "finish_reason": None}]})
+                                    up = b + 8
+                                    in_think = False
+                            if not in_think:
+                                # swallow the newlines that follow </think> even when they
+                                # arrive in a LATER decode step than the tag itself
+                                if not content_open:
+                                    while up < len(full) and full[up] == "\n": up += 1
+                                hb = (max(len(s0) for s0 in stops) - 1) if (stops and not fin) else 0
+                                safe = max(up, len(full) - hb)
+                                if safe > up:
+                                    content_open = True
+                                    ch = ({"index": 0, "delta": {"content": full[up:safe]}, "finish_reason": None}
+                                          if is_chat else
+                                          {"index": 0, "text": full[up:safe], "finish_reason": None})
+                                    _sse({**base, "choices": [ch]})
+                                    up = safe
                             sent_txt, sent_tok = full, n_out
-                            if delta:
-                                ch = ({"index": 0, "delta": {"content": delta}, "finish_reason": None}
-                                      if is_chat else
-                                      {"index": 0, "text": delta, "finish_reason": None})
-                                _sse({**base, "choices": [ch]})
+                            if stopped:
+                                break
                         elif done:
                             break
                         else:
@@ -827,7 +883,7 @@ def make_handler(eng, tok, args):
                             req.progress.wait(0.05)
                             req.progress.clear()
                     gen = len(req.out)
-                    finish = "length" if gen >= max_new else "stop"
+                    finish = "stop" if stopped else ("length" if gen >= max_new else "stop")
                     ch = ({"index": 0, "delta": {}, "finish_reason": finish} if is_chat
                           else {"index": 0, "text": "", "finish_reason": finish})
                     _sse({**base, "choices": [ch]})
@@ -849,14 +905,29 @@ def make_handler(eng, tok, args):
             # include the full committed continuation (out[0] is the first generated token)
             text = tok.decode(req.out if len(req.out) else [], skip_special_tokens=True)
             gen = len(req.out)
+            stopped = False
+            for st0 in stops:
+                i2 = text.find(st0)
+                if i2 >= 0:
+                    text = text[:i2]; stopped = True
+            reasoning = None
+            if is_chat and think:
+                j = text.find("</think>")
+                if j >= 0:
+                    reasoning, text = text[:j], text[j + 8:].lstrip("\n")
+                else:                       # budget exhausted inside the think block
+                    reasoning, text = text, ""
             tool_calls = None
             if is_chat and tools and TOOL_OPEN in text:
                 text, tool_calls = parse_tool_calls(text, tools)
-            finish = "tool_calls" if tool_calls else ("length" if gen >= max_new else "stop")
+            finish = ("tool_calls" if tool_calls else
+                      ("stop" if stopped else ("length" if gen >= max_new else "stop")))
             usage = {"prompt_tokens": req.n_prompt, "completion_tokens": gen,
                      "total_tokens": req.n_prompt + gen}
             if is_chat:
                 msg = {"role": "assistant", "content": text or None}
+                if reasoning:
+                    msg["reasoning_content"] = reasoning
                 if tool_calls:
                     msg["tool_calls"] = tool_calls
                 resp = {"id": cid, "object": "chat.completion", "model": args.model_name,
