@@ -145,16 +145,16 @@ decode:
 | prefill 4096, unique, fully warm | 16080 | 7544 | 2.13x theirs |
 | prefill 4096, shared prefix, warm | 40282 | **174093** | **4.32x ours** |
 | prefill 16384 (conc 2) | 10104 | 6157 | 1.64x theirs |
-| prefill 16384 | 9173 | 7369 | 1.24x theirs |
-| prefill 32768 | 7978 | 6414 | 1.24x theirs |
-| prefill 65536 | 6090 | 5087 | 1.20x theirs |
-| prefill 98304 | 4908 | 4218 | 1.16x theirs |
-| prefill 131072 | **cannot (max-len 116032)** | **3585** | ours alone |
+| prefill 16384 | 9173 | 8896 | 3.1% behind |
+| prefill 32768 | 7978 | 7524 | 6.0% behind |
+| prefill 65536 | 6090 | 5743 | 6.0% behind |
+| prefill 98304 | 4908 | 4645 | 5.7% behind |
+| prefill 131072 | **cannot (max-len 116032)** | **3885** | ours alone |
 
-(cold, same client, both servers fresh, vllm prefix cache off. the gqa-shared
-attention kernel + wide-wave ks=1 + full-width waves moved the band from
-1.28-1.60x to **1.16-1.24x** in one campaign; engine-level the same prompts run
-9895/9624/9146/8358/7134/5522/4510/3799 tok/s at 2k..128k)
+(cold, same client, both servers fresh, vllm prefix cache off. one day of
+probe-driven campaigns -- gqa-shared attention, wide-wave ks=1, full-width
+waves, the paged conv routing fix, fused silu quantization -- moved the band
+from 1.28-1.60x behind to **3-6%**, every change bit-exact-gated)
 | ttft p50, 8 clients x 2048 | 1.425 s | **1.230 s** | ours |
 | decode n=1, paged | 69.2 | 61.1 | 1.13x theirs |
 | decode n=1, fp6 mtp spec decode | 69.2 | **141.4** | **2.04x ours** |

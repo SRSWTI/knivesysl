@@ -767,7 +767,10 @@ def make_handler(eng, tok, args):
                                 fn["arguments"] = json.loads(fn["arguments"])
                             except Exception:
                                 pass
-                think = bool(body.get("enable_thinking", False))
+                # Default ON (TQ_THINK=0 or per-request "enable_thinking": false to
+                # disable): agent clients rarely send the field, and the reasoning
+                # tier is the point of hosting this model for one's own workloads.
+                think = bool(body.get("enable_thinking", os.environ.get("TQ_THINK", "1") != "0"))
                 try:
                     tmpl = tok.apply_chat_template(msgs, tools=tools, add_generation_prompt=True,
                                                    tokenize=False, enable_thinking=think)
