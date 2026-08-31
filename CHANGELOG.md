@@ -11,6 +11,33 @@ driven by the same client (`tools/bench_endpoint.py`).
 
 ## Unreleased
 
+### Wide-wave split-K clamp + full-width waves: the frontier moves again
+
+Two follow-ons the GQA kernel unlocked, both measured before baking:
+
+1. **ks=1 at z-batched wide waves** (>= 4 full 256-col tiles). The GEMM
+   autotuner measures at 256 columns, where split-K manufactures occupancy; a
+   1024/1536/2048-col z-batched wave already fills the card, so the tuned ks>1
+   only bought the partials round-trip plus `k_tq_nvf4_reduce` (5.5% of a 64k
+   prefill). 64k 5222->5466, 32k 6402->6690; 512-col waves keep the tuned ks
+   (ks=1 measured -5.1% there). Numeric gate worst 9.8e-08.
+2. **Full-width waves by default.** With attention KV-sharing and ks=1 in, the
+   wave-width optimum moved to the full 2048-col cap at EVERY depth (it was
+   512 shallow): 2k 8853->9895, 8k 8158->9146, 16k 7361->8358, 32k 6402->7134,
+   64k ->5522, 128k ->3799. `serve_batched` now defaults its prefill budget to
+   the full cap (`--prefill-budget 512` restores the ITL-fairness behavior);
+   host gaps measured 6 ms across a 16k prefill, scheduler exonerated.
+
+Server matrix, cold, fresh servers, vLLM prefix cache off, same client:
+16k 9173/7369 (1.24x) | 32k 7978/6414 (1.24x) | 64k 6090/5087 (1.20x) |
+96k 4908/4218 (**1.16x**) | 131072: vLLM HTTP 400, ours 3585. The session
+opened at 1.28-1.60x. Paged parity 11/11 on the final config.
+
+Remaining server-vs-engine delta is 8-13% inside the paged wave call (host
+gaps ~0); even zeroed it lands ~1.09x -- the flip needs the GEMM
+producer/consumer rewrite (36.5% of a 16k prefill, ours ~0.74x CUTLASS) or
+the ladder levers. That is the named next campaign.
+
 ### GQA-shared prefill attention: the 16k-96k campaign
 
 **`k_tq_wide_attn_mma6`** -- one CTA per KV HEAD instead of per query head: the

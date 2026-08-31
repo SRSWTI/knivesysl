@@ -877,7 +877,10 @@ def serve(args):
     if args.wave_cols is None:
         args.wave_cols = WAVE_MAX
     if args.prefill_budget is None:
-        args.prefill_budget = min(512, WAVE_MAX)   # shallow default; _work widens past 16k depth
+        # Full-width default: post GQA-attention + wide-wave ks=1, chunk 2048 wins at
+        # EVERY depth (2k +12%, 16k +11%, 64k +6% over 512-col waves). Latency-sensitive
+        # multi-client setups can pass --prefill-budget 512 to trade throughput for ITL.
+        args.prefill_budget = WAVE_MAX
     print(f"batched server: engine wave cap={WAVE_MAX} "
           f"wave_cols={args.wave_cols} prefill_budget={args.prefill_budget}", flush=True)
     eng = BatchedEngine(L, args.tqf, args.max_slots, args.num_blocks, args.page,

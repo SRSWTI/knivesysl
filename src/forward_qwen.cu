@@ -14100,11 +14100,10 @@ static int tq_wave_cap(void) {
     if (cap == 0) {
         const char *e = getenv("TQ_WAVE_MAX");
         // Cap is the MAXIMUM wave the engine accepts; wave BUILDERS choose the
-        // width per depth. Measured optimum: 512 cols shallow (8055 tok/s at a
-        // 2048-token prompt), 2048 cols deep (64k prefill 4141 -> 4567: four
-        // fewer weight passes once attention dominates anyway). Raised 512 ->
-        // 2048 so deep callers can go wide; python schedulers default 512
-        // until a client's cursor passes 16k.
+        // width. Post GQA-attention + wide-wave ks=1 the measured optimum is
+        // the FULL 2048 cap at every depth (2k 8853->9895, 16k 7361->8358,
+        // 64k 5466->5522), so the python schedulers now default to it too;
+        // --prefill-budget trades throughput back for decode ITL fairness.
         cap = e ? atoi(e) : (tq_wide_gemm_tiled() ? 8 * TQ_WIDE_GEMM_TILE : 128);
         if (cap < 1) cap = 128;
     }
