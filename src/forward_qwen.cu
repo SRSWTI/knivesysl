@@ -13754,8 +13754,16 @@ static int nvf4_gemm_tiled(const tq_qmma_weight_t *w, float *out, int nvar,
     if (!w->nvf4 || !w->d_nvf4_a) return -90;
     const int Kt64 = w->Kt64;
     // Tuned config when available; the heuristic is only the pre-tune fallback.
-    const int ks = w->nvf4_ks ? w->nvf4_ks
-                              : tq_nvf4_ksplits(w->Mt, Kt64, tq_nvf4_stages());
+    int ks = w->nvf4_ks ? w->nvf4_ks
+                        : tq_nvf4_ksplits(w->Mt, Kt64, tq_nvf4_stages());
+    // The tuner measures at 256 columns, where split-K manufactures occupancy.
+    // A z-batched wide wave already fills the card, so ks>1 only buys the
+    // partials round-trip plus the reduce kernel. TQ_NVF4_KS overrides.
+    static int ks_env = -2;
+    if (ks_env < -1) { const char *e = getenv("TQ_NVF4_KS"); ks_env = (e && e[0]) ? atoi(e) : -1; }
+    if (ks_env > 0) ks = ks_env;
+    else if (nvar >= 4 * TQ_NVF4_TILE) ks = 1;         // measured: +4.5-4.7% at 1024/1536-col
+                                                       // waves; 512-col waves keep the tuned ks
     // Full 256-col tiles go up in ONE launch (blockIdx.z): tile 1's CTAs fill the
     // tail of tile 0's wave instead of waiting behind a host-serialized launch.
     const int full = nvar / TQ_NVF4_TILE;
