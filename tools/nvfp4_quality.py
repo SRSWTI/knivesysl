@@ -18,7 +18,10 @@ from __future__ import annotations
 import argparse, ctypes, os, sys
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIGTEXT = os.environ.get("TQ_BENCH_TEXT", os.path.join(HERE, "src", "forward_qwen.cu"))
+_PINNED = os.path.join(HERE, "build-qwen", "tf_corpus_e3cdb42.txt")
+# Default to the PINNED corpus: the live source file shifts between builds and
+# turns every cross-build comparison into prompt drift (see CHANGELOG, twice).
+BIGTEXT = os.environ.get("TQ_BENCH_TEXT", _PINNED if os.path.exists(_PINNED) else os.path.join(HERE, "src", "forward_qwen.cu"))
 
 
 def main() -> int:
