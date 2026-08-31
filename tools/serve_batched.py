@@ -46,6 +46,10 @@ def load_lib(path):
     L.qwn_paged_free.restype = ctypes.c_int
     L.qwn_paged_reset_slot.argtypes = [ctypes.c_int]; L.qwn_paged_reset_slot.restype = ctypes.c_int
     L.qwn_paged_load_client.argtypes = [ctypes.c_int, ctypes.c_int]; L.qwn_paged_load_client.restype = ctypes.c_int
+    L.qwn_paged_ckpt_save.argtypes = [ctypes.c_int, ctypes.c_int]; L.qwn_paged_ckpt_save.restype = ctypes.c_int
+    L.qwn_paged_ckpt_adopt.argtypes = [ctypes.c_int, ctypes.c_int]; L.qwn_paged_ckpt_adopt.restype = ctypes.c_int
+    L.qwn_paged_ckpt_free.argtypes = [ctypes.c_int]; L.qwn_paged_ckpt_free.restype = ctypes.c_int
+    L.qwn_paged_fork.argtypes = [ctypes.c_int] * 3; L.qwn_paged_fork.restype = ctypes.c_int
     L.qwn_paged_decode_step.argtypes = [ctypes.POINTER(ctypes.c_int)] * 3 + [ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
     L.qwn_paged_decode_step.restype = ctypes.c_int
     L.qwn_paged_stats.argtypes = [ctypes.POINTER(ctypes.c_int)] * 4; L.qwn_paged_stats.restype = ctypes.c_int
@@ -149,9 +153,12 @@ class BatchedEngine:
         self.decode_max_idle_ms = max(1.0, decode_max_idle_ms)
         self.last_decode = time.time()
         self.pc_enabled = prefix_cache; self.pc_min = max(1, prefix_cache_min)
-        self.pc_ids = []; self.pc_last = None
         self.pc_hits = self.pc_misses = self.pc_builds = self.pc_saved = 0
-        self.pc_streak = 0          # consecutive misses (lets a stale prefix be replaced)
+        # checkpoint registry (APC phase 2): engine ckpt id -> prefix ids + stats
+        self.cks = []               # [{id, pos, ids, t_hit}]
+        self.ck_max = int(os.environ.get("TQ_CKPT_MAX", "6"))
+        self.ck_trim = max(0, int(os.environ.get("TQ_CKPT_TRIM", "8")))
+        self.ck_last = None         # previous admitted prompt (LCP checkpoint candidate)
         self.pref = {}              # slot -> [Request, prefill cursor] (chunked prefill)
         ck(self.L.qwn_paged_init(max_slots, num_blocks, page), "paged_init")
         fb, tb, pg, mb = self._stats()
@@ -195,71 +202,69 @@ class BatchedEngine:
         if seed in req.eos or len(req.out) >= req.max_new:
             self._detach(slot)
 
-    # ---------------------------- shared-prefix cache ----------------------------
-    # qwn_paged_load_client(slot, upto_pos) copies the single-stream Q4 KV rows
-    # [0..upto_pos] into a slot's pool blocks AND the DeltaNet recurrent/conv state
-    # into that slot. That recurrent state is the state AFTER the whole single-stream
-    # prefill (it is O(1), not per-position), so a slot may reuse it only when its
-    # prompt starts with EXACTLY the materialized prefix -- there is no partial
-    # rewind for the 48 gated-DeltaNet layers. Hence ONE materialized prefix (the
-    # shared system prompt of an agent fleet), not vLLM's N-way hash-addressed APC.
-    # This dedups the prefix COMPUTE, not its memory: every slot still gets its own
-    # physical copy of the prefix blocks (block sharing needs refcounted block
-    # tables in the engine).
-    def _prefix_hit(self, req):
-        n = len(self.pc_ids)
-        return (self.pc_enabled and n >= self.pc_min and req.n_prompt > n
-                and req.ids[:n] == self.pc_ids)
+    # ------------------- prefix checkpoints: the hybrid's APC (phase 2) -------------------
+    # A checkpoint = shared refs to the full KV blocks of [0, pos) + COPIES of the tail
+    # rows and the O(1) DeltaNet state (engine ABI, ckpt_smoke-gated bit-exact). The
+    # scheduler saves one per distinct prompt at (n_prompt - trim): the trim stops a few
+    # tokens short of the generation opener so the NEXT append-only turn -- whose history
+    # replaces "<think>" with the rendered assistant message -- still prefix-matches. The
+    # save happens MID-PREFILL at exactly that cursor (the DeltaNet state cannot be
+    # rewound, so position and state must agree by construction). Admission adopts the
+    # deepest matching checkpoint and prefills only the suffix. N-way, LRU, VRAM-capped;
+    # every failure path degrades to a plain full prefill.
+    def _ck_match(self, req):
+        best = None
+        for c in self.cks:
+            if c["pos"] < req.n_prompt and (best is None or c["pos"] > best["pos"]) \
+               and req.ids[:c["pos"]] == c["ids"]:
+                best = c
+        return best
 
-    def _materialize_prefix(self, ids):
-        """Prefill `ids` into the single-stream state (wide path, ~2500 tok/s) so
-        later admissions snapshot it into their slot instead of re-prefilling.
-        NEVER raises: the cache is an optimization. At big TQ_CTX the single-stream
-        state may not fit next to the pool (reset_state -4) -- degrade to no-cache
-        instead of wedging admission (which is exactly what happened at 262k)."""
-        n = len(ids)
-        rc0 = self.L.qwn_reset_state()
-        if rc0 != 0:
-            self.pc_ids = []
-            self.pc_enabled = False
-            print(f"[engine] prefix cache disabled: reset_state rc={rc0} "
-                  f"(single-stream state does not fit at this TQ_CTX/pool size)", flush=True)
-            return
-        am = ctypes.c_int(0)
-        pos = 0
-        while pos < n:
-            c = min(WAVE_MAX, n - pos)
-            last = (pos + c >= n)
-            rc = self.L.qwn_prefill_wide(_ci(ids[pos:pos + c]), pos - 1, c,
-                                         ctypes.byref(am) if last else None)
-            if rc != 0:
-                self.pc_ids = []
-                print(f"[engine] prefix materialize rc={rc} at {pos}", flush=True)
+    def _ck_evict_one(self):
+        if not self.cks:
+            return False
+        lru = min(self.cks, key=lambda c: c["t_hit"])
+        self.cks.remove(lru)
+        self.L.qwn_paged_ckpt_free(lru["id"])
+        return True
+
+    def _ck_targets(self, req, cursor):
+        """Checkpoint positions for this prompt's prefill (sorted). Two candidates:
+        the LCP with the PREVIOUS prompt (= where the shared history ends -- the
+        boundary the next append-only turn will extend), and n_prompt - trim (the
+        exact-resend / parallel-fan-out boundary)."""
+        if not self.pc_enabled:
+            return []
+        cands = set()
+        cands.add(req.n_prompt - self.ck_trim)
+        prev = self.ck_last
+        if prev:
+            m = min(len(prev), req.n_prompt)
+            i = 0
+            while i < m and prev[i] == req.ids[i]:
+                i += 1
+            cands.add(i)
+        out = []
+        for n in sorted(cands):
+            if n < self.pc_min or n <= cursor:
+                continue
+            if any(c["pos"] == n and c["ids"] == req.ids[:n] for c in self.cks):
+                continue                         # this exact prefix is already cached
+            out.append(n)
+        return out
+
+    def _ck_save(self, req, slot, pos):
+        while len(self.cks) >= self.ck_max:
+            if not self._ck_evict_one():
                 return
-            pos += c
-        self.pc_ids = list(ids)
+        cid = self.L.qwn_paged_ckpt_save(slot, pos)
+        if cid < 0 and self._ck_evict_one():     # registry/VRAM pressure: retry once
+            cid = self.L.qwn_paged_ckpt_save(slot, pos)
+        if cid < 0:
+            return                               # optimization only; never fatal
+        self.cks.append({"id": cid, "pos": pos, "ids": list(req.ids[:pos]),
+                         "t_hit": time.time()})
         self.pc_builds += 1
-
-    def _prefix_candidate(self, req):
-        """Longest common prefix with the last admitted prompt: a shared system
-        prompt shows up here on the second request that carries it.
-
-        A cached prefix that stopped hitting must be replaceable, even by a SHORTER
-        candidate -- otherwise the first (possibly over-long) prefix wins forever
-        and the fleet's real shared prompt never gets cached."""
-        prev = self.pc_last
-        self.pc_last = req.ids
-        if not self.pc_enabled or not prev:
-            return None
-        m = min(len(prev), req.n_prompt - 1)
-        i = 0
-        while i < m and prev[i] == req.ids[i]:
-            i += 1
-        if i < self.pc_min:
-            return None
-        if i > len(self.pc_ids) or self.pc_streak >= 2:
-            return req.ids[:i]
-        return None
 
     def _admit(self):
         """Move queued requests into the PREFILLING set (slot + blocks reserved).
@@ -284,23 +289,21 @@ class BatchedEngine:
                 ck(self.L.qwn_paged_reset_slot(slot), "reset_slot")
                 free_blk -= need
                 cursor = 0
-                if self._prefix_hit(req):
-                    rc = self.L.qwn_paged_load_client(slot, len(self.pc_ids) - 1)
-                    if rc == 0:
-                        cursor = len(self.pc_ids)        # prefill only the suffix
-                        self.pc_hits += 1; self.pc_saved += cursor; self.pc_streak = 0
+                hit = self._ck_match(req)
+                if hit is not None:
+                    pos = self.L.qwn_paged_ckpt_adopt(slot, hit["id"])
+                    if pos == hit["pos"]:
+                        cursor = pos                     # prefill only the suffix
+                        hit["t_hit"] = time.time()
+                        self.pc_hits += 1; self.pc_saved += cursor
                     else:
                         ck(self.L.qwn_paged_reset_slot(slot), "reset_slot")
-                        print(f"[engine] load_client rc={rc}, full prefill instead", flush=True)
+                        print(f"[engine] ckpt adopt rc={pos}, full prefill instead", flush=True)
+                        self.pc_misses += 1
                 else:
-                    self.pc_misses += 1; self.pc_streak += 1
-                    cand = self._prefix_candidate(req)
-                    if cand is not None:
-                        self._materialize_prefix(cand)
-                        if self._prefix_hit(req) and self.L.qwn_paged_load_client(slot, len(cand) - 1) == 0:
-                            cursor = len(cand)
-                            self.pc_hits += 1; self.pc_saved += cursor; self.pc_streak = 0
-                self.pref[slot] = [req, cursor]          # [request, prefill cursor]
+                    self.pc_misses += 1
+                self.pref[slot] = [req, cursor, self._ck_targets(req, cursor)]
+                self.ck_last = list(req.ids)
             except Exception as e:
                 # a failed admission must cost ONE request, not the slot and not the
                 # server: before this guard a raise here leaked the slot and left the
@@ -352,6 +355,9 @@ class BatchedEngine:
             if st is None:
                 continue
             st[1] += c
+            while len(st) > 2 and st[2] and st[2][0] == st[1]:
+                self._ck_save(st[0], slot, st[1])        # state == cursor by construction
+                st[2].pop(0)
             if final:
                 del self.pref[slot]
                 self._activate(st[0], slot, oseed[k])
@@ -447,8 +453,13 @@ class BatchedEngine:
         for slot, st in list(self.pref.items()):
             if room <= 0:
                 break
-            req, pos = st
+            req, pos = st[0], st[1]
             c = min(room, req.n_prompt - pos)
+            ckts = st[2] if len(st) > 2 else []
+            for t in ckts:
+                if pos < t < pos + c:
+                    c = t - pos                  # land the cursor ON the next checkpoint
+                    break
             final = 1 if pos + c >= req.n_prompt else 0
             seg_off.append(len(cols_tok)); seg_slot.append(slot); seg_len.append(c); seg_fin.append(final)
             cols_tok += req.ids[pos:pos + c]
@@ -736,7 +747,8 @@ def make_handler(eng, tok, args):
                                  "decoded_tokens": eng.decoded_tokens,
                                  "prefilled_tokens": eng.prefilled_tokens,
                                  "prefix_cache": {"enabled": eng.pc_enabled,
-                                                  "prefix_tokens": len(eng.pc_ids),
+                                                  "prefix_tokens": sum(c["pos"] for c in eng.cks),
+                                                  "checkpoints": len(eng.cks),
                                                   "hits": eng.pc_hits, "misses": eng.pc_misses,
                                                   "builds": eng.pc_builds,
                                                   "tokens_saved": eng.pc_saved}})
