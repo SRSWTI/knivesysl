@@ -853,6 +853,7 @@ def make_handler(eng, tok, args):
                     # "</think"; stop strings get the same holdback treatment.
                     in_think = is_chat and think
                     up, stopped, content_open = 0, False, not (is_chat and think)
+                    tool_start = -1                     # index of first <tool_call> in full
                     sent_txt, sent_tok, deadline = "", 0, time.time() + args.timeout
                     while True:
                         done = req.done.is_set()
@@ -881,8 +882,21 @@ def make_handler(eng, tok, args):
                                 # arrive in a LATER decode step than the tag itself
                                 if not content_open:
                                     while up < len(full) and full[up] == "\n": up += 1
-                                hb = (max(len(s0) for s0 in stops) - 1) if (stops and not fin) else 0
-                                safe = max(up, len(full) - hb)
+                                # auto tool choice: content stops streaming at the first
+                                # <tool_call>; the XML buffers silently and is emitted as
+                                # a delta.tool_calls chunk when generation ends (the
+                                # qwen3_coder-parser behavior vLLM has).
+                                if is_chat and tools and tool_start < 0:
+                                    ti = full.find(TOOL_OPEN, up)
+                                    if ti >= 0:
+                                        tool_start = ti
+                                lim = tool_start if tool_start >= 0 else len(full)
+                                hb = 0
+                                if not fin:
+                                    if stops: hb = max(hb, max(len(s0) for s0 in stops) - 1)
+                                    if is_chat and tools and tool_start < 0:
+                                        hb = max(hb, len(TOOL_OPEN) - 1)
+                                safe = max(up, min(lim, len(full) - hb))
                                 if safe > up:
                                     content_open = True
                                     ch = ({"index": 0, "delta": {"content": full[up:safe]}, "finish_reason": None}
@@ -901,7 +915,15 @@ def make_handler(eng, tok, args):
                             req.progress.wait(0.05)
                             req.progress.clear()
                     gen = len(req.out)
-                    finish = "stop" if stopped else ("length" if gen >= max_new else "stop")
+                    tcs = None
+                    if is_chat and tools and tool_start >= 0:
+                        _clean, tcs = parse_tool_calls(sent_txt[tool_start:], tools)
+                        if tcs:
+                            _sse({**base, "choices": [{"index": 0, "delta": {"tool_calls": [
+                                dict(tc, index=i) for i, tc in enumerate(tcs)]},
+                                "finish_reason": None}]})
+                    finish = ("tool_calls" if tcs else
+                              ("stop" if stopped else ("length" if gen >= max_new else "stop")))
                     ch = ({"index": 0, "delta": {}, "finish_reason": finish} if is_chat
                           else {"index": 0, "text": "", "finish_reason": finish})
                     _sse({**base, "choices": [ch]})
