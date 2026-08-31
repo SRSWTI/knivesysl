@@ -11,6 +11,42 @@ driven by the same client (`tools/bench_endpoint.py`).
 
 ## Unreleased
 
+### The 3-6% matrix: conv routing, silu fusion, and the GEMM verdict
+
+Campaign two of the day, probe-driven end to end:
+
+1. **Warp-specialized producer for the TMA GEMM** (`TQ_NVF4_WS`): built,
+   bit-identical, measured FLAT (+0.1-0.4%). Verdict recorded honestly: at
+   2048-col z-batched waves the GEMM already runs ~CUTLASS-class efficiency
+   (~1100+ TF/s effective back-computed from the profile); the "0.74x CUTLASS"
+   deficit died with 512-col host tiling. Kept in-tree as an env-gated variant.
+2. **Paged conv routed through the position-parallel wide kernel.** The paged
+   DeltaNet conv (`k_tq_linear_conv_chunk`) ran ONE thread per channel with a
+   serial 2048-iteration window loop -- 40 blocks on 170 SMs, 755 ms of a 5.1 s
+   paged 32k prefill vs 83 ms for the contiguous path's kernel doing identical
+   math. Bit-exact (same taps, same state update); paged 32k 6363 -> 7298.
+   This WAS the mysterious 8-13% server-vs-engine delta, whole.
+3. **silu(gate)*up fused into the nvfp4 activation quantizer.** The [n x I]
+   fp32 product never exists: 32-lane coalesced load, silu once into a 2 KB
+   smem tile, absmax + encode from smem (~20 -> 8 bytes/element). Bit-identical
+   codes. First cut with 8-lane loads was -5.9%; coalescing was the whole game:
+   +2.8% @16k, +1.7% @64k. `TQ_NVF4_FUSE_SILU=0` reverts.
+
+**Final server matrix** (cold, fresh servers, vLLM prefix cache off, same client):
+
+| P | vllm | knivesysl | gap |
+|---|--:|--:|--:|
+| 16384 | 9173 | 8896 | 3.1% |
+| 32768 | 7978 | 7524 | 6.0% |
+| 65536 | 6090 | 5743 | 6.0% |
+| 98304 | 4908 | 4645 | 5.7% |
+| 131072 | HTTP 400 | 3885 | ours alone |
+
+The session opened at 1.28-1.60x behind. Engine-level: 16k 8597, 64k 5631,
+plus every gate green (argmax bit-exact fused-vs-unfused, paged parity 11/11,
+numeric worst 9.8e-08). What remains is real kernel frontier, not bugs:
+attention's mma-issue floor, dn prep occupancy, and the ladder levers.
+
 ### Wide-wave split-K clamp + full-width waves: the frontier moves again
 
 Two follow-ons the GQA kernel unlocked, both measured before baking:
