@@ -12984,6 +12984,8 @@ static void maybe_nvf4_convert_all(void) {
     int up   = mlp || strstr(env, "up") != NULL;
     int down = mlp || strstr(env, "down") != NULL;
     size_t before = g_qwen.device_bytes;
+    size_t mfree0 = 0, mtot = 0;
+    cudaMemGetInfo(&mfree0, &mtot);
     int n = 0;
     for (int i = 0; i < g_qwen.L; i++) {
         tq_layer_t *l = &g_qwen.layers[i];
@@ -13005,6 +13007,14 @@ static void maybe_nvf4_convert_all(void) {
         }
     }
     g_nvf4_any = (n > 0);
+    if (getenv("TQ_MEM_TRACE")) {
+        size_t mfree1 = 0, mtot1 = 0;
+        cudaMemGetInfo(&mfree1, &mtot1);
+        fprintf(stderr, "TQ_MEM_TRACE convert_all: free %zu -> %zu MiB (actual delta %+ld, claimed %+ld)\n",
+                mfree0 >> 20, mfree1 >> 20,
+                (long)((long long)mfree1 - (long long)mfree0) >> 20,
+                (long)((long long)before - (long long)g_qwen.device_bytes) >> 20);
+    }
     fprintf(stderr, "TQ_W_NVFP4=%s (mlp=%d delta=%d attn=%d): %d weights -> NVFP4 W4A4 "
                     "(4.50 bits/w vs 6.00), %zu MB device -> %zu MB (-%zu MB)\n",
             env, mlp, delta, attn, n, before >> 20, g_qwen.device_bytes >> 20,
@@ -13281,12 +13291,9 @@ static int nvf4_gemm_tiled(const tq_qmma_weight_t *w, float *out, int nvar,
 static int nvf4_autotune(tq_qmma_weight_t *w, int nvar, cudaStream_t st) {
     // Own synthetic activation: the tuner runs at load, before any real one exists, and
     // K differs per shape so the quantized buffer must be built for this weight's K.
-    float *d_x = NULL;
-    if (cudaMalloc(&d_x, (size_t)nvar * w->K * sizeof(float)) != cudaSuccess) return -1;
-    k_tq_nvf4_fill_x<<<(unsigned)(((size_t)nvar * w->K + 255) / 256), 256, 0, st>>>(
-        d_x, (long)nvar * w->K, 4242u);
-    nvf4_quant_invalidate();
-    if (nvf4_quant_ensure(d_x, w->K, nvar, st) != 0) { cudaFree(d_x); return -1; }
+    // Cache FIRST: the check used to sit after the synthetic-activation malloc and
+    // the early return leaked d_x for every cached shape -- 489 of 496 weights at
+    // 5-18 MB each, the bulk of the ~7 GB the autotuner was retaining.
     struct Ent { int M, K, ks, stages; };
     static Ent cache[16];
     static int ncache = 0;
@@ -13294,8 +13301,14 @@ static int nvf4_autotune(tq_qmma_weight_t *w, int nvar, cudaStream_t st) {
         if (cache[i].M == w->M && cache[i].K == w->K) {
             w->nvf4_ks = cache[i].ks; w->nvf4_stages = cache[i].stages; return 0;
         }
+    float *d_x = NULL;
+    if (cudaMalloc(&d_x, (size_t)nvar * w->K * sizeof(float)) != cudaSuccess) return -1;
+    k_tq_nvf4_fill_x<<<(unsigned)(((size_t)nvar * w->K + 255) / 256), 256, 0, st>>>(
+        d_x, (long)nvar * w->K, 4242u);
+    nvf4_quant_invalidate();
+    if (nvf4_quant_ensure(d_x, w->K, nvar, st) != 0) { cudaFree(d_x); return -1; }
     float *d_out = NULL;
-    if (cudaMalloc(&d_out, (size_t)nvar * w->M * sizeof(float)) != cudaSuccess) return -1;
+    if (cudaMalloc(&d_out, (size_t)nvar * w->M * sizeof(float)) != cudaSuccess) { cudaFree(d_x); return -1; }
     const int Kt64 = w->Kt64;
     int best_ks = 1, best_st = 3; double best = 1e30;
     cudaEvent_t e0, e1;
@@ -13334,6 +13347,11 @@ static int nvf4_autotune(tq_qmma_weight_t *w, int nvar, cudaStream_t st) {
     cudaEventDestroy(e0); cudaEventDestroy(e1);
     cudaFree(d_out); cudaFree(d_x);
     nvf4_quant_invalidate();
+    if (getenv("TQ_MEM_TRACE")) {
+        size_t mf = 0, mt = 0; cudaMemGetInfo(&mf, &mt);
+        fprintf(stderr, "TQ_MEM_TRACE tuned M=%d K=%d ks=%d st=%d: free %zu MiB\n",
+                w->M, w->K, best_ks, best_st, mf >> 20);
+    }
     w->nvf4_ks = best_ks; w->nvf4_stages = best_st;
     if (ncache < 16) { cache[ncache++] = { w->M, w->K, best_ks, best_st }; }
     return 0;
@@ -13343,6 +13361,8 @@ static int nvf4_autotune(tq_qmma_weight_t *w, int nvar, cudaStream_t st) {
 // launches for the whole model, not one per weight.
 static void nvf4_autotune_all(void) {
     if (!g_nvf4_any) return;
+    size_t mfree0 = 0, mtot = 0;
+    cudaMemGetInfo(&mfree0, &mtot);
     for (int i = 0; i < g_qwen.L; i++) {
         tq_layer_t *l = &g_qwen.layers[i];
         tq_qmma_weight_t *ws[12] = { &l->mlp_gate, &l->mlp_up, &l->mlp_down,
@@ -13359,6 +13379,11 @@ static void nvf4_autotune_all(void) {
     if (l0->mlp_down.nvf4) fprintf(stderr, " down=k%ds%d", l0->mlp_down.nvf4_ks, l0->mlp_down.nvf4_stages);
     if (l0->linear_in_qkv.nvf4) fprintf(stderr, " lqkv=k%ds%d", l0->linear_in_qkv.nvf4_ks, l0->linear_in_qkv.nvf4_stages);
     fprintf(stderr, "\n");
+    if (getenv("TQ_MEM_TRACE")) {
+        size_t mfree1 = 0, mtot1 = 0;
+        cudaMemGetInfo(&mfree1, &mtot1);
+        fprintf(stderr, "TQ_MEM_TRACE autotune_all: free %zu -> %zu MiB\n", mfree0 >> 20, mfree1 >> 20);
+    }
 }
 
 static int nvf4_proj(const tq_qmma_weight_t *w, const float *d_x, float *out, int nvar,
