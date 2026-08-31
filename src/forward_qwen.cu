@@ -11813,6 +11813,58 @@ __global__ void k_tq_nvf4_quant_x(uint32_t *b, const float *X, int nvar, int K,
     dst[lane * 2 + 1] = words[1];
 }
 
+// Fused silu(gate)*up -> per-16 ue4m3 quantize. Same scale math, same encode, same
+// fp32 silu expression as k_tq_silu_mul feeding k_tq_nvf4_quant_x -- bit-identical
+// codes -- but the [N x I] fp32 product never exists: computed ONCE into a 2 KB smem
+// tile (the unfused pair wrote it, then re-read it twice: absmax pass + encode pass).
+__global__ void k_tq_nvf4_quant_silu(uint32_t *b, const float *gate, const float *up,
+                                     int nvar, int K, int NGgroups, int Kt64) {
+    long tile = (long)blockIdx.x;
+    if (tile >= (long)NGgroups * Kt64) return;
+    int g8 = (int)(tile / Kt64), kt = (int)(tile % Kt64);
+    int lane = threadIdx.x;
+    uint32_t *dst = b + tile * TQ_NVF4_BW;
+    __shared__ float sc[8][4];
+    __shared__ float sx[8][64];
+    // Cooperative load: all 32 lanes, consecutive k within a column -> fully
+    // coalesced 128 B lines; silu computed exactly once per element.
+    for (int idx = lane; idx < 512; idx += 32) {
+        int c = idx >> 6, k = idx & 63;
+        int col = g8 * 8 + c, gk = kt * 64 + k;
+        float v = 0.f;
+        if (col < nvar && gk < K) {
+            float gv = gate[(size_t)col * K + gk];
+            v = (gv / (1.0f + expf(-gv))) * up[(size_t)col * K + gk];
+        }
+        sx[c][k] = v;
+    }
+    __syncthreads();
+    if (lane < 8) {
+        uint32_t w = 0;
+        for (int g = 0; g < 4; g++) {
+            float mx = 0.f;
+            for (int t = 0; t < 16; t++) mx = fmaxf(mx, fabsf(sx[lane][g * 16 + t]));
+            uint8_t sb = tq_f2ue4m3(mx / 6.0f);
+            if (sb == 0) sb = 1;
+            w |= (uint32_t)sb << (8 * g);
+            sc[lane][g] = tq_ue4m3_to_f(sb);
+        }
+        dst[64 + lane] = w;
+    }
+    __syncthreads();
+    uint32_t words[2] = {0, 0};
+    for (int reg = 0; reg < 2; reg++) {
+        for (int j = 0; j < 8; j++) {
+            int k = tq_nvf4_b_k(lane, reg, j);
+            float v = sx[lane >> 2][k];
+            float sf = sc[lane >> 2][k >> 4];
+            words[reg] |= tq_quant_e2m1_code(sf > 0.f ? v / sf : 0.f) << (4 * j);
+        }
+    }
+    dst[lane * 2 + 0] = words[0];
+    dst[lane * 2 + 1] = words[1];
+}
+
 // One block per 128x128 weight block -> pow2 ue8m0 scale_inv targeting E2M3 (7.5).
 __global__ void k_tq_block_absmax_pow2_e2m3(const uint16_t *bf16, int M, int K,
                                             int scale_cols, float *scale_inv) {
@@ -13750,7 +13802,8 @@ static void nvf4_quant_invalidate(void) { g_nvf4_qvalid = 0; }
 // Quantize the whole [N][K] activation into fragment-native tiles. Space is rounded up
 // to whole 32-group (256-column) tiles so every host column tile starts on a tile
 // boundary and the GEMM's power-of-two NG never reads past what was written.
-static int nvf4_quant_ensure(const float *d_x, int K, int N, cudaStream_t st) {
+static int nvf4_quant_ensure(const float *d_x, int K, int N, cudaStream_t st,
+                             const float *gate = NULL, const float *up = NULL) {
     if (g_nvf4_qvalid && g_nvf4_qsrc == d_x && g_nvf4_qK == K && g_nvf4_qN == N) return 0;
     if (K % 64 != 0) return -93;
     const int Kt64 = K / 64;
@@ -13774,8 +13827,12 @@ static int nvf4_quant_ensure(const float *d_x, int K, int N, cudaStream_t st) {
     if ((size_t)ng8 < Gtot)     // padding groups must read ZERO, not stale bytes
         cudaMemsetAsync(g_nvf4_b + (size_t)ng8 * Kt64 * TQ_NVF4_BW, 0,
                         (Gtot - (size_t)ng8) * Kt64 * TQ_NVF4_BW * sizeof(uint32_t), st);
-    k_tq_nvf4_quant_x<<<(unsigned)((size_t)ng8 * Kt64), 32, 0, st>>>(
-        g_nvf4_b, d_x, N, K, ng8, Kt64);
+    if (gate)
+        k_tq_nvf4_quant_silu<<<(unsigned)((size_t)ng8 * Kt64), 32, 0, st>>>(
+            g_nvf4_b, gate, up, N, K, ng8, Kt64);
+    else
+        k_tq_nvf4_quant_x<<<(unsigned)((size_t)ng8 * Kt64), 32, 0, st>>>(
+            g_nvf4_b, d_x, N, K, ng8, Kt64);
     g_nvf4_b_groups = (int)Gtot;
     g_nvf4_qsrc = d_x; g_nvf4_qK = K; g_nvf4_qN = N; g_nvf4_qvalid = 1;
     return 0;
@@ -22681,6 +22738,7 @@ static int ensure_wide_prefill_buffers(int N) {
 }
 
 static int wide_quant_input(const float *d_x, int K, int N);
+static int wide_quant_silu(const float *gate, const float *up, int K, int N);
 static int wide_proj(const tq_qmma_weight_t *w, float *out, int N);
 // Q4(K)+E4M3(V) batched/wide attention (defined in the roadmap-E section below). With
 // {k4,kq4s,v8,vscale}_stride = 0 every column shares ONE cache -> wide-prefill Q4 attention.
@@ -22718,8 +22776,17 @@ static int wide_mlp_x(tq_layer_t *l, const float *add_a, const float *add_b,
     if (ret != 0) return ret;
     if ((ret = wide_proj(&l->mlp_gate, g_wide_gate, n)) != 0) return ret;
     if ((ret = wide_proj(&l->mlp_up, g_wide_up, n)) != 0) return ret;
-    k_tq_silu_mul<<<((size_t)n * I + 255) / 256, 256, 0, g_qwen.stream>>>(g_wide_mh, g_wide_gate, g_wide_up, (size_t)n * I);
-    if ((ret = wide_quant_input(g_wide_mh, I, n)) != 0) return ret;
+    static int fuse_silu = -1;
+    if (fuse_silu < 0) { const char *e = getenv("TQ_NVF4_FUSE_SILU"); fuse_silu = (e && e[0]) ? !!atoi(e) : 1; }
+    if (fuse_silu && l->mlp_down.nvf4) {
+        // down-proj is the ONLY consumer of the silu product; quantize it fused
+        // (the [n x I] fp32 intermediate is never written or re-read: ~20 -> 8
+        // bytes of traffic per element).
+        if ((ret = wide_quant_silu(g_wide_gate, g_wide_up, I, n)) != 0) return ret;
+    } else {
+        k_tq_silu_mul<<<((size_t)n * I + 255) / 256, 256, 0, g_qwen.stream>>>(g_wide_mh, g_wide_gate, g_wide_up, (size_t)n * I);
+        if ((ret = wide_quant_input(g_wide_mh, I, n)) != 0) return ret;
+    }
     if ((ret = wide_proj(&l->mlp_down, g_wide_down, n)) != 0) return ret;
     k_tq_add_vec<<<((size_t)n * H + 255) / 256, 256, 0, g_qwen.stream>>>(layer_out, resid, g_wide_down, (size_t)n * H);
     return 0;
@@ -22750,6 +22817,7 @@ static size_t g_wproj_b_bytes = 0, g_wproj_bscale_n = 0, g_wproj_part_bytes = 0;
 // activations feeding only NVFP4 projections (~5.8% of prefill went to the quantizer).
 // With no NVFP4 weights it quantizes eagerly exactly as before.
 static const float *g_wq_pend_x = NULL;
+static const float *g_wq_pend_gate = NULL, *g_wq_pend_up = NULL;   // fused silu pending
 static int g_wq_pend_K = 0, g_wq_pend_N = 0, g_wq_fp6_done = 0;
 
 static int wide_quant_input_fp6(const float *d_x, int K, int N) {
@@ -22781,6 +22849,7 @@ static int wide_quant_input_fp6(const float *d_x, int K, int N) {
 }
 static int wide_quant_input(const float *d_x, int K, int N) {
     g_wq_pend_x = d_x; g_wq_pend_K = K; g_wq_pend_N = N;
+    g_wq_pend_gate = NULL; g_wq_pend_up = NULL;
     g_wq_fp6_done = 0;
     nvf4_quant_invalidate();
     if (!g_nvf4_any) {                     // default path: unchanged, eager
@@ -22802,13 +22871,26 @@ static int wide_dbg(void) {
     return g_wide_dbg;
 }
 
+// Record a PENDING fused silu(gate)*up activation: the product is never
+// materialized; the nvf4 quantizer computes it in-register/smem. Only valid
+// when every consumer of this activation is NVFP4 (the caller guards).
+static int wide_quant_silu(const float *gate, const float *up, int K, int N) {
+    g_wq_pend_x = gate;                    // memo key (unique per production)
+    g_wq_pend_gate = gate; g_wq_pend_up = up;
+    g_wq_pend_K = K; g_wq_pend_N = N;
+    g_wq_fp6_done = 0;
+    nvf4_quant_invalidate();
+    return 0;
+}
+
 static int wide_proj(const tq_qmma_weight_t *w, float *out, int N) {
     if (w->nvf4) {
         if (!g_wq_pend_x || g_wq_pend_N != N || g_wq_pend_K != w->K) return -94;
-        int rc = nvf4_quant_ensure(g_wq_pend_x, g_wq_pend_K, N, g_qwen.stream);
+        int rc = nvf4_quant_ensure(g_wq_pend_x, g_wq_pend_K, N, g_qwen.stream,
+                                   g_wq_pend_gate, g_wq_pend_up);
         if (rc != 0) return rc;
         rc = nvf4_gemm_tiled(w, out, N, g_qwen.stream);
-        if (rc == 0 && wide_dbg()) {
+        if (rc == 0 && wide_dbg() && !g_wq_pend_gate) {
             cudaError_t e = cudaStreamSynchronize(g_qwen.stream);
             if (e != cudaSuccess) {
                 fprintf(stderr, "wide_proj NVFP4 M=%d K=%d Mt=%d Kt64=%d N=%d: %s\n",
