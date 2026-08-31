@@ -213,9 +213,18 @@ class BatchedEngine:
 
     def _materialize_prefix(self, ids):
         """Prefill `ids` into the single-stream state (wide path, ~2500 tok/s) so
-        later admissions snapshot it into their slot instead of re-prefilling."""
+        later admissions snapshot it into their slot instead of re-prefilling.
+        NEVER raises: the cache is an optimization. At big TQ_CTX the single-stream
+        state may not fit next to the pool (reset_state -4) -- degrade to no-cache
+        instead of wedging admission (which is exactly what happened at 262k)."""
         n = len(ids)
-        ck(self.L.qwn_reset_state(), "reset_state")
+        rc0 = self.L.qwn_reset_state()
+        if rc0 != 0:
+            self.pc_ids = []
+            self.pc_enabled = False
+            print(f"[engine] prefix cache disabled: reset_state rc={rc0} "
+                  f"(single-stream state does not fit at this TQ_CTX/pool size)", flush=True)
+            return
         am = ctypes.c_int(0)
         pos = 0
         while pos < n:
@@ -271,26 +280,35 @@ class BatchedEngine:
             if len(self.pref) >= self.max_prefill:
                 break                                   # cap concurrent prefills (TTFT fairness)
             self.q.pop(0); slot = self.free_slots.pop()
-            ck(self.L.qwn_paged_reset_slot(slot), "reset_slot")
-            free_blk -= need
-            cursor = 0
-            if self._prefix_hit(req):
-                rc = self.L.qwn_paged_load_client(slot, len(self.pc_ids) - 1)
-                if rc == 0:
-                    cursor = len(self.pc_ids)            # prefill only the suffix
-                    self.pc_hits += 1; self.pc_saved += cursor; self.pc_streak = 0
-                else:
-                    ck(self.L.qwn_paged_reset_slot(slot), "reset_slot")
-                    print(f"[engine] load_client rc={rc}, full prefill instead", flush=True)
-            else:
-                self.pc_misses += 1; self.pc_streak += 1
-                cand = self._prefix_candidate(req)
-                if cand is not None:
-                    self._materialize_prefix(cand)
-                    if self._prefix_hit(req) and self.L.qwn_paged_load_client(slot, len(cand) - 1) == 0:
-                        cursor = len(cand)
+            try:
+                ck(self.L.qwn_paged_reset_slot(slot), "reset_slot")
+                free_blk -= need
+                cursor = 0
+                if self._prefix_hit(req):
+                    rc = self.L.qwn_paged_load_client(slot, len(self.pc_ids) - 1)
+                    if rc == 0:
+                        cursor = len(self.pc_ids)        # prefill only the suffix
                         self.pc_hits += 1; self.pc_saved += cursor; self.pc_streak = 0
-            self.pref[slot] = [req, cursor]              # [request, prefill cursor]
+                    else:
+                        ck(self.L.qwn_paged_reset_slot(slot), "reset_slot")
+                        print(f"[engine] load_client rc={rc}, full prefill instead", flush=True)
+                else:
+                    self.pc_misses += 1; self.pc_streak += 1
+                    cand = self._prefix_candidate(req)
+                    if cand is not None:
+                        self._materialize_prefix(cand)
+                        if self._prefix_hit(req) and self.L.qwn_paged_load_client(slot, len(cand) - 1) == 0:
+                            cursor = len(cand)
+                            self.pc_hits += 1; self.pc_saved += cursor; self.pc_streak = 0
+                self.pref[slot] = [req, cursor]          # [request, prefill cursor]
+            except Exception as e:
+                # a failed admission must cost ONE request, not the slot and not the
+                # server: before this guard a raise here leaked the slot and left the
+                # request neither queued nor prefilling (client hung forever)
+                self.free_slots.append(slot)
+                req.err = f"admission failed: {e}"
+                req.done.set()
+                print(f"[engine] admit failed, request errored: {e}", flush=True)
 
     def _wave(self, dec_slots, pref_plan, cols_tok, cols_slot, cols_pos,
               seg_slot, seg_off, seg_len, seg_fin):
