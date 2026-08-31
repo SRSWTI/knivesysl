@@ -87,6 +87,60 @@ anchor, so a follow-up turn re-prefills only the suffix:
 the batched server has the same primitive for a shared system prompt: **340 --> 784 tok/s**
 at n=32, p50 latency 14.5 --> 6.2 s.
 
+### apc phase 3 — mid-prefill checkpoints, coalescing admission
+
+the hybrid cannot reuse kv at arbitrary block boundaries — the deltanet state is not
+rewindable — so a cache entry is a *checkpoint*: refcounted references to the full kv
+blocks plus a copy of the o(1) recurrent state (151.5 mb), saved mid-prefill at the two
+boundaries agentic traffic actually revisits: the lcp junction with the previous prompt
+(turn append) and `n_prompt - 8` (exact resend, trimmed so the next turn's `<think>`
+re-render still prefix-matches). admission adopts the deepest match and prefills only
+the suffix; same-prefix requests arriving while a donor is mid-prefill are held a few
+waves and adopt its checkpoint instead of racing it (6 concurrent arrivals = 2 full
+prefills, not 6). n-way lru, state slabs in one pool allocated on first save
+(`TQ_CKPT_POOL`, default 6 x 151.5 mb), every failure path degrades to a plain full
+prefill. save/evict/adopt are logged as `[ckpt]` lines.
+
+measured 2026-08-31 on the production build, same server with `--no-prefix-cache` as
+the control, real token counts (the bench's chars/token estimate undercounts — "24k"
+labels are 33.2k real tokens):
+
+| scenario | off | on | |
+|---|--:|--:|--:|
+| turn append, 36k -> 50.4k ctx (+2.9k/turn) | 5.97-8.22 s | 0.61-0.78 s flat | 9-11x |
+| session resend, all six depths | 5.6-8.2 s | **0.071-0.085 s** | **75-98x** |
+| 6-way fan-out, 33.2k shared, cold | wall 24.6 s | wall 5.26 s | 4.7x |
+| 6-way fan-out, checkpoint pre-exists | wall 24.6 s | **wall 0.67 s** | **37x** |
+| decode on adopted state | 58.0 tok/s cold | 58.1 tok/s | no penalty |
+
+adopted output is bit-identical at temperature 0 (probed live on the production build).
+
+![ttft vs depth](docs/apc/ttft_vs_depth.svg)
+![speedups](docs/apc/speedups.svg)
+![fan-out ladders](docs/apc/fanout_ladder.svg)
+![prefill throughput](docs/apc/prefill_curve.svg)
+![decode at depth](docs/apc/decode_depth.svg)
+
+vs vllm v1's hybrid apc (dense align-mode, 528-token blocks): a resend hit here
+recomputes 8 tokens against their <=527 (0% hit below 528 tokens — their #40696); a
+cached 33k session pins 0.15 gb of state here against ~4.7 gb dense [derived on our
+state shapes], which on a 32 gb card is ~6 resident sessions vs ~2; and they have no
+fan-out coalescing (tracking #26201). the honest losses: a mid-context divergence at a
+junction never seen as consecutive admissions pays a full prefill where their 528 grid
+reuses up to the divergence block (the lcp save catches any junction after one
+co-occurrence), and absolute single-stream decode (58-67 tok/s, dense ~27b active)
+sits below moe-class numbers on this card — apc stops you re-paying prefill, it does
+not move the weight-read roofline.
+
+![vs vllm](docs/apc/vs_vllm.svg)
+![the honest loss](docs/apc/divergence_loss.svg)
+
+production runs under `tools/serve_prod.sh` (restart wrapper, core dumps enabled); the
+engine exits after 8 consecutive step errors instead of zombie-serving a dead cuda
+context, and a stale pending-quant record can no longer leak across waves (the old
+`rc=-94` cascade — kernel-log-confirmed as xid 31 null-pointer writes — is gone: zero
+gpu faults under real 40-60k-token traffic on the fixed build).
+
 ### prefill — the gemm deficit is closed
 
 ![gemm headroom](assets/gemm-headroom.svg)
