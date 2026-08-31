@@ -146,6 +146,8 @@ decode:
 | prefill 4096, shared prefix, warm | 40282 | **174093** | **4.32x ours** |
 | prefill 16384 (conc 2) | 10104 | 6157 | 1.64x theirs |
 | prefill 65536 | 7162 | 4480 | 1.60x theirs |
+| prefill 98304 | 4834 | 3790 | 1.28x theirs |
+| prefill 131072 | **cannot (max-len 116032)** | **3259** | ours alone |
 | ttft p50, 8 clients x 2048 | 1.425 s | **1.230 s** | ours |
 | decode n=1, paged | 69.2 | 61.1 | 1.13x theirs |
 | decode n=1, fp6 mtp spec decode | 69.2 | **141.4** | **2.04x ours** |
@@ -304,7 +306,7 @@ turns.
 
 | flag | meaning |
 |---|---|
-| `TQ_CTX` | max context (engine cap 262144) |
+| `TQ_CTX` | max context (engine cap 262144; 131072 serves in 26.6 GB on the nvfp4 tier) |
 | `TQ_KV_Q4=1` | 4-bit k + e4m3 v cache (needed for 256k) |
 | `TQ_EMBED_FP8=2` | 6-bit embed table, -1.5 gib |
 | `TQ_PAGED_SPLIT` | force split-k on/off for paged decode attention |
@@ -365,8 +367,9 @@ see `CHANGELOG.md` for the measurement log behind every number here.
 2. long-context prefill attention, continued. depth-adaptive 64-row tiles + wide deep
    waves cut the 64k deficit 2.64x -> 1.68x (server 2677 -> 4267 tok/s); what remains
    is cp.async/tma staging of the quantized KV stream inside the attention loop
-3. the nvfp4 `all`-tier memory accounting: ~6.5 gb of device allocation is untracked,
-   which blocks 262k-context and high-concurrency pools that fp6 handles fine
+3. an nvfp4 gemv decode kernel: single-stream decode still refuses nvfp4 (-120 by
+   design); the memory story is fixed (the "6.5 gb bug" was an autotuner leak plus
+   the driver's local-memory pool, see CHANGELOG) and 262k contexts now allocate
 4. re-measure quality against nvfp4 ourselves instead of inheriting the number
 5. more models — the converter and the format are architecture-agnostic; the kernels
    are not, yet

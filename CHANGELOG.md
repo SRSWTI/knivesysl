@@ -11,6 +11,53 @@ driven by the same client (`tools/bench_endpoint.py`).
 
 ## Unreleased
 
+### 128k: memory truth, V staging, and the capability line
+
+**The "6.5 GB NVFP4 accounting bug" decomposed into a leak and a mirage.** The
+autotuner's shape cache sat AFTER its synthetic-activation malloc, so every cache
+hit leaked `d_x` -- 489 of 496 weights at 5-18 MB each. `TQ_MEM_TRACE=1` (new)
+shows the conversion itself was always clean (+4320 MiB actual vs +4359 claimed)
+and the remaining ~3.5 GB appears at the FIRST kernel launch: the driver's
+local-memory pool, a context-lifetime cost every tier pays. The old comparison
+measured FP6 before any launch, which is how a leak plus a driver pool read as
+"NVFP4 costs 2.9 GB". Post-launch truth on this build: FP6 leaves 9760 MiB free,
+NVFP4-`all` leaves **10578** -- the tier finally delivers its memory win, and
+262k contexts now allocate on every tier (NVFP4 single-stream decode still
+returns its documented -120).
+
+**V8 super-tile staged via cp.async** in the 64-row attention kernel: the copy
+issues before the QK phase and hides under K-dequant + mma; the V phase reads
+smem instead of scattered per-byte gathers. Bit-identical (64/64 argmax vs the
+unstaged 32-row kernel); 64k 4813 -> 4866, 128k 3385 -> 3422.
+
+**First 128k measurements** (`all` tier, unlocked by the memory fix):
+
+| scenario | vllm | knivesysl | |
+|---|--:|--:|---|
+| prefill 98304, server | 4834 | 3790 | 1.28x theirs |
+| prefill 114688 (their max-len 116032) | 4491 | -- | their ceiling |
+| prefill 131072, server | **HTTP 400** | **3259** | ours alone |
+| prefill 131072, engine | cannot | 3422 | -- |
+| decode @131072 ctx | cannot | 25.7 ms/step | -- |
+
+vLLM's first 114688 response on a fresh server is 4491 tok/s (an earlier 8413
+reading was prefix-cache contamination -- 13.6 s wall for MORE tokens than a
+20.3 s 96k run; discarded). At 128k this checkpoint+config cannot answer at all:
+`--max-model-len 140000` does not fit at util 0.92 and 116032 is its ceiling,
+while this engine serves 131072 in 26.6 GB with 4.4 GB to spare. Note the
+long-context deficit narrows as depth grows: 1.64x at 16k, 1.60x at 64k,
+1.28x at 96k.
+
+Quality spot check (temp 0, NVFP4-`all` + tf32 scan): the linked-list merge
+prompt produces correct, idiomatic, documented code -- indistinguishable in
+correctness from vLLM's output on the same prompt. Needle at a 128k haystack
+(FP6, the tier whose single-stream decode the harness needs): 2/3 -- depths
+4000 and 64000 RECOVERED, depth 120000 flips into a think-preamble and
+exhausts the 32-token answer window (the depth-8000 near-tie class; this
+depth was never measured before, so it is a data point, not a regression). GEMM stages=4 re-confirmed dead (110 KB smem vs the 101 KB
+opt-in cap, already screened by the tuner); the producer/consumer rewrite
+remains the recorded next step for the warm 2-4k cells.
+
 ### Long-context attention: depth-adaptive tiles, wide deep waves
 
 The 64k profile put the wide-prefill attention at **54.1%** of the whole prefill;
