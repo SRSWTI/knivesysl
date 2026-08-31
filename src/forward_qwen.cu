@@ -11512,8 +11512,14 @@ static __device__ __forceinline__ void tq_tma_2d(void *smem, const CUtensorMap *
 // ---------------------------------------------------------------- the GEMM (TMA)
 // Same block tile and warp partition as the cp.async kernel: 128 rows x NG*8 cols,
 // 8 warps as WM(M) x (8/WM)(N). Only the staging mechanism differs.
-template <int NG, int STAGES, int WM>
-__global__ __launch_bounds__(256, 1)
+// WS=1: warp-specialized producer. Warps 0-7 are PURE consumers (the embedded
+// tid==0 refill made warp 0 the straggler-collector: it waited for all 8 warps'
+// empty[] arrivals before issuing, every stage, inside its own compute path).
+// A 9th warp (threads 256-287) runs the refill loop against the SAME barriers:
+// full[s] completed by the TMA transfer (count 1), empty[s] armed by the 8
+// consumer warps. Math order identical -> bit-identical output.
+template <int NG, int STAGES, int WM, int WS = 0>
+__global__ __launch_bounds__(WS ? 288 : 256, 1)
 void k_tq_nvf4_gemm_tma(const __grid_constant__ CUtensorMap mapA,
                      const __grid_constant__ CUtensorMap mapB,
                      float *__restrict__ out, const float *__restrict__ wglobal,
@@ -11583,8 +11589,22 @@ void k_tq_nvf4_gemm_tma(const __grid_constant__ CUtensorMap mapA,
     const int a_sf_word = 128 + ((lane >> 2) + 8 * (lane & 1));
     const int b_sf_word = 64 + (lane >> 2);
 
-    if (tid == 0)
+    if (tid == (WS ? 256 : 0))
         for (int s = 0; s < STAGES && s < nst; s++) issue(s, s);
+
+    if constexpr (WS != 0) {
+        if (warp >= 8) {                          // producer warp: refill only, no math
+            if (lane == 0)
+                for (int stg = STAGES; stg < nst; stg++) {
+                    const int buf = stg % STAGES;
+                    // wait for generation (stg/STAGES - 1)'s consumers to release buf
+                    const uint32_t phase = (uint32_t)((stg / STAGES - 1) & 1);
+                    tq_mbar_wait(&empty[buf], phase);
+                    issue(buf, stg);
+                }
+            return;
+        }
+    }
 
     for (int stg = 0; stg < nst; stg++) {
         const int buf = stg % STAGES;
@@ -11624,9 +11644,11 @@ void k_tq_nvf4_gemm_tma(const __grid_constant__ CUtensorMap mapA,
         // Release this buffer: one arrive per warp, no CTA-wide fence. Warps that got
         // here first proceed straight to the next stage's full[] wait.
         if (lane == 0) tq_mbar_arrive(&empty[buf]);
-        if (tid == 0 && stg + STAGES < nst) {
-            tq_mbar_wait(&empty[buf], phase);       // all 8 warps have released buf
-            issue(buf, stg + STAGES);
+        if constexpr (WS == 0) {
+            if (tid == 0 && stg + STAGES < nst) {
+                tq_mbar_wait(&empty[buf], phase);   // all 8 warps have released buf
+                issue(buf, stg + STAGES);
+            }
         }
     }
 
@@ -13589,6 +13611,12 @@ static int tq_nvf4_bmap_ensure(const uint32_t *base, int groups, int Kt64, int N
 }
 // TQ_NVFP4_TMA=0 reverts to cp.async. TMA wins because the copy costs no warp AND the
 // per-stage CTA barrier becomes per-warp mbarrier waits.
+// Warp-specialized producer for the TMA GEMM: TQ_NVF4_WS (default off until measured).
+static int tq_nvf4_ws(void) {
+    static int c = -1;
+    if (c < 0) { const char *e = getenv("TQ_NVF4_WS"); c = (e && e[0]) ? !!atoi(e) : 0; }
+    return c;
+}
 static int tq_nvf4_use_tma(void) {
     static int c = -1;
     if (c < 0) { const char *e = getenv("TQ_NVFP4_TMA"); c = (e && !atoi(e)) ? 0 : 1; }
@@ -13597,13 +13625,13 @@ static int tq_nvf4_use_tma(void) {
 
 #define TQ_NVF4_TARGS *w->nvf4_map, g_nvf4_bmap, dst, w->d_nvf4_global, M, Mt, Kt64, \
                       nvar, per, ks, brow
-#define TQ_NVF4_DISPATCH_T(S) switch (G) {                                                     \
-    case 1:  k_tq_nvf4_gemm_tma<1, S,8><<<gr,256,tbytes,st>>>(TQ_NVF4_TARGS); break;           \
-    case 2:  k_tq_nvf4_gemm_tma<2, S,4><<<gr,256,tbytes,st>>>(TQ_NVF4_TARGS); break;           \
-    case 4:  k_tq_nvf4_gemm_tma<4, S,2><<<gr,256,tbytes,st>>>(TQ_NVF4_TARGS); break;           \
-    case 8:  k_tq_nvf4_gemm_tma<8, S,2><<<gr,256,tbytes,st>>>(TQ_NVF4_TARGS); break;           \
-    case 16: k_tq_nvf4_gemm_tma<16,S,2><<<gr,256,tbytes,st>>>(TQ_NVF4_TARGS); break;           \
-    default: k_tq_nvf4_gemm_tma<32,S,2><<<gr,256,tbytes,st>>>(TQ_NVF4_TARGS); break; }
+#define TQ_NVF4_DISPATCH_T(S, WSV) switch (G) {                                                \
+    case 1:  k_tq_nvf4_gemm_tma<1, S,8,WSV><<<gr,256+32*WSV,tbytes,st>>>(TQ_NVF4_TARGS); break; \
+    case 2:  k_tq_nvf4_gemm_tma<2, S,4,WSV><<<gr,256+32*WSV,tbytes,st>>>(TQ_NVF4_TARGS); break; \
+    case 4:  k_tq_nvf4_gemm_tma<4, S,2,WSV><<<gr,256+32*WSV,tbytes,st>>>(TQ_NVF4_TARGS); break; \
+    case 8:  k_tq_nvf4_gemm_tma<8, S,2,WSV><<<gr,256+32*WSV,tbytes,st>>>(TQ_NVF4_TARGS); break; \
+    case 16: k_tq_nvf4_gemm_tma<16,S,2,WSV><<<gr,256+32*WSV,tbytes,st>>>(TQ_NVF4_TARGS); break; \
+    default: k_tq_nvf4_gemm_tma<32,S,2,WSV><<<gr,256+32*WSV,tbytes,st>>>(TQ_NVF4_TARGS); break; }
 
 #define TQ_NVF4_ARGS dst, w->d_nvf4_a, b, w->d_nvf4_global, M, Mt, Kt64, nvar, per, ks
 #define TQ_NVF4_DISPATCH_G(S) switch (G) {                                                    \
@@ -13658,6 +13686,10 @@ static int launch_nvf4_gemm_cfg(float *out, const tq_qmma_weight_t *w, const uin
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)mt);   \
             cudaFuncSetAttribute(k_tq_nvf4_gemm_tma<NGV, 3, WMV>,                         \
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)mt);   \
+            cudaFuncSetAttribute(k_tq_nvf4_gemm_tma<NGV, 2, WMV, 1>,                      \
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)mt);   \
+            cudaFuncSetAttribute(k_tq_nvf4_gemm_tma<NGV, 3, WMV, 1>,                      \
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)mt);   \
         } while (0)
         TQ_NVF4_PRIME(1, 8); TQ_NVF4_PRIME(2, 4); TQ_NVF4_PRIME(4, 2);
         TQ_NVF4_PRIME(8, 2); TQ_NVF4_PRIME(16, 2); TQ_NVF4_PRIME(32, 2);
@@ -13674,8 +13706,9 @@ static int launch_nvf4_gemm_cfg(float *out, const tq_qmma_weight_t *w, const uin
     const int tma = tq_nvf4_use_tma() && w->nvf4_map
                  && tq_nvf4_bmap_ensure(g_nvf4_b, g_nvf4_b_groups, Kt64, G);
     if (tma) {
-        if (stages == 2)  { TQ_NVF4_DISPATCH_T(2) }
-        else              { TQ_NVF4_DISPATCH_T(3) }
+        const int wsv = tq_nvf4_ws();
+        if (stages == 2)  { if (wsv) { TQ_NVF4_DISPATCH_T(2, 1) } else { TQ_NVF4_DISPATCH_T(2, 0) } }
+        else              { if (wsv) { TQ_NVF4_DISPATCH_T(3, 1) } else { TQ_NVF4_DISPATCH_T(3, 0) } }
     } else {
         if (stages == 2) { TQ_NVF4_DISPATCH_G(2) }
         else             { TQ_NVF4_DISPATCH_G(3) }
@@ -25152,11 +25185,25 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
             TQ_WV_CK("delta_in_proj");
             for (int k = 0; k < K; k++) {     // per-client conv + chunkwise DeltaNet over the segment
                 int off = seg_off[k], n = seg_len[k], slot = seg_slot[k];
-                k_tq_linear_conv_chunk<<<(conv_dim + 255) / 256, 256, 0, g_qwen.stream>>>(
-                    g_wide_qkv + (size_t)off * conv_dim, g_pg_conv[L] + (size_t)slot * conv_f,
-                    g_wide_qkv + (size_t)off * conv_dim, l->d_linear_conv1d, conv_dim, g_qwen.linear_conv_kernel_dim, n);
+                // Position-parallel conv (grid y = n+1), the same kernel the contiguous
+                // path uses: the serial-per-channel k_tq_linear_conv_chunk ran 40 blocks
+                // total with a 2048-iteration dependent loop per thread -- 755 ms of a
+                // 5.1 s paged 32k prefill vs 83 ms for this kernel (bit-identical taps,
+                // sum order, and state math; out must not alias x, hence g_wide_conv).
+                float *cvout = g_wide_conv + (size_t)off * conv_dim;
+                if (g_qwen.linear_conv_kernel_dim <= 8) {
+                    k_tq_linear_conv_update_wide<<<dim3((conv_dim + 255) / 256, n + 1), 256, 0, g_qwen.stream>>>(
+                        cvout, g_pg_conv[L] + (size_t)slot * conv_f,
+                        g_wide_qkv + (size_t)off * conv_dim, l->d_linear_conv1d,
+                        conv_dim, g_qwen.linear_conv_kernel_dim, n);
+                } else {
+                    k_tq_linear_conv_chunk<<<(conv_dim + 255) / 256, 256, 0, g_qwen.stream>>>(
+                        g_wide_qkv + (size_t)off * conv_dim, g_pg_conv[L] + (size_t)slot * conv_f,
+                        g_wide_qkv + (size_t)off * conv_dim, l->d_linear_conv1d, conv_dim, g_qwen.linear_conv_kernel_dim, n);
+                    cvout = g_wide_qkv + (size_t)off * conv_dim;
+                }
                 if (launch_deltanet_chunk_hs(8, 2, 8, g_wide_lcore + (size_t)off * value_dim,
-                        g_pg_recur[L] + (size_t)slot * recur_f, g_wide_qkv + (size_t)off * conv_dim,
+                        g_pg_recur[L] + (size_t)slot * recur_f, cvout,
                         g_wide_z + (size_t)off * value_dim, g_wide_b + (size_t)off * lvh, g_wide_a + (size_t)off * lvh,
                         l->d_linear_A_log, l->d_linear_dt_bias, l->d_linear_norm, n, lvh, lkh, ld,
                         g_qwen.eps, g_qwen.stream) != 0) return -99;
