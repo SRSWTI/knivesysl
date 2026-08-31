@@ -362,14 +362,25 @@ see `CHANGELOG.md` for the measurement log behind every number here.
 
 ## where this is going
 
-1. re-run the guidellm sustained-arrival comparison against vllm; the point-benchmark
-   matrix (bench_endpoint) is measured and in `CHANGELOG.md`, sustained arrival is not
-2. long-context prefill attention, continued. depth-adaptive 64-row tiles + wide deep
-   waves cut the 64k deficit 2.64x -> 1.68x (server 2677 -> 4267 tok/s); what remains
-   is cp.async/tma staging of the quantized KV stream inside the attention loop
-3. an nvfp4 gemv decode kernel: single-stream decode still refuses nvfp4 (-120 by
-   design); the memory story is fixed (the "6.5 gb bug" was an autotuner leak plus
-   the driver's local-memory pool, see CHANGELOG) and 262k contexts now allocate
-4. re-measure quality against nvfp4 ourselves instead of inheriting the number
-5. more models — the converter and the format are architecture-agnostic; the kernels
-   are not, yet
+**now: the 16k-96k prefill attention gap** - gqa-shared cta rewrite of the wide
+attention kernel (attention is 54% of a 64k prefill and re-reads kv 6x; one cta
+per kv head with the 6 query heads packed into the mma's m dimension).
+
+**next steps, in order:**
+
+1. nvfp4 gemv decode kernel - lift the single-stream `-120` guard so the nvfp4
+   tiers get the fp6 spec-decode path (~60 -> ~135+ tok/s interactive)
+2. warm unique-prefill gemm: the tma producer/consumer pipeline rewrite
+   (cutlass-class scheduling; closes the 1.28-2.13x warm 2-4k cells)
+3. **the 4-5x ladder** (after vllm is beaten everywhere) - the dense fp4 issue
+   roof on this card is 2051 tf/s (~38k tok/s ceiling), so the leap must change
+   the work, not just the efficiency:
+   - 2:4 structured sparsity (`mma.sp`, `TQ_FLAG_SPARSE_24_E2M3` reserved): x2 roof
+   - whole-prompt waves (weights read once per prefill): x1.2-1.3, unblocked by
+     the gqa attention rewrite above
+   - per-layer persistent megakernel (activations never touch dram): x1.2-1.4
+   - deltanet-scan/gemm co-scheduling on partitioned sms: x1.10-1.15
+   - l2 weight prefetch + pdl kernel-tail overlap: x1.03-1.05
+4. more models - the converter and the format are architecture-agnostic; the
+   kernels are not, yet
+
