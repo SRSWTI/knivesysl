@@ -20,6 +20,9 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--url", default="http://127.0.0.1:8000")
 ap.add_argument("--label", required=True)
 ap.add_argument("--gen", type=int, default=256)
+ap.add_argument("--temp", type=float, default=0.0, help="sampled-verify probe (seeded per client)")
+ap.add_argument("--workload", choices=["repetitive", "prose"], default="repetitive",
+                help="prose = ngram-hostile (probes the EMA/depth gating cost floor)")
 ap.add_argument("--pool-tokens", type=int, default=230000, help="num_blocks*page budget")
 ap.add_argument("--slots", type=int, default=4)
 args = ap.parse_args()
@@ -34,14 +37,20 @@ NS = [1, 2, 4]
 def prompt_for(ctx_tok, ci):
     need = int(ctx_tok * CHR)
     off = (ci * 49999 + ctx_tok * 7) % max(1, len(corpus) - need - 1)
+    if args.workload == "prose":
+        return ("Background reading:\n" + corpus[off:off + need]
+                + "\nNow write an ORIGINAL essay (not quoting the text above) about the"
+                  " long-term maintainability of large software systems. At least 400 words.")
     return ("Repository file contents:\n" + corpus[off:off + need]
             + "\nContinue writing the file content above, staying consistent with its style.")
 
 
-def stream_one(prompt, out):
-    body = {"model": "ksl", "max_tokens": args.gen, "temperature": 0, "stream": True,
+def stream_one(prompt, out, ci=0):
+    body = {"model": "ksl", "max_tokens": args.gen, "temperature": args.temp, "stream": True,
             "ignore_eos": True, "messages": [{"role": "user", "content": prompt}],
             "chat_template_kwargs": {"enable_thinking": False}}
+    if args.temp > 0:
+        body["seed"] = 42 + ci
     req = urllib.request.Request(args.url + "/v1/chat/completions",
                                  json.dumps(body).encode(), {"Content-Type": "application/json"})
     t0 = time.time(); times = []
@@ -54,9 +63,12 @@ def stream_one(prompt, out):
             for c in d.get("choices", []):
                 if c.get("delta", {}).get("content") or c.get("delta", {}).get("reasoning_content"):
                     times.append(time.time())
+    itl = sorted(times[i] - times[i - 1] for i in range(1, len(times)))
     out.append({"ttft": times[0] - t0 if times else None,
                 "n_tok": len(times),
-                "dec_s": (times[-1] - times[0]) if len(times) > 1 else 0.0})
+                "dec_s": (times[-1] - times[0]) if len(times) > 1 else 0.0,
+                "itl_p50": itl[len(itl) // 2] * 1e3 if itl else None,
+                "itl_p99": itl[int(len(itl) * 0.99)] * 1e3 if itl else None})
 
 
 def health():
@@ -66,7 +78,7 @@ def health():
 def run_cell(ctx, n):
     h0 = health()
     outs = []
-    th = [threading.Thread(target=stream_one, args=(prompt_for(ctx, i), outs)) for i in range(n)]
+    th = [threading.Thread(target=stream_one, args=(prompt_for(ctx, i), outs, i)) for i in range(n)]
     t0 = time.time()
     for t in th: t.start()
     for t in th: t.join()
@@ -82,7 +94,9 @@ def run_cell(ctx, n):
             "per_req_tok_s": sum(dec) / len(dec) if dec else 0.0,
             "agg_tok_s": toks / max(1e-9, wall - max((o["ttft"] or 0) for o in outs)),
             "spec_rounds": rounds,
-            "tok_per_round": committed / rounds if rounds else None}
+            "tok_per_round": committed / rounds if rounds else None,
+            "itl_p50_ms": max((o["itl_p50"] or 0) for o in outs),
+            "itl_p99_ms": max((o["itl_p99"] or 0) for o in outs)}
 
 
 def main():
