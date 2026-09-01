@@ -45,6 +45,8 @@ def load_lib(path):
     L.qwn_paged_init.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]; L.qwn_paged_init.restype = ctypes.c_int
     L.qwn_paged_free.restype = ctypes.c_int
     L.qwn_paged_reset_slot.argtypes = [ctypes.c_int]; L.qwn_paged_reset_slot.restype = ctypes.c_int
+    L.qwn_paged_set_sampling.argtypes = [ctypes.c_int, ctypes.c_float, ctypes.c_ulonglong]
+    L.qwn_paged_set_sampling.restype = ctypes.c_int
     L.qwn_paged_load_client.argtypes = [ctypes.c_int, ctypes.c_int]; L.qwn_paged_load_client.restype = ctypes.c_int
     L.qwn_paged_ckpt_save.argtypes = [ctypes.c_int, ctypes.c_int]; L.qwn_paged_ckpt_save.restype = ctypes.c_int
     L.qwn_paged_ckpt_adopt.argtypes = [ctypes.c_int, ctypes.c_int]; L.qwn_paged_ckpt_adopt.restype = ctypes.c_int
@@ -121,10 +123,11 @@ def ck(r, what):
 class Request:
     __slots__ = ("ids", "max_new", "eos", "out", "done", "slot", "pos", "next_tok",
                  "started", "t_admit", "t_first", "t_done", "t_tok", "n_prompt", "err",
-                 "progress", "cancel")
+                 "progress", "cancel", "temp", "seed")
 
-    def __init__(self, ids, max_new, eos):
+    def __init__(self, ids, max_new, eos, temp=0.0, seed=0):
         self.ids = ids; self.max_new = max_new; self.eos = set(eos)
+        self.temp = float(temp); self.seed = int(seed) & 0xFFFFFFFFFFFFFFFF
         self.out = []; self.done = threading.Event(); self.slot = -1
         self.pos = 0; self.next_tok = 0; self.started = False
         self.t_admit = self.t_first = self.t_done = self.t_tok = 0.0; self.n_prompt = len(ids); self.err = None
@@ -184,8 +187,8 @@ class BatchedEngine:
         ck(self.L.qwn_paged_stats(ctypes.byref(fb), ctypes.byref(tb), ctypes.byref(pg), ctypes.byref(mb)), "stats")
         return fb.value, tb.value, pg.value, mb.value
 
-    def submit(self, ids, max_new, eos):
-        req = Request(ids, max_new, eos)
+    def submit(self, ids, max_new, eos, temp=0.0, seed=0):
+        req = Request(ids, max_new, eos, temp, seed)
         with self.cv:
             self.q.append(req)
             self.cv.notify()
@@ -318,6 +321,8 @@ class BatchedEngine:
             self.q.pop(qi); slot = self.free_slots.pop()
             try:
                 ck(self.L.qwn_paged_reset_slot(slot), "reset_slot")
+                if req.temp > 0.0:
+                    ck(self.L.qwn_paged_set_sampling(slot, req.temp, req.seed), "set_sampling")
                 free_blk -= need
                 cursor = 0
                 hit = self._ck_match(req)
@@ -876,7 +881,15 @@ def make_handler(eng, tok, args):
             # sending max_tokens + ignore_eos, so every request does equal work.
             req_eos = [] if bool(body.get("ignore_eos", False)) else eos
             want_usage = bool((body.get("stream_options") or {}).get("include_usage"))
-            req = eng.submit(list(ids), max_new, req_eos)
+            # Sampling: an omitted temperature keeps the engine's greedy default
+            # (agentic clients here want determinism + APC-friendly replays);
+            # explicit temperature>0 samples engine-side with the spec-sampler
+            # semantics (temp-scaled + TQ_MIN_P tail floor + replayable seed).
+            # top_p/top_k are not implemented by the v1 sampler (min-p governs the
+            # tail instead) and are accepted-but-ignored, like serve_openai.
+            temp = max(0.0, float(body.get("temperature") or 0.0))
+            seed = int(body.get("seed") or int.from_bytes(os.urandom(8), "little"))
+            req = eng.submit(list(ids), max_new, req_eos, temp, seed)
             cid = f"chatcmpl-{int(time.time()*1000)}"
 
             if stream:

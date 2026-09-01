@@ -23696,6 +23696,78 @@ __global__ void k_tq_batched_argmax(int *out_ids, const float *logits, int V, in
     if (tid == 0) out_ids[c] = si[0];
 }
 
+// Per-client sampler over [N x V] logits: row r draws with (temps[r], seeds[r],
+// ctrs[r]). temp <= 0 rows reproduce k_tq_batched_argmax EXACTLY (same traversal,
+// same lowest-index tie-break), so an all-greedy launch is bit-identical. Sampled
+// rows use the spec sampler's semantics (k_tq_spec_sample_descend): temp-scaled
+// logits with the TQ_MIN_P floor applied AFTER scaling, then a Gumbel(0,1) argmax
+// draw via counter-based tq_u01(seed, ctr, salt=1, v) -- replayable: the same
+// (seed, token position) always yields the same token.
+__global__ void k_tq_batched_sample(int *out_ids, const float *logits, int V, int N,
+                                    const float *temps, const unsigned long long *seeds,
+                                    const int *ctrs, float logp_min) {
+    int c = blockIdx.x;
+    if (c >= N) return;
+    const float *row = logits + (size_t)c * V;
+    int tid = threadIdx.x, bs = blockDim.x;
+    float temp = temps[c];
+    __shared__ float sv[256];
+    __shared__ int si[256];
+    if (temp <= 0.0f) {                     // greedy: verbatim k_tq_batched_argmax
+        float best = -3.402823466e38f; int besti = 0;
+        for (int i = tid; i < V; i += bs) {
+            float v = row[i];
+            if (v > best) { best = v; besti = i; }
+        }
+        sv[tid] = best; si[tid] = besti;
+        __syncthreads();
+        for (int s = bs >> 1; s > 0; s >>= 1) {
+            if (tid < s) {
+                if (sv[tid + s] > sv[tid] || (sv[tid + s] == sv[tid] && si[tid + s] < si[tid])) {
+                    sv[tid] = sv[tid + s]; si[tid] = si[tid + s];
+                }
+            }
+            __syncthreads();
+        }
+        if (tid == 0) out_ids[c] = si[0];
+        return;
+    }
+    // pass 1: row max (the min-p floor is relative to the scaled peak)
+    float vmax = -3.402823466e38f;
+    for (int i = tid; i < V; i += bs) vmax = fmaxf(vmax, row[i]);
+    sv[tid] = vmax;
+    __syncthreads();
+    for (int s = bs >> 1; s > 0; s >>= 1) {
+        if (tid < s) sv[tid] = fmaxf(sv[tid], sv[tid + s]);
+        __syncthreads();
+    }
+    vmax = sv[0];
+    __syncthreads();
+    // pass 2: Gumbel-max over the min-p-floored, temp-scaled distribution
+    float inv_tau = 1.0f / temp;
+    uint64_t seed = (uint64_t)seeds[c];
+    uint32_t ctr = (uint32_t)ctrs[c];
+    float best = -3.402823466e38f; int besti = 0x7fffffff;
+    for (int i = tid; i < V; i += bs) {
+        float x = (row[i] - vmax) * inv_tau;
+        if (x < logp_min) continue;         // min-p: drop the inflated low-prob tail
+        float u = tq_u01(seed, ctr, 1u, (uint32_t)i);
+        x += -__logf(-__logf(fmaxf(u, 1.0e-20f)));
+        if (x > best || (x == best && i < besti)) { best = x; besti = i; }
+    }
+    sv[tid] = best; si[tid] = besti;
+    __syncthreads();
+    for (int s = bs >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (sv[tid + s] > sv[tid] || (sv[tid + s] == sv[tid] && si[tid + s] < si[tid])) {
+                sv[tid] = sv[tid + s]; si[tid] = si[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) out_ids[c] = (si[0] == 0x7fffffff) ? 0 : si[0];
+}
+
 // Per-client persistent state (lives across decode steps). g_wide_* hold the per-step
 // activation columns (reused). Full-attn layers: per-client fp32 KV slab. Linear layers:
 // per-client DeltaNet recurrent + conv state. Indexed by layer; NULL for the other type.
@@ -24887,6 +24959,14 @@ static float   *g_pg_recur[TQ_MAX_LAYERS] = {0};
 static float   *g_pg_conv[TQ_MAX_LAYERS] = {0};
 static int     *g_block_table = NULL, *h_block_table = NULL;
 static int     *g_slot_ids = NULL, *g_iota = NULL;
+// Per-slot sampling params (0 = greedy; set via qwn_paged_set_sampling, cleared by
+// reset_slot). h_samp_* are the host truth; g_samp_* are per-ROW device staging
+// marshaled only when a launch actually has a sampled row.
+static float *h_samp_temp = NULL;
+static unsigned long long *h_samp_seed = NULL;
+static float *g_samp_temp = NULL;
+static unsigned long long *g_samp_seed = NULL;
+static int   *g_samp_ctr = NULL;
 static int     *g_pf_colslot = NULL; static int g_pf_colslot_cap = 0;  // prefill wave column->slot
 static float   *g_pg_logits = NULL;
 static int     *g_pg_argmax = NULL;
@@ -24907,6 +24987,9 @@ static void paged_free_all(void) {
     if (g_block_table) { cudaFree(g_block_table); g_block_table = NULL; }
     if (g_slot_ids) { cudaFree(g_slot_ids); g_slot_ids = NULL; }
     if (g_iota) { cudaFree(g_iota); g_iota = NULL; }
+    if (g_samp_temp) { cudaFree(g_samp_temp); g_samp_temp = NULL; }
+    if (g_samp_seed) { cudaFree(g_samp_seed); g_samp_seed = NULL; }
+    if (g_samp_ctr) { cudaFree(g_samp_ctr); g_samp_ctr = NULL; }
     if (g_pf_colslot) { cudaFree(g_pf_colslot); g_pf_colslot = NULL; } g_pf_colslot_cap = 0;
     if (g_attn_pacc) { cudaFree(g_attn_pacc); g_attn_pacc = NULL; } g_attn_pacc_n = 0;
     if (g_attn_pml) { cudaFree(g_attn_pml); g_attn_pml = NULL; } g_attn_pml_n = 0;
@@ -24915,6 +24998,8 @@ static void paged_free_all(void) {
     if (h_block_table) { free(h_block_table); h_block_table = NULL; }
     if (h_free) { free(h_free); h_free = NULL; }
     if (h_slot_nb) { free(h_slot_nb); h_slot_nb = NULL; }
+    if (h_samp_temp) { free(h_samp_temp); h_samp_temp = NULL; }
+    if (h_samp_seed) { free(h_samp_seed); h_samp_seed = NULL; }
     if (h_blk_ref) { free(h_blk_ref); h_blk_ref = NULL; }
     void paged_ckpt_drop_all(void);
     paged_ckpt_drop_all();
@@ -24987,11 +25072,17 @@ extern "C" int qwn_paged_init(int max_slots, int num_blocks, int page) {
     if (cudaMalloc(&g_iota, (size_t)max_slots * sizeof(int)) != cudaSuccess) { paged_free_all(); return -6; }
     if (cudaMalloc(&g_pg_logits, (size_t)max_slots * g_qwen.V * sizeof(float)) != cudaSuccess) { paged_free_all(); return -6; }
     if (cudaMalloc(&g_pg_argmax, (size_t)max_slots * sizeof(int)) != cudaSuccess) { paged_free_all(); return -6; }
+    int samp_rows = max_slots > 256 ? max_slots : 256;    // prefill waves seed <= 256 segments
+    if (cudaMalloc(&g_samp_temp, (size_t)samp_rows * sizeof(float)) != cudaSuccess) { paged_free_all(); return -6; }
+    if (cudaMalloc(&g_samp_seed, (size_t)samp_rows * sizeof(unsigned long long)) != cudaSuccess) { paged_free_all(); return -6; }
+    if (cudaMalloc(&g_samp_ctr, (size_t)samp_rows * sizeof(int)) != cudaSuccess) { paged_free_all(); return -6; }
     h_block_table = (int *)malloc(btn * sizeof(int));
     h_free = (int *)malloc((size_t)num_blocks * sizeof(int));
     h_slot_nb = (int *)malloc((size_t)max_slots * sizeof(int));
     h_blk_ref = (int *)malloc((size_t)num_blocks * sizeof(int));
-    if (!h_block_table || !h_free || !h_slot_nb || !h_blk_ref) { paged_free_all(); return -7; }
+    h_samp_temp = (float *)calloc((size_t)max_slots, sizeof(float));
+    h_samp_seed = (unsigned long long *)calloc((size_t)max_slots, sizeof(unsigned long long));
+    if (!h_block_table || !h_free || !h_slot_nb || !h_blk_ref || !h_samp_temp || !h_samp_seed) { paged_free_all(); return -7; }
     for (int i = 0; i < num_blocks; i++) h_blk_ref[i] = 0;
     for (size_t i = 0; i < btn; i++) h_block_table[i] = -1;
     for (int i = 0; i < num_blocks; i++) h_free[i] = num_blocks - 1 - i;   // pop low ids first
@@ -25010,6 +25101,17 @@ extern "C" int qwn_paged_init(int max_slots, int num_blocks, int page) {
 
 extern "C" int qwn_paged_free(void) { paged_free_all(); return 0; }
 
+// Per-slot sampling for the paged decode/seed path. temp 0 = greedy (bit-exact
+// default path untouched); temp > 0 = spec-sampler semantics (temp-scaled logits,
+// TQ_MIN_P floor, Gumbel draw). The RNG counter is the produced token's position,
+// so a request replayed with the same seed and prompt emits the same tokens.
+extern "C" int qwn_paged_set_sampling(int slot, float temp, unsigned long long seed) {
+    if (!g_pg_ready || slot < 0 || slot >= g_pg_maxslots) return -1;
+    h_samp_temp[slot] = (temp < 0.0f) ? 0.0f : temp;
+    h_samp_seed[slot] = seed;
+    return 0;
+}
+
 // Free a slot's blocks back to the pool and zero its DeltaNet state (slot is now reusable).
 extern "C" int qwn_paged_reset_slot(int slot) {
     if (!g_pg_ready || slot < 0 || slot >= g_pg_maxslots) return -1;
@@ -25019,6 +25121,7 @@ extern "C" int qwn_paged_reset_slot(int slot) {
         row[lb] = -1;
     }
     h_slot_nb[slot] = 0;
+    if (h_samp_temp) { h_samp_temp[slot] = 0.0f; h_samp_seed[slot] = 0ull; }
     size_t recur_f = (size_t)batched_recur_floats(), conv_f = (size_t)batched_conv_floats();
     for (int L = 0; L < g_qwen.L; L++) {
         if (g_qwen.layer_types[L] != TQ_LAYER_LINEAR_ATTENTION) continue;
@@ -25345,7 +25448,24 @@ static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, 
         !g_qwen.lm_head.word_major && can_use_qmma_sf_weight(&g_qwen.lm_head) && !g_qwen.lm_head.row_major) {
         if ((ret = wide_quant_input(g_wide_norm, H, N)) != 0) return -78;
         if ((ret = wide_proj(&g_qwen.lm_head, g_pg_logits, N)) != 0) return -78;
-        k_tq_batched_argmax<<<N, 256, 0, g_qwen.stream>>>(g_pg_argmax, g_pg_logits, g_qwen.V, N);
+        int any_samp = 0;
+        for (int j = 0; j < N && j < 256; j++)
+            if (h_samp_temp[slot_ids_h[j]] > 0.0f) { any_samp = 1; break; }
+        if (any_samp && N <= 256) {
+            static float hs_t[256]; static unsigned long long hs_s[256]; static int hs_c[256];
+            for (int j = 0; j < N; j++) {
+                int s = slot_ids_h[j];
+                hs_t[j] = h_samp_temp[s]; hs_s[j] = h_samp_seed[s]; hs_c[j] = positions[j] + 1;
+            }
+            cudaMemcpyAsync(g_samp_temp, hs_t, (size_t)N * sizeof(float), cudaMemcpyHostToDevice, g_qwen.stream);
+            cudaMemcpyAsync(g_samp_seed, hs_s, (size_t)N * sizeof(unsigned long long), cudaMemcpyHostToDevice, g_qwen.stream);
+            cudaMemcpyAsync(g_samp_ctr, hs_c, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+            float mp = spec_min_p();
+            k_tq_batched_sample<<<N, 256, 0, g_qwen.stream>>>(g_pg_argmax, g_pg_logits, g_qwen.V, N,
+                g_samp_temp, g_samp_seed, g_samp_ctr, (mp > 0.0f) ? logf(mp) : -3.0e38f);
+        } else {
+            k_tq_batched_argmax<<<N, 256, 0, g_qwen.stream>>>(g_pg_argmax, g_pg_logits, g_qwen.V, N);
+        }
     } else {
         for (int j = 0; j < N; j++) {
             cudaMemcpyAsync(g_qwen.d_debug_norm, g_wide_norm + (size_t)j * H, (size_t)H * sizeof(float),
@@ -25561,7 +25681,25 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
                     return -119;
                 }
             }
-            k_tq_batched_argmax<<<Kf, 256, 0, g_qwen.stream>>>(g_pg_argmax, g_pg_logits, g_qwen.V, Kf);
+            int any_samp = 0;
+            for (int f = 0; f < Kf; f++)
+                if (h_samp_temp[seg_slot[fk[f]]] > 0.0f) { any_samp = 1; break; }
+            if (any_samp) {
+                static float ps_t[256]; static unsigned long long ps_s[256]; static int ps_c[256];
+                for (int f = 0; f < Kf; f++) {
+                    int k2 = fk[f], s2 = seg_slot[k2];
+                    ps_t[f] = h_samp_temp[s2]; ps_s[f] = h_samp_seed[s2];
+                    ps_c[f] = col_pos[seg_off[k2] + seg_len[k2] - 1] + 1;   // the seed token's position
+                }
+                cudaMemcpyAsync(g_samp_temp, ps_t, (size_t)Kf * sizeof(float), cudaMemcpyHostToDevice, g_qwen.stream);
+                cudaMemcpyAsync(g_samp_seed, ps_s, (size_t)Kf * sizeof(unsigned long long), cudaMemcpyHostToDevice, g_qwen.stream);
+                cudaMemcpyAsync(g_samp_ctr, ps_c, (size_t)Kf * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+                float mp = spec_min_p();
+                k_tq_batched_sample<<<Kf, 256, 0, g_qwen.stream>>>(g_pg_argmax, g_pg_logits, g_qwen.V, Kf,
+                    g_samp_temp, g_samp_seed, g_samp_ctr, (mp > 0.0f) ? logf(mp) : -3.0e38f);
+            } else {
+                k_tq_batched_argmax<<<Kf, 256, 0, g_qwen.stream>>>(g_pg_argmax, g_pg_logits, g_qwen.V, Kf);
+            }
         } else {
             for (int f = 0; f < Kf; f++) {
                 cudaMemcpyAsync(g_qwen.d_debug_norm, g_wide_norm + (size_t)f * H, (size_t)H * sizeof(float),
