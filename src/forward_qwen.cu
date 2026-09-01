@@ -8801,6 +8801,9 @@ __global__ void k_tq_linear_decode_core_hs_fused_tree(float *core_out, float *re
 // children, then proceeds with the core recurrence. Depth synchronisation via a single
 // global atomic counter (same scheme as the separate fused-tree kernels).
 // Bit-identical per node to the separate conv + core fused-tree path.
+// root_idx (may be NULL): per-node committed-state row for multi-root launches
+// (the paged verify runs several slots' chains in one launch, each chain rooting
+// at ITS slot's committed state). NULL = single root (bit-identical old path).
 template <int G, int HS>
 __global__ void k_tq_deltanet_fused_depths(float *core_out, float *recurrent_state,
                                            float *conv_state, const float *qkv_in,
@@ -8815,7 +8818,10 @@ __global__ void k_tq_deltanet_fused_depths(float *core_out, float *recurrent_sta
                                            const float *committed_recur,
                                            const float *committed_conv,
                                            const int *depth_offsets, int n_depths,
-                                           int *depth_done) {
+                                           int *depth_done,
+                                           const int *root_idx = NULL,
+                                           int committed_recur_stride = 0,
+                                           int committed_conv_stride = 0) {
     extern __shared__ float smem[];
     float *qn = smem;
     float *kn = smem + dim;
@@ -8836,11 +8842,16 @@ __global__ void k_tq_deltanet_fused_depths(float *core_out, float *recurrent_sta
 
     int node = group_node_ids[slot];
     int par = parent_ids[node];
+    size_t root_r = 0, root_c = 0;
+    if (par < 0 && root_idx) {
+        root_r = (size_t)root_idx[node] * committed_recur_stride;
+        root_c = (size_t)root_idx[node] * committed_conv_stride;
+    }
     const float *src_conv = (par >= 0) ? conv_state + (size_t)par * conv_state_stride
-                                       : committed_conv;
+                                       : committed_conv + root_c;
     float *dst_conv = conv_state + (size_t)node * conv_state_stride;
     const float *src_rstate = (par >= 0) ? recurrent_state + (size_t)par * recur_stride
-                                         : committed_recur;
+                                         : committed_recur + root_r;
     float *dst_rstate = recurrent_state + (size_t)node * recur_stride;
     const float *xn = qkv_in + (size_t)node * conv_dim;
     float *core_o = core_out + (size_t)node * core_stride;
@@ -18511,7 +18522,9 @@ static int spec_linear_deltanet_fused(tq_layer_t *l, float *core_base, float *re
                                       const float *committed_recur,
                                       const float *committed_conv,
                                       const int *depth_offsets, int n_depths,
-                                      int *depth_done) {
+                                      int *depth_done,
+                                      const int *root_idx = NULL,
+                                      int cr_stride = 0, int cc_stride = 0) {
     int heads = g_qwen.linear_num_value_heads, key_heads = g_qwen.linear_num_key_heads;
     int dim = g_qwen.linear_value_head_dim;
     int lc_g = linear_core_par_g();
@@ -18531,7 +18544,7 @@ static int spec_linear_deltanet_fused(tq_layer_t *l, float *core_base, float *re
             l->d_linear_A_log, l->d_linear_dt_bias, l->d_linear_conv1d,                          \
             heads, key_heads, dim, ks, group_dev, parent_dev,                                    \
             recur_f, conv_dim, value_dim, conv_f, committed_recur, committed_conv,               \
-            depth_offsets, n_depths, depth_done)
+            depth_offsets, n_depths, depth_done, root_idx, cr_stride, cc_stride)
     if (lc_g == 8 && lc_hs == 8) SPEC_DELTANET_FUSED(8, 8);
     else if (lc_g == 8 && lc_hs == 4) SPEC_DELTANET_FUSED(8, 4);
     else if (lc_g == 8 && lc_hs == 2) SPEC_DELTANET_FUSED(8, 2);
@@ -25801,17 +25814,179 @@ static int paged_spec_pool_init(void) {
     const char *e = getenv("TQ_PG_SPEC_SLOTS");
     int want = e ? atoi(e) : 4;
     if (want > g_pg_maxslots) want = g_pg_maxslots;
-    g_pg_spec_sf = paged_state_floats();
-    for (int n = want; n > 0; n >>= 1) {
-        if (cudaMalloc(&g_pg_spec_state, (size_t)n * g_pg_spec_sf * sizeof(float)) == cudaSuccess) {
-            g_pg_spec_n = n;
-            fprintf(stderr, "[paged] spec state slabs: %d x %.1f MB\n",
-                    n, g_pg_spec_sf * sizeof(float) / 1048576.0);
-            return n;
+    if (want < 0) want = 0;
+    g_pg_spec_n = want;              // v2 never restores slot state: no slabs needed
+    return want;
+}
+
+// v2 per-(linear-layer, node) forked-state archive + tiny topology arrays.
+// Dedicated, all-or-nothing, NEVER retried: a failed ensure disables paged spec
+// permanently instead of leak-spiraling VRAM (the shared spec allocator retries
+// its cudaMallocs into non-NULL pointers -- that spiral killed the first v2
+// matrix run). TQ_PG_SPEC_NODES (default 8, cap 16) sizes the archive: 8 nodes
+// x 48 linear layers of FP32 state ~= 1.2 GB.
+static float *g_pga_recur = NULL, *g_pga_conv = NULL;
+static int *g_pga_grp = NULL, *g_pga_par = NULL, *g_pga_off = NULL, *g_pga_done = NULL, *g_pga_root = NULL;
+static int g_pga_nodes = 0;
+static int g_pga_ready = 0;          // 1 ok, -1 failed permanently
+
+static int paged_spec_ensure_archive(int recur_f, int conv_f) {
+    if (g_pga_ready) return g_pga_ready > 0 ? 0 : -1;
+    const char *e = getenv("TQ_PG_SPEC_NODES");
+    g_pga_nodes = e ? atoi(e) : 8;
+    if (g_pga_nodes < 1) g_pga_nodes = 1;
+    if (g_pga_nodes > TQ_SPEC_MAX_N) g_pga_nodes = TQ_SPEC_MAX_N;
+    int n_lin = 0;
+    for (int i = 0; i < g_qwen.L; i++)
+        if (g_qwen.layer_types[i] == TQ_LAYER_LINEAR_ATTENTION) n_lin++;
+    size_t rb = (size_t)n_lin * g_pga_nodes * recur_f * sizeof(float);
+    size_t cb = (size_t)n_lin * g_pga_nodes * conv_f * sizeof(float);
+    if (cudaMalloc(&g_pga_recur, rb) != cudaSuccess ||
+        cudaMalloc(&g_pga_conv, cb) != cudaSuccess ||
+        cudaMalloc(&g_pga_grp, TQ_SPEC_MAX_N * sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&g_pga_par, TQ_SPEC_MAX_N * sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&g_pga_off, (TQ_SPEC_MAX_N + 1) * sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&g_pga_done, sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&g_pga_root, TQ_SPEC_MAX_N * sizeof(int)) != cudaSuccess) {
+        if (g_pga_recur) { cudaFree(g_pga_recur); g_pga_recur = NULL; }
+        if (g_pga_conv) { cudaFree(g_pga_conv); g_pga_conv = NULL; }
+        if (g_pga_grp) { cudaFree(g_pga_grp); g_pga_grp = NULL; }
+        if (g_pga_par) { cudaFree(g_pga_par); g_pga_par = NULL; }
+        if (g_pga_off) { cudaFree(g_pga_off); g_pga_off = NULL; }
+        if (g_pga_done) { cudaFree(g_pga_done); g_pga_done = NULL; }
+        g_pga_ready = -1;
+        fprintf(stderr, "[paged] spec archive: no VRAM for %.0f MB, paged spec disabled\n",
+                (rb + cb) / 1048576.0);
+        return -1;
+    }
+    g_pga_ready = 1;
+    fprintf(stderr, "[paged] spec archive: %.0f MB (%d nodes x %d linear layers)\n",
+            (rb + cb) / 1048576.0, g_pga_nodes, n_lin);
+    return 0;
+}
+// ==================== v2 verify core: spec-class kernels ====================
+// v1 rode run_paged_prefill_wave_core and paid chunk-256 DeltaNet scans plus
+// per-segment MMA-prefill attention on ~9-column chains: 4-8x a decode step,
+// a measured net LOSS at every (ctx, n) cell despite 2.8-8.7 accepted
+// tokens/round. This core runs the same chains through spec-class kernels:
+//   - linear layers: ONE k_tq_deltanet_fused_depths launch for ALL slots'
+//     chains (per-node state archive, per-slot roots via root_idx). Committed
+//     slot state is NEVER mutated -- the round commits the accepted node's
+//     state afterward (the "never corrupt committed state" pattern vLLM/SGLang
+//     converged on, and what our single-stream tree verify has always done).
+//   - full-attn layers: kv_write over all chain columns + ONE batched
+//     decode-attention launch (each column reads pool rows <= its position;
+//     chain rows are written first, so intra-chain causality holds).
+// Node id == column id; chains are contiguous; node depth = j - seg_off.
+// Total nodes <= TQ_SPEC_MAX_N: topology/archive buffers are the single-stream
+// spec allocations (ensure_spec_buffers), FP32 legacy archive layout.
+static int run_paged_spec_verify_core(const int *tokens, const int *col_slot, const int *col_pos,
+                                      const int *seg_slot, const int *seg_off, const int *seg_len,
+                                      int K, int T) {
+    int H = g_qwen.H, attn_m = g_qwen.nh * g_qwen.hd;
+    int lkh = g_qwen.linear_num_key_heads, lvh = g_qwen.linear_num_value_heads, ld = g_qwen.linear_value_head_dim;
+    int value_dim = lvh * ld, key_dim = lkh * ld, conv_dim = 2 * key_dim + value_dim;
+    int kv_m = g_qwen.nkv * g_qwen.hd, nkv = g_qwen.nkv;
+    int recur_f = batched_recur_floats(), conv_f = batched_conv_floats();
+    int ret;
+    if (T < 1) return -110;
+    if (paged_spec_ensure_archive(recur_f, conv_f) != 0) return -111;
+    if (T > g_pga_nodes) return -110;             // archive-node cap (TQ_PG_SPEC_NODES)
+    if (ensure_wide_prefill_buffers(T) != 0) return -90;
+    if (ensure_pf_colslot(T) != 0) return -90;
+    int pf_maxpos = 0;
+    for (int k = 0; k < K; k++) {
+        int last_pos = col_pos[seg_off[k] + seg_len[k] - 1];
+        if (paged_ensure_blocks(seg_slot[k], last_pos) != 0) return -91;    // pool full
+        if (last_pos > pf_maxpos) pf_maxpos = last_pos;
+    }
+    // depth-sorted topology: parent = previous chain column, root = the slot.
+    static int h_grp[TQ_SPEC_MAX_N], h_par[TQ_SPEC_MAX_N], h_root[TQ_SPEC_MAX_N];
+    static int h_off[TQ_SPEC_MAX_N + 1];
+    int n_depths = 0;
+    for (int k = 0; k < K; k++) if (seg_len[k] > n_depths) n_depths = seg_len[k];
+    {
+        int no = 0;
+        h_off[0] = 0;
+        for (int d = 0; d < n_depths; d++) {
+            for (int k = 0; k < K; k++)
+                if (d < seg_len[k]) h_grp[no++] = seg_off[k] + d;
+            h_off[d + 1] = no;
+        }
+        for (int k = 0; k < K; k++) {
+            h_par[seg_off[k]] = -1;
+            for (int j = 1; j < seg_len[k]; j++) h_par[seg_off[k] + j] = seg_off[k] + j - 1;
+            for (int j = 0; j < seg_len[k]; j++) h_root[seg_off[k] + j] = seg_slot[k];
         }
     }
-    g_pg_spec_state = NULL; g_pg_spec_n = 0;
-    fprintf(stderr, "[paged] spec state slabs: no VRAM, paged spec disabled\n");
+    cudaMemcpyAsync(g_pga_grp, h_grp, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+    cudaMemcpyAsync(g_pga_par, h_par, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+    cudaMemcpyAsync(g_pga_off, h_off, (size_t)(n_depths + 1) * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+    cudaMemcpyAsync(g_pga_root, h_root, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+    cudaMemcpyAsync(g_block_table, h_block_table, (size_t)g_pg_maxslots * g_pg_maxblk * sizeof(int),
+                    cudaMemcpyHostToDevice, g_qwen.stream);
+    cudaMemcpyAsync(g_pf_colslot, col_slot, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+    cudaMemcpyAsync(g_wide_pos, col_pos, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+    for (int j = 0; j < T; j++)
+        k_tq_embed_lookup<<<(H + 255) / 256, 256, 0, g_qwen.stream>>>(
+            g_wide_h + (size_t)j * H, g_qwen.d_embed, tokens[j], H);
+    int lin_idx = 0;
+    for (int L = 0; L < g_qwen.L; L++) {
+        tq_layer_t *l = &g_qwen.layers[L];
+        if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION) {
+            if (!(tq_wide_fmt_ok(&l->q_proj) && tq_wide_fmt_ok(&l->o_proj) &&
+                  tq_wide_fmt_ok(&l->mlp_gate) && tq_wide_fmt_ok(&l->mlp_down))) return -92;
+            k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(T), T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
+            if ((ret = wide_quant_input(g_wide_norm, H, T)) != 0) return -93;
+            if ((ret = wide_proj(&l->q_proj, g_wide_q, T)) != 0) return -93;
+            if ((ret = wide_proj(&l->k_proj, g_wide_k, T)) != 0) return -93;
+            if ((ret = wide_proj(&l->v_proj, g_wide_v, T)) != 0) return -93;
+            k_tq_paged_attn_kv_write_q4<<<dim3(nkv, T), g_qwen.hd, 0, g_qwen.stream>>>(
+                g_pool_k4[L], g_pool_kq4s[L], g_pool_v8[L], g_pool_vscale[L],
+                g_wide_k, g_wide_v, l->d_k_norm, g_wide_pos, g_pf_colslot,
+                g_block_table, g_pg_maxblk, g_pg_page, g_pg_plog, nkv, g_qwen.hd, kv_m,
+                g_qwen.eps, g_qwen.rope_theta);
+            if (launch_paged_attn_q4(g_wide_core, g_wide_q, l->d_q_norm, g_wide_k, g_wide_v, l->d_k_norm,
+                                     g_pool_k4[L], g_pool_kq4s[L], g_pool_v8[L], g_pool_vscale[L],
+                                     g_wide_pos, g_pf_colslot, g_block_table, g_pg_maxblk, g_pg_page, g_pg_plog,
+                                     T, pf_maxpos, g_qwen.stream) != 0) return -94;
+            if ((ret = wide_quant_input(g_wide_core, attn_m, T)) != 0) return -95;
+            if ((ret = wide_proj(&l->o_proj, g_wide_o, T)) != 0) return -95;
+            if ((ret = wide_mlp_x(l, g_wide_h, g_wide_o, g_wide_resid, g_wide_resid, g_wide_h, T)) != 0) return -96;
+        } else {
+            if (!(tq_wide_fmt_ok(&l->linear_in_qkv) && tq_wide_fmt_ok(&l->linear_in_z) &&
+                  tq_wide_fmt_ok(&l->linear_in_b) && tq_wide_fmt_ok(&l->linear_in_a) &&
+                  tq_wide_fmt_ok(&l->linear_out) && tq_wide_fmt_ok(&l->mlp_gate) &&
+                  tq_wide_fmt_ok(&l->mlp_down))) return -97;
+            k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(T), T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
+            if ((ret = wide_quant_input(g_wide_norm, H, T)) != 0) return -98;
+            if ((ret = wide_proj(&l->linear_in_qkv, g_wide_qkv, T)) != 0) return -98;
+            if ((ret = wide_proj(&l->linear_in_z, g_wide_z, T)) != 0) return -98;
+            if ((ret = wide_proj(&l->linear_in_b, g_wide_b, T)) != 0) return -98;
+            if ((ret = wide_proj(&l->linear_in_a, g_wide_a, T)) != 0) return -98;
+            float *recur_base = g_pga_recur + (size_t)lin_idx * g_pga_nodes * recur_f;
+            float *conv_base  = g_pga_conv  + (size_t)lin_idx * g_pga_nodes * conv_f;
+            cudaMemsetAsync(g_pga_done, 0, sizeof(int), g_qwen.stream);
+            if (spec_linear_deltanet_fused(l, g_wide_lcore, recur_base, conv_base,
+                                           g_wide_qkv, g_wide_b, g_wide_a,
+                                           g_pga_grp, g_pga_par, T,
+                                           recur_f, conv_dim, value_dim, conv_f,
+                                           g_pg_recur[L], g_pg_conv[L],
+                                           g_pga_off, n_depths,
+                                           g_pga_done,
+                                           g_pga_root, recur_f, conv_f) != 0) return -89;
+            {
+                size_t shB = (size_t)ld * sizeof(float);
+                k_tq_linear_decode_gated_norm_b<<<dim3(lvh, T), ld, shB, g_qwen.stream>>>(
+                    g_wide_lcore, g_wide_z, l->d_linear_norm, lvh, ld, g_qwen.eps,
+                    g_pga_grp, value_dim);
+            }
+            if ((ret = wide_quant_input(g_wide_lcore, value_dim, T)) != 0) return -100;
+            if ((ret = wide_proj(&l->linear_out, g_wide_o, T)) != 0) return -100;
+            if ((ret = wide_mlp_x(l, g_wide_h, g_wide_o, g_wide_resid, g_wide_resid, g_wide_h, T)) != 0) return -101;
+            lin_idx++;
+        }
+    }
     return 0;
 }
 
@@ -25819,16 +25994,15 @@ static int paged_spec_pool_init(void) {
 // row-major [N x maxd]; dlens[i] <= maxd. out_tokens is [N x (maxd+1)];
 // out_m[i] = COMMITTED emissions (accepted prefix + the bonus token). dlen=0
 // degenerates to plain decode (1-column segment, 1 emission), so plain and spec
-// share one path. Returns 0, or <0 (whole round failed, no tokens committed --
-// a failed round may leave a partial slot restored-but-unreplayed; the server
-// must fail those requests, matching the wave-error contract).
+// share one path. Returns 0, or <0 (whole round failed, NO tokens committed and
+// committed slot state untouched -- the verify core never mutates it; the
+// commit-scatter below only runs on success).
 extern "C" int qwn_paged_spec_round(const int *slots, const int *seeds, const int *poss,
                                     const int *drafts, const int *dlens, int N, int maxd,
                                     int *out_tokens, int *out_m) {
     if (!g_pg_ready) return -1;
     if (N < 1 || N > 64 || maxd < 0 || maxd > TQ_PG_SPEC_MAXD) return -2;
-    int nspec = paged_spec_pool_init();
-    if (nspec < 1 || N > nspec) return -3;       // server caps its spec batch at nspec
+    if (paged_spec_pool_init() < 1) return -3;   // TQ_PG_SPEC_SLOTS=0 disables
     int cols_tok[TQ_PG_SPEC_COLS], cols_slot[TQ_PG_SPEC_COLS], cols_pos[TQ_PG_SPEC_COLS];
     int seg_slot[64], seg_off[64], seg_len[64], seg_fin[64], oseed[64];
     int T = 0;
@@ -25842,14 +26016,13 @@ extern "C" int qwn_paged_spec_round(const int *slots, const int *seeds, const in
             cols_tok[T] = drafts[(size_t)i * maxd + j];
             cols_slot[T] = slot; cols_pos[T] = poss[i] + 1 + j; T++;
         }
-        // snapshot the recurrent state (lane i): the wave advances it in place.
-        // dlen=0 slots are plain decode (nothing to rewind) -- skip the copy.
-        if (dl > 0)
-            paged_state_slot_to(g_pg_spec_state + (size_t)i * g_pg_spec_sf, slot);
+        // no snapshot needed: the v2 verify core forks state into the per-node
+        // archive and never touches the slot's committed state.
     }
     wide_quant_reset();
-    int rc = run_paged_prefill_wave_core(cols_tok, cols_slot, cols_pos,
-                                         seg_slot, seg_off, seg_len, seg_fin, N, T, oseed);
+    int rc = run_paged_spec_verify_core(cols_tok, cols_slot, cols_pos,
+                                        seg_slot, seg_off, seg_len, N, T);
+    (void)seg_fin; (void)oseed;
     if (rc != 0) return rc;
     // emission pass: final norm + wide lm_head + per-slot sampler over ALL T columns
     if (!(!g_qwen.tie_word_embeddings && g_qwen.lm_head.e2m3 && !g_qwen.lm_head.e2m3_byte &&
@@ -25884,10 +26057,12 @@ extern "C" int qwn_paged_spec_round(const int *slots, const int *seeds, const in
     int emit[TQ_PG_SPEC_COLS];
     cudaMemcpyAsync(emit, g_pg_argmax, (size_t)T * sizeof(int), cudaMemcpyDeviceToHost, g_qwen.stream);
     if (cudaStreamSynchronize(g_qwen.stream) != cudaSuccess) return -8;
-    // accept-walk per slot + one batched replay wave for partially-accepted slots
-    int r_ct[TQ_PG_SPEC_COLS], r_cs[TQ_PG_SPEC_COLS], r_cp[TQ_PG_SPEC_COLS];
-    int r_ss[64], r_so[64], r_sl[64], r_sf[64], r_os[64];
-    int RT = 0, RK = 0;
+    // accept-walk per slot, then COMMIT: scatter the accepted node's per-layer
+    // DeltaNet state into each slot (the core never touched committed state).
+    // Accepted KV rows are already in the pool; rejected rows sit past the
+    // committed position (attention is position-gated) and get overwritten on
+    // the next visit to those positions.
+    int acc_node[64];
     for (int i = 0; i < N; i++) {
         int off = seg_off[i], dl = dlens[i];
         int a = 0;
@@ -25895,20 +26070,24 @@ extern "C" int qwn_paged_spec_round(const int *slots, const int *seeds, const in
         int m = a + 1;                           // committed emissions e_0..e_a
         for (int j = 0; j < m; j++) out_tokens[(size_t)i * (maxd + 1) + j] = emit[off + j];
         out_m[i] = m;
-        if (a < dl) {                            // partial: restore, then replay accepted inputs
-            paged_state_to_slot(g_pg_spec_state + (size_t)i * g_pg_spec_sf, slots[i]);
-            r_ss[RK] = slots[i]; r_so[RK] = RT; r_sl[RK] = a + 1; r_sf[RK] = 0; RK++;
-            r_ct[RT] = seeds[i]; r_cs[RT] = slots[i]; r_cp[RT] = poss[i]; RT++;
-            for (int j = 0; j < a; j++) {
-                r_ct[RT] = drafts[(size_t)i * maxd + j];
-                r_cs[RT] = slots[i]; r_cp[RT] = poss[i] + 1 + j; RT++;
-            }
-        }
+        acc_node[i] = off + a;                   // last VERIFIED input column
     }
-    if (RK > 0) {
-        wide_quant_reset();
-        rc = run_paged_prefill_wave_core(r_ct, r_cs, r_cp, r_ss, r_so, r_sl, r_sf, RK, RT, r_os);
-        if (rc != 0) return rc;
+    {
+        int recur_fc = batched_recur_floats(), conv_fc = batched_conv_floats();
+        int li = 0;
+        for (int L = 0; L < g_qwen.L; L++) {
+            if (g_qwen.layer_types[L] != TQ_LAYER_LINEAR_ATTENTION) continue;
+            float *rb = g_pga_recur + (size_t)li * g_pga_nodes * recur_fc;
+            float *cb = g_pga_conv + (size_t)li * g_pga_nodes * conv_fc;
+            for (int i = 0; i < N; i++) {
+                cudaMemcpyAsync(g_pg_recur[L] + (size_t)slots[i] * recur_fc, rb + (size_t)acc_node[i] * recur_fc,
+                                (size_t)recur_fc * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
+                cudaMemcpyAsync(g_pg_conv[L] + (size_t)slots[i] * conv_fc, cb + (size_t)acc_node[i] * conv_fc,
+                                (size_t)conv_fc * sizeof(float), cudaMemcpyDeviceToDevice, g_qwen.stream);
+            }
+            li++;
+        }
+        if (cudaStreamSynchronize(g_qwen.stream) != cudaSuccess) return -9;
     }
     return 0;
 }

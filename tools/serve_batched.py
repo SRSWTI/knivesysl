@@ -567,14 +567,16 @@ class BatchedEngine:
         decode step at float eps; a Gumbel draw can flip a near-tie)."""
         slots = list(self.active.keys())
         n = len(slots)
-        maxd = self.spec_maxd
+        # v2 verify core: total chain nodes (n slots x (draft+seed)) ride the
+        # TQ_PG_SPEC_NODES archive (default 8) -- clamp per-round depth to fit.
+        maxd = max(0, min(self.spec_maxd, int(os.environ.get("TQ_PG_SPEC_NODES", "8")) // n - 1))
         sl = (ctypes.c_int * n)(*slots)
         seeds = (ctypes.c_int * n)(*[self.active[s].next_tok for s in slots])
         pos = (ctypes.c_int * n)(*[self.active[s].pos for s in slots])
         dl = (ctypes.c_int * n)()
         dr = (ctypes.c_int * max(1, n * maxd))()
         for j, s in enumerate(slots):
-            d = self._draft(self.active[s]) if maxd > 0 else []
+            d = self._draft(self.active[s])[:maxd] if maxd > 0 else []
             dl[j] = len(d)
             for k2, t in enumerate(d):
                 dr[j * maxd + k2] = t
