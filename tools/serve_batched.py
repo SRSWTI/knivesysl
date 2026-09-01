@@ -53,6 +53,10 @@ def load_lib(path):
     L.qwn_paged_ckpt_save.argtypes = [ctypes.c_int, ctypes.c_int]; L.qwn_paged_ckpt_save.restype = ctypes.c_int
     L.qwn_paged_ckpt_adopt.argtypes = [ctypes.c_int, ctypes.c_int]; L.qwn_paged_ckpt_adopt.restype = ctypes.c_int
     L.qwn_paged_ckpt_free.argtypes = [ctypes.c_int]; L.qwn_paged_ckpt_free.restype = ctypes.c_int
+    L.qwn_paged_ckpt_demote.argtypes = [ctypes.c_int]; L.qwn_paged_ckpt_demote.restype = ctypes.c_int
+    L.qwn_paged_ckpt_promote.argtypes = [ctypes.c_int]; L.qwn_paged_ckpt_promote.restype = ctypes.c_int
+    L.qwn_paged_ckpt_tier.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+    L.qwn_paged_ckpt_tier.restype = ctypes.c_int
     L.qwn_paged_fork.argtypes = [ctypes.c_int] * 3; L.qwn_paged_fork.restype = ctypes.c_int
     L.qwn_paged_decode_step.argtypes = [ctypes.POINTER(ctypes.c_int)] * 3 + [ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
     L.qwn_paged_decode_step.restype = ctypes.c_int
@@ -162,7 +166,10 @@ class BatchedEngine:
         self.pc_hits = self.pc_misses = self.pc_builds = self.pc_saved = 0
         # checkpoint registry (APC phase 2): engine ckpt id -> prefix ids + stats
         self.cks = []               # [{id, pos, ids, t_hit}]
-        self.ck_max = int(os.environ.get("TQ_CKPT_MAX", "6"))
+        # With a host tier the registry is no longer bounded by the VRAM slab pool:
+        # entries beyond it live demoted in pinned host RAM (engine cap is 24).
+        _hgb = float(os.environ.get("TQ_CKPT_HOST_GB", "8"))
+        self.ck_max = int(os.environ.get("TQ_CKPT_MAX", "16" if _hgb > 0 else "6"))
         self.ck_trim = max(0, int(os.environ.get("TQ_CKPT_TRIM", "8")))
         self.ck_last = None         # previous admitted prompt (LCP checkpoint candidate)
         self.pref = {}              # slot -> [Request, prefill cursor] (chunked prefill)
@@ -188,6 +195,7 @@ class BatchedEngine:
         self.spec_slots = max(1, int(os.environ.get("TQ_PG_SPEC_SLOTS", "4")))
         self.spec_maxd = max(0, min(15, int(os.environ.get("TQ_PAGED_SPEC_D", "8"))))
         self.spec_rounds = 0; self.spec_committed = 0; self.spec_drafted = 0
+        self.spec_rounds_by_n = {}
         # wave cost accounting (see _wave / _loop)
         self.t_marshal = 0.0; self.t_engine = 0.0; self.t_loop = 0.0; self.t_idle = 0.0
         # per-wave timeline for scheduler diagnosis: (t_end, engine_ms, pref_cols,
@@ -238,8 +246,22 @@ class BatchedEngine:
         return best
 
     def _ck_evict_one(self):
+        """Make room. Demoting the LRU RESIDENT entry hands back its state slab and
+        every KV block ref while keeping the entry matchable from host RAM, so
+        capacity stops being bounded by the slab pool. Only when nothing can be
+        demoted (host budget spent, or everything already demoted) do we destroy the
+        LRU outright."""
         if not self.cks:
             return False
+        mb = ctypes.c_int(0)
+        res = [c for c in self.cks
+               if self.L.qwn_paged_ckpt_tier(c["id"], ctypes.byref(mb)) == 0]
+        if res:
+            lru = min(res, key=lambda c: c["t_hit"])
+            if self.L.qwn_paged_ckpt_demote(lru["id"]) == 0:
+                self.L.qwn_paged_ckpt_tier(lru["id"], ctypes.byref(mb))
+                print(f"[ckpt] demote id={lru['id']} pos={lru['pos']} host={mb.value}MB", flush=True)
+                return True
         lru = min(self.cks, key=lambda c: c["t_hit"])
         self.cks.remove(lru)
         rc = self.L.qwn_paged_ckpt_free(lru["id"])
@@ -341,6 +363,12 @@ class BatchedEngine:
                 cursor = 0
                 hit = self._ck_match(req)
                 if hit is not None:
+                    if self.L.qwn_paged_ckpt_tier(hit["id"], None) == 1:
+                        pr = self.L.qwn_paged_ckpt_promote(hit["id"])
+                        if pr == -3 and self._ck_evict_one():   # freed a slab; retry once
+                            pr = self.L.qwn_paged_ckpt_promote(hit["id"])
+                        if pr != 0:                             # adopt below returns -5
+                            print(f"[ckpt] promote id={hit['id']} rc={pr}", flush=True)
                     pos = self.L.qwn_paged_ckpt_adopt(slot, hit["id"])
                     if pos == hit["pos"]:
                         cursor = pos                     # prefill only the suffix
@@ -608,6 +636,7 @@ class BatchedEngine:
         if len(self.wavelog) < 65536:
             self.wavelog.append((_t2, (_t2 - _t1) * 1e3, 0, n, n, 2))
         self.spec_rounds += 1
+        self.spec_rounds_by_n[n] = self.spec_rounds_by_n.get(n, 0) + 1
         finished = []
         _tnow = time.time()
         for j, s in enumerate(slots):
@@ -919,6 +948,7 @@ def make_handler(eng, tok, args):
                                           "rounds": eng.spec_rounds,
                                           "committed": eng.spec_committed,
                                           "drafted": eng.spec_drafted,
+                                          "rounds_by_n": eng.spec_rounds_by_n,
                                           "tokens_per_round": (eng.spec_committed / eng.spec_rounds)
                                                               if eng.spec_rounds else 0.0}})
             elif self.path.startswith("/waveprof"):
