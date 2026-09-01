@@ -54,21 +54,30 @@ def stream_one(prompt, out, ci=0):
             "chat_template_kwargs": {"enable_thinking": False}}
     if args.temp > 0:
         body["seed"] = 42 + ci
+    body["stream_options"] = {"include_usage": True}
     req = urllib.request.Request(args.url + "/v1/chat/completions",
                                  json.dumps(body).encode(), {"Content-Type": "application/json"})
-    t0 = time.time(); times = []
+    t0 = time.time(); times = []; usage_tok = None
     with urllib.request.urlopen(req, timeout=2400) as r:
         for raw in r:
             ln = raw.decode("utf-8", "replace").strip()
             if not ln.startswith("data: ") or ln == "data: [DONE]":
                 continue
             d = json.loads(ln[6:])
+            u = d.get("usage") or {}
+            if u.get("completion_tokens"):
+                usage_tok = int(u["completion_tokens"])
             for c in d.get("choices", []):
                 if c.get("delta", {}).get("content") or c.get("delta", {}).get("reasoning_content"):
                     times.append(time.time())
     itl = sorted(times[i] - times[i - 1] for i in range(1, len(times)))
+    # CRITICAL: one SSE event carries `accept_len` tokens under speculative decoding,
+    # so delta count is NOT token count -- trust the server's usage block when present.
+    # itl_* stay per-EVENT (that is what a client actually perceives as a burst).
     out.append({"ttft": times[0] - t0 if times else None,
-                "n_tok": len(times),
+                "n_tok": usage_tok if usage_tok else len(times),
+                "n_delta": len(times),
+                "tok_per_delta": (usage_tok / len(times)) if usage_tok and times else 1.0,
                 "dec_s": (times[-1] - times[0]) if len(times) > 1 else 0.0,
                 "itl_p50": itl[len(itl) // 2] * 1e3 if itl else None,
                 "itl_p99": itl[int(len(itl) * 0.99)] * 1e3 if itl else None})

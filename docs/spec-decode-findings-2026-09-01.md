@@ -1,114 +1,128 @@
-# spec decode on sm120: what the measurements say
+# spec decode on sm120: measurements, and the instrument bug that inverted them
 
-all numbers below measured 2026-09-01 on the one rtx 5090 (gb202, sm120, 32 gb), same
-client, greedy, thinking off. the reference column is sglang at pinned commit
-`1cf2b8c5` serving `RadixArk/Qwen3.8-27B-NVFP4` (modelopt mixed-precision, 20.13 gb
-weights, fp8 kv) -- the cookbook's *verified* rtx 5090 cell, run unmodified.
+> **Read the first section before any number below.** An earlier revision of this file
+> concluded that DSpark was a 0.67x slowdown and that "draft cost must be near-zero on
+> this card." Both were artifacts of a broken measurement. They are wrong. The
+> corrected numbers are the opposite sign.
 
-## the headline: a trained 1.86b drafter is a net loss on this card
+## the instrument bug
 
-dspark (`RadixArk/Qwen3.8-27B-DSpark`, gamma=7, verify window 8, vanilla markov rank
-256) against its own engine's plain decode:
+`tools/bench_spec_matrix.py` counted `n_tok = len(times)` -- one entry per SSE event.
+Under speculative decoding a server emits `accept_len` tokens **per event**, so the
+probe was reporting *events/second* and calling it tokens/second. Every speculative
+cell ever measured with it was undercounted by the accept factor (2-4x). Non-speculative
+cells are unaffected (one token per event) and remain valid.
 
-| workload | sglang plain | sglang + dspark | ratio | accept len |
-|---|--:|--:|--:|--:|
-| math_reasoning | 76.4 | 51.2 | **0.67x** | 3.80 |
-| code_repetitive | 72.6 | 49.1 | **0.68x** | 3.30 |
-| factual_qa | 76.4 | 50.2 | **0.66x** | 2.92 |
-| longctx_summary | 75.0 | 50.5 | **0.67x** | 2.52 |
-| chat_instruct | 75.9 | 51.2 | **0.67x** | 2.50 |
-| prose_novel | 76.9 | 51.0 | **0.66x** | 2.08 |
+Caught by comparing against the engine's own counter on an identical request:
 
-the accepts are real and match the model card's published range (2.1-3.8 here vs their
-3.43 aggregate at temp 1.0). the *speedup* is not: it is a uniform 33% slowdown, and it
-is flat at 0.67x whether accept is 2.08 or 3.80 -- the round cost is fixed and dominant,
-so more accepts buy nothing.
-
-**why it inverts.** speculation assumes verify compute is nearly free. that holds on an
-h200 (~990 tf/s bf16 against 4.8 tb/s) where their 2.25-3.16x was measured; it does not
-hold on a 5090 (~105 tf/s against 1.79 tb/s), which is compute-poor relative to its
-bandwidth. a verify wave is expensive here.
-
-**it also costs context.** same server, same pins, draft on vs off: `max_total_num_tokens`
-11,666 -> 31,219. the draft is 3.64 gb of weights plus 1.12 gb of d=8 verify
-intermediates.
-
-## the rule this establishes: draft cost must be near-zero on sm120
-
-everything measured on this card, ranked:
-
-| drafter | draft cost | result |
-|---|---|--:|
-| mtp head (1 layer, shared trunk) | ~free | **2.04x** (86.8 tok/s single-stream, fp6 tier) |
-| n-gram (ours, shipped) | zero | **1.57x** draftable / parity prose |
-| dspark (1.86b, 5 layers, +3.64 gb) | huge | **0.67x** |
-
-our own n-gram design -- zero draft compute, ema + depth gated so it can never be worse
-than plain -- beats a professionally-tuned trained drafter on this hardware. that is not
-luck; it is the only shape that fits the card.
-
-`tools/bench_spec_matrix.py --ns 8` on our engine confirms the concurrency half:
-
-| cell | plain /req | ngram /req | spec rounds |
+| | client probe | engine `x_knivesysl.gen_tok_s` | tokens returned |
 |---|--:|--:|--:|
-| 2048:8 | 37.3 | 39.4 | 1 |
-| 8192:8 | 30.0 | 30.2 | 5 |
+| streaming | 44.8 "tok/s" | 108.2 | 58 events |
+| non-streaming | -- | 104.5 | **128 tokens** |
 
-at n=8 speculation self-disables (active requests exceed `TQ_PAGED_SPEC_SLOTS`=4) and
-lands at parity. the fallback is clean -- no penalty for being off.
+Independently confirmed on the sglang side: same prompts, near-identical output
+lengths, plain emitted 160 deltas averaging 3.0-5.9 chars while dspark emitted 43-79
+deltas averaging 9.0-13.6 chars -- and the chars/delta ratio reproduced the measured
+accept length to within noise.
 
-## honest deficits vs sglang
+**Fix:** request `stream_options.include_usage` and take `completion_tokens` from the
+server. ITL percentiles stay per-EVENT, which is what a client actually perceives
+(speculation makes token arrival bursty, and that is a real property, not an artifact).
 
-matched cells, our production nvfp4 tier vs their verified plain config:
+## corrected numbers (fixed tool, one rtx 5090, same day)
 
-| cell | ours /req | sglang /req | gap | ours agg | sglang agg | gap | ours ttft | sglang ttft |
-|---|--:|--:|--:|--:|--:|--:|--:|--:|
-| 2048:1 | 58.5 | 75.2 | 1.29x | 58.5 | 75.7 | 1.29x | 0.20 | 0.15 |
-| 2048:2 | 48.6 | 63.7 | 1.31x | 99.4 | 112.5 | 1.13x | 0.42 | 0.51 |
-| 2048:4 | 40.7 | 56.3 | 1.38x | 173.0 | 215.9 | 1.25x | 0.79 | 0.62 |
-| 8192:1 | 60.5 | 74.3 | 1.23x | 60.5 | 74.9 | 1.24x | 0.88 | 0.73 |
-| 8192:2 | 55.6 | 64.3 | 1.16x | 118.9 | 129.6 | 1.09x | 1.73 | **0.71** |
-| 8192:4 | 45.2 | 50.3 | 1.11x | 223.9 | 248.8 | 1.11x | 3.51 | **1.49** |
+| config | 2048:1 | 8192:1 | tf-top1 |
+|---|--:|--:|--:|
+| ours paged nvfp4, plain | 58.5 | 60.5 | 85.78 |
+| **ours paged nvfp4 + ngram** | **87.8** (1.50x) | **142.3** (2.35x) | 85.78 |
+| ours single-stream fp6 + mtp | **119.5** | -- | **91.30** |
+| sglang plain nvfp4 | 75.2 | 74.3 | 85.78 |
+| sglang + dspark | ~162 (code prompt) | -- | 85.78 |
 
-sglang wins every decode cell by 1.09-1.38x. the gap narrows with depth (8k: 1.24 ->
-1.09 -> 1.11) but never inverts. the worst column is ttft under concurrency -- 2.4x
-behind at 8k -- which is the known prefill deficit amplified by their chunked-prefill
-scheduler interleaving better than our wave planner.
+- **n-gram is a 1.5-2.35x win and the win GROWS with depth** (tok/round 3.45-4.17). It
+  was previously shipped OFF by default on the strength of the broken numbers.
+- **DSpark works.** Measured accepts 2.08 (prose) to 3.80 (math), mean 2.85; real
+  throughput ~106-195 tok/s against sglang's own 72.6-76.9 plain -- roughly **1.9x
+  mean**, which substantially reproduces the model card's published 2.25-3.16x at c=1.
+- **fp6 + mtp single-stream is the standout combined point**: 119.5 tok/s at 91.30
+  quality, versus sglang plain's 75.2 at 85.78 -- faster *and* +5.5 quality points.
 
-the readme's "decode -- we win" is measured against vllm (58.7 tok/s single stream) and
-stands as written. it was never measured against sglang; against sglang we lose on plain
-decode. the one configuration that beats them is **our mtp path at 86.8 tok/s**, which
-is why porting mtp off the fp6 single-stream tier onto the paged nvfp4 server is the
-decode-competitiveness item, not dspark.
+## what the bug also invalidated
 
-not like-for-like, in both directions: their weights are modelopt mixed-precision
-(20.13 gb, some layers above 4-bit) against our all-nvfp4 w4a4 (18.1 gb); their kv is
-fp8 against our int4+hadamard. we hold 268,800 kv tokens against their 168,487 at n=4.
-their generations here were 128 tokens against 256 in our stored baseline.
+- the SpecMatrix phase verdict ("v2 delivers 0.33-0.73x of plain")
+- shipping paged speculation OFF by default (`19f4815`)
+- **the depth gate** `TQ_PAGED_SPEC_MAXPOS=65536` (`7cb005a`) -- tuned to *disable*
+  deep speculation because deep cells looked like regressions. They were not. The
+  deepest cell measured after the fix shows the largest win (2.35x at 8k), so the
+  gate is now suppressing our best numbers.
+- the derived "paged round costs 2.92 decode steps, no drafter can win"
 
-## reproducing the reference on this box
+## what still stands (measured with speculation OFF)
 
-five distinct failures before it served; all avoidable:
+- sglang plain leads our paged plain by 1.09-1.38x per-request across the ctx x n grid
+- TTFT under concurrency: ours 1.73s / 3.51s at 8192 n=2 / n=4 against their 0.71s /
+  1.49s -- a ~2.4x prefill deficit that a `--max-prefill` sweep did **not** fix
+  (4 concurrent prefills: 1.73s/3.56s, unchanged), because the wide prefill wave is
+  segment-count-sensitive by design: `128 cols as 1 segment = 42.8 ms, as 32 segments
+  = 73.5 ms`
+- fp6 costs 0.87x of nvfp4 decode (55.9 vs 64.2 mean over six workloads) while
+  achieving *higher* effective bandwidth (1258 vs 1162 GB/s) -- the nvfp4 W4A4 path
+  has overhead eating into its byte savings
+- dspark's VRAM bill: draft weights 3.64 GB + 1.12 GB d=8 verify intermediates, taking
+  `max_total_num_tokens` from 31,219 to 11,666 on the same pins
+- the quality ladder: fp8 95.94 > fp6 91.30 > e2m1 86.46 > nvfp4 85.78
 
-1. `FileNotFoundError: 'ninja'` -- launching via an absolute venv path leaves
-   `/tmp/sglang-env/bin` off `$PATH`, so the jit's `subprocess("ninja")` misses. export
-   the venv + `/usr/local/cuda/bin` on `PATH`.
-2. **host** oom, victim `cicc` -- flashinfer's jit fans ninja across all 32 threads at
-   ~5.5 gb rss each, which exceeds 59 gb of system ram. cap with `MAX_JOBS=6
-   NVCC_THREADS=1`. (this is a host-ram kill with no python traceback; check
-   `/var/log/kern.log`, not the server log.)
-3. gpu oom during cuda-graph capture at `avail_mem=0.66 GB`.
+## activation precision, for the record
+
+Activations are already E4M3 (fp8) on the fp6 and e2m1 tiers; **nvfp4 is the only tier
+that drops them to 4-bit**, and that is exactly what buys it the k64 `mxf4nvf4`
+instruction. `TQ_W_E2M1` *is* W4A8. A16 activations cannot enter the tensor-core path
+at all (`mxf8f6f4`/`mxf4nvf4` require every operand from the f8/f6/f4 family).
+
+The lever is weak: A4->A8 is worth <=0.68 points (85.78 -> 86.46, and that conflates
+scale structure), while W4->W6 is worth 4.84 (86.46 -> 91.30). **Weight precision
+dominates activation precision by ~7x.**
+
+One structural gap: `gc_weight_e2m3` is a single `__constant__` set once from a
+file-level flag, so the fp6-vs-fp8 weight base is all-or-nothing. `TQ_W_NVFP4` and
+`TQ_W_E2M1` are per-tensor, so tensors can be dropped 6->4 bits individually, but no
+tensor can be *raised* to 8. unsloth (mixed W8A8+W4A4) and RadixArk (ModelOpt
+`MIXED_PRECISION`) both ship hetero-with-8-bit; we ship hetero-down-from-6-bit.
+Making 8-bit expressible per tensor -- fp8 on the SNR-worst `down_proj`/`linear_out`
+only -- is the bounded engine change that would beat their mixed exports on
+quality-per-byte.
+
+## reproducing the sglang reference on this box
+
+Five distinct failures before it served:
+
+1. `FileNotFoundError: 'ninja'` -- launching via an absolute venv path leaves the venv
+   off `$PATH`, so the jit's `subprocess("ninja")` misses. Put the venv and
+   `/usr/local/cuda/bin` on `PATH`.
+2. **Host** oom, victim `cicc` -- flashinfer's jit fans ninja across all 32 threads at
+   ~5.5 GB rss each, exceeding 59 GB of system ram. Cap with `MAX_JOBS=6
+   NVCC_THREADS=1`. No python traceback; look in `/var/log/kern.log`.
+3. GPU oom during cuda-graph capture at `avail_mem=0.66 GB`.
 4. `ValueError: Loaded weights leave no GPU memory for the KV cache` -- lowering
-   `--mem-fraction-static` is backwards: the static budget must cover weights + state +
-   kv, while capture allocates from what is left *outside* it.
-5. `RuntimeError: mat1 and mat2 shapes cannot be multiplied (7x5120 and 2560x248320)` --
-   the draft projects through the *target's* lm_head, and an fp4-packed head needs
-   `quant_method.apply`, not a matmul. that is exactly what pinned commit `1cf2b8c5`
-   ("support quantized target lm_head in the dflash2 selector") adds; the pypi wheel
-   0.5.18 does not have it. installing the pinned tree needs
-   `SGLANG_BUILD_RUST_EXTS=none` (setup.py otherwise demands cargo for the router exts).
+   `--mem-fraction-static` is backwards: the static budget covers weights + state + kv,
+   while graph capture allocates from what is left *outside* it.
+5. `RuntimeError: mat1 and mat2 shapes cannot be multiplied (7x5120 and 2560x248320)`
+   -- the draft projects through the *target's* lm_head, and an fp4-packed head needs
+   `quant_method.apply`, not a matmul. Pinned commit `1cf2b8c` adds exactly that; the
+   pypi wheel 0.5.18 does not have it. Installing the pinned tree needs
+   `SGLANG_BUILD_RUST_EXTS=none` (setup.py otherwise demands cargo for router exts).
 
-one sizing note worth keeping: `--mamba-full-memory-ratio 5.61` grossly over-provisions
-the gdn state pool on this card. pinning `--max-mamba-cache-size` explicitly
-(concurrency x s, s=4 under `extra_buffer_lazy`) moved kv from 31,219 to 168,487 tokens
-at n=4. prefer the explicit pin.
+Sizing note: `--mamba-full-memory-ratio 5.61` grossly over-provisions the gdn state
+pool here. Pinning `--max-mamba-cache-size` explicitly (concurrency x S, S=4 under
+`extra_buffer_lazy`) moved kv from 31,219 to 168,487 tokens at n=4. Prefer the pin.
+
+## benching hygiene learned the hard way
+
+`tools/serve_prod.sh` is a **restart wrapper**. `pkill -f serve_batched` alone lets it
+resurrect production, and a bench then measures PRODUCTION while labelling the results
+as whatever config it thought it started. `tools/bench_all_tiers.sh` now kills the
+wrapper first and asserts the live server's tier and spec state against what was
+requested before it will record a single cell.
+
+Also: `$w` cannot expand into an environment assignment -- bash parses assignment
+prefixes before expansion, so an expanded `VAR=VAL` becomes a command name. Use `env`.
