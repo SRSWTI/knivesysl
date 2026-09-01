@@ -24967,6 +24967,14 @@ static unsigned long long *h_samp_seed = NULL;
 static float *g_samp_temp = NULL;
 static unsigned long long *g_samp_seed = NULL;
 static int   *g_samp_ctr = NULL;
+// Paged speculative decoding: draft chains verified in one fused wave (see the
+// block after qwn_paged_prefill_batch). Snapshot slabs let a partially-accepted
+// slot rewind its DeltaNet state.
+#define TQ_PG_SPEC_COLS 64                 // max total chain columns per round
+#define TQ_PG_SPEC_MAXD 15                 // max draft tokens per chain
+static float *g_pg_spec_state = NULL;      // nspec x paged_state_floats() snapshot lanes
+static int    g_pg_spec_n = -1;            // usable lanes; -1 = not yet sized
+static size_t g_pg_spec_sf = 0;
 static int     *g_pf_colslot = NULL; static int g_pf_colslot_cap = 0;  // prefill wave column->slot
 static float   *g_pg_logits = NULL;
 static int     *g_pg_argmax = NULL;
@@ -24990,6 +24998,8 @@ static void paged_free_all(void) {
     if (g_samp_temp) { cudaFree(g_samp_temp); g_samp_temp = NULL; }
     if (g_samp_seed) { cudaFree(g_samp_seed); g_samp_seed = NULL; }
     if (g_samp_ctr) { cudaFree(g_samp_ctr); g_samp_ctr = NULL; }
+    if (g_pg_spec_state) { cudaFree(g_pg_spec_state); g_pg_spec_state = NULL; }
+    g_pg_spec_n = -1; g_pg_spec_sf = 0;
     if (g_pf_colslot) { cudaFree(g_pf_colslot); g_pf_colslot = NULL; } g_pf_colslot_cap = 0;
     if (g_attn_pacc) { cudaFree(g_attn_pacc); g_attn_pacc = NULL; } g_attn_pacc_n = 0;
     if (g_attn_pml) { cudaFree(g_attn_pml); g_attn_pml = NULL; } g_attn_pml_n = 0;
@@ -25070,8 +25080,9 @@ extern "C" int qwn_paged_init(int max_slots, int num_blocks, int page) {
     if (cudaMalloc(&g_block_table, btn * sizeof(int)) != cudaSuccess) { paged_free_all(); return -6; }
     if (cudaMalloc(&g_slot_ids, (size_t)max_slots * sizeof(int)) != cudaSuccess) { paged_free_all(); return -6; }
     if (cudaMalloc(&g_iota, (size_t)max_slots * sizeof(int)) != cudaSuccess) { paged_free_all(); return -6; }
-    if (cudaMalloc(&g_pg_logits, (size_t)max_slots * g_qwen.V * sizeof(float)) != cudaSuccess) { paged_free_all(); return -6; }
-    if (cudaMalloc(&g_pg_argmax, (size_t)max_slots * sizeof(int)) != cudaSuccess) { paged_free_all(); return -6; }
+    int lm_rows = max_slots > TQ_PG_SPEC_COLS ? max_slots : TQ_PG_SPEC_COLS;  // spec emits per-column
+    if (cudaMalloc(&g_pg_logits, (size_t)lm_rows * g_qwen.V * sizeof(float)) != cudaSuccess) { paged_free_all(); return -6; }
+    if (cudaMalloc(&g_pg_argmax, (size_t)lm_rows * sizeof(int)) != cudaSuccess) { paged_free_all(); return -6; }
     int samp_rows = max_slots > 256 ? max_slots : 256;    // prefill waves seed <= 256 segments
     if (cudaMalloc(&g_samp_temp, (size_t)samp_rows * sizeof(float)) != cudaSuccess) { paged_free_all(); return -6; }
     if (cudaMalloc(&g_samp_seed, (size_t)samp_rows * sizeof(unsigned long long)) != cudaSuccess) { paged_free_all(); return -6; }
@@ -25756,6 +25767,150 @@ extern "C" int qwn_paged_prefill_batch(const int *tokens, const int *col_slot, c
     g_wave_ms += (tb.tv_sec - ta.tv_sec) * 1e3 + (tb.tv_nsec - ta.tv_nsec) * 1e-6;
     g_wave_n++;
     return rc;
+}
+
+// ==================== Paged speculative decoding (chain verify) ====================
+// One round: each participating slot brings a DRAFT CHAIN (server-side n-gram, or
+// any other source); [seed, draft...] is a normal prefill segment, so ONE fused
+// wave advances KV + DeltaNet state for every slot's chain while reading the
+// weights once. The emission pass then runs final-norm + lm_head + the per-slot
+// sampler over ALL chain columns; the host accept-walk keeps the longest prefix
+// where the model's own emission agrees with the draft. Guarantees, measured:
+// GREEDY is token-exact vs plain decode (argmax is robust to the wave-vs-step
+// eps difference; gated on count/prose/code suites incl. fused N=2). SAMPLED is
+// seed-replayable within spec mode (position-keyed RNG) and eps-equivalent
+// across modes: the wave path's logits differ from the decode step's at float
+// eps (same class as split-k, README "98.32% TF agreement"), and a Gumbel draw
+// can flip a near-tied candidate, forking an otherwise-identical stream.
+//
+// DeltaNet state cannot rewind, so each slot's state is snapshotted into a spec
+// lane before the wave; a partially-accepted slot restores and replays only its
+// accepted tokens (one extra small wave shared by all partial slots -- a full
+// accept skips it entirely). KV needs no rollback: rejected rows sit past the
+// committed position (attention is position-gated) and are overwritten on the
+// next visit. Rejected rows can never touch APC-shared blocks: spec writes only
+// at pos >= the committed end, and every block there is slot-owned by
+// construction (adopt/fork COPY the tail block; shared full blocks end below
+// the committed position).
+//
+// This is also the FIRST spec path that runs on the NVFP4 tier: the single-
+// stream spec route reads FP6 fragments (w->d_A) freed by the NVFP4 repack
+// (-120), while this round rides the NVFP4-native paged wave core.
+static int paged_spec_pool_init(void) {
+    if (g_pg_spec_n >= 0) return g_pg_spec_n;
+    const char *e = getenv("TQ_PG_SPEC_SLOTS");
+    int want = e ? atoi(e) : 4;
+    if (want > g_pg_maxslots) want = g_pg_maxslots;
+    g_pg_spec_sf = paged_state_floats();
+    for (int n = want; n > 0; n >>= 1) {
+        if (cudaMalloc(&g_pg_spec_state, (size_t)n * g_pg_spec_sf * sizeof(float)) == cudaSuccess) {
+            g_pg_spec_n = n;
+            fprintf(stderr, "[paged] spec state slabs: %d x %.1f MB\n",
+                    n, g_pg_spec_sf * sizeof(float) / 1048576.0);
+            return n;
+        }
+    }
+    g_pg_spec_state = NULL; g_pg_spec_n = 0;
+    fprintf(stderr, "[paged] spec state slabs: no VRAM, paged spec disabled\n");
+    return 0;
+}
+
+// One fused speculative round over up to paged_spec_pool_init() slots. drafts is
+// row-major [N x maxd]; dlens[i] <= maxd. out_tokens is [N x (maxd+1)];
+// out_m[i] = COMMITTED emissions (accepted prefix + the bonus token). dlen=0
+// degenerates to plain decode (1-column segment, 1 emission), so plain and spec
+// share one path. Returns 0, or <0 (whole round failed, no tokens committed --
+// a failed round may leave a partial slot restored-but-unreplayed; the server
+// must fail those requests, matching the wave-error contract).
+extern "C" int qwn_paged_spec_round(const int *slots, const int *seeds, const int *poss,
+                                    const int *drafts, const int *dlens, int N, int maxd,
+                                    int *out_tokens, int *out_m) {
+    if (!g_pg_ready) return -1;
+    if (N < 1 || N > 64 || maxd < 0 || maxd > TQ_PG_SPEC_MAXD) return -2;
+    int nspec = paged_spec_pool_init();
+    if (nspec < 1 || N > nspec) return -3;       // server caps its spec batch at nspec
+    int cols_tok[TQ_PG_SPEC_COLS], cols_slot[TQ_PG_SPEC_COLS], cols_pos[TQ_PG_SPEC_COLS];
+    int seg_slot[64], seg_off[64], seg_len[64], seg_fin[64], oseed[64];
+    int T = 0;
+    for (int i = 0; i < N; i++) {
+        int slot = slots[i], dl = dlens[i];
+        if (slot < 0 || slot >= g_pg_maxslots || dl < 0 || dl > maxd) return -4;
+        if (T + dl + 1 > TQ_PG_SPEC_COLS) return -5;
+        seg_slot[i] = slot; seg_off[i] = T; seg_len[i] = dl + 1; seg_fin[i] = 0;
+        cols_tok[T] = seeds[i]; cols_slot[T] = slot; cols_pos[T] = poss[i]; T++;
+        for (int j = 0; j < dl; j++) {
+            cols_tok[T] = drafts[(size_t)i * maxd + j];
+            cols_slot[T] = slot; cols_pos[T] = poss[i] + 1 + j; T++;
+        }
+        // snapshot the recurrent state (lane i): the wave advances it in place.
+        // dlen=0 slots are plain decode (nothing to rewind) -- skip the copy.
+        if (dl > 0)
+            paged_state_slot_to(g_pg_spec_state + (size_t)i * g_pg_spec_sf, slot);
+    }
+    wide_quant_reset();
+    int rc = run_paged_prefill_wave_core(cols_tok, cols_slot, cols_pos,
+                                         seg_slot, seg_off, seg_len, seg_fin, N, T, oseed);
+    if (rc != 0) return rc;
+    // emission pass: final norm + wide lm_head + per-slot sampler over ALL T columns
+    if (!(!g_qwen.tie_word_embeddings && g_qwen.lm_head.e2m3 && !g_qwen.lm_head.e2m3_byte &&
+          !g_qwen.lm_head.word_major && can_use_qmma_sf_weight(&g_qwen.lm_head) && !g_qwen.lm_head.row_major))
+        return -7;                               // spec requires the wide lm_head tier
+    k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(T), T), 1024, 0, g_qwen.stream>>>(
+        g_wide_norm, g_wide_h, g_qwen.d_norm, g_qwen.H, g_qwen.eps);
+    wide_quant_reset();
+    int ret;
+    if ((ret = wide_quant_input(g_wide_norm, g_qwen.H, T)) != 0) return ret;
+    if ((ret = wide_proj(&g_qwen.lm_head, g_pg_logits, T)) != 0) return ret;
+    {
+        static float hs_t[TQ_PG_SPEC_COLS]; static unsigned long long hs_s[TQ_PG_SPEC_COLS];
+        static int hs_c[TQ_PG_SPEC_COLS];
+        int any_samp = 0;
+        for (int c = 0; c < T; c++) {
+            int s = cols_slot[c];
+            hs_t[c] = h_samp_temp[s]; hs_s[c] = h_samp_seed[s]; hs_c[c] = cols_pos[c] + 1;
+            if (hs_t[c] > 0.0f) any_samp = 1;
+        }
+        if (any_samp) {
+            cudaMemcpyAsync(g_samp_temp, hs_t, (size_t)T * sizeof(float), cudaMemcpyHostToDevice, g_qwen.stream);
+            cudaMemcpyAsync(g_samp_seed, hs_s, (size_t)T * sizeof(unsigned long long), cudaMemcpyHostToDevice, g_qwen.stream);
+            cudaMemcpyAsync(g_samp_ctr, hs_c, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+            float mp = spec_min_p();
+            k_tq_batched_sample<<<T, 256, 0, g_qwen.stream>>>(g_pg_argmax, g_pg_logits, g_qwen.V, T,
+                g_samp_temp, g_samp_seed, g_samp_ctr, (mp > 0.0f) ? logf(mp) : -3.0e38f);
+        } else {
+            k_tq_batched_argmax<<<T, 256, 0, g_qwen.stream>>>(g_pg_argmax, g_pg_logits, g_qwen.V, T);
+        }
+    }
+    int emit[TQ_PG_SPEC_COLS];
+    cudaMemcpyAsync(emit, g_pg_argmax, (size_t)T * sizeof(int), cudaMemcpyDeviceToHost, g_qwen.stream);
+    if (cudaStreamSynchronize(g_qwen.stream) != cudaSuccess) return -8;
+    // accept-walk per slot + one batched replay wave for partially-accepted slots
+    int r_ct[TQ_PG_SPEC_COLS], r_cs[TQ_PG_SPEC_COLS], r_cp[TQ_PG_SPEC_COLS];
+    int r_ss[64], r_so[64], r_sl[64], r_sf[64], r_os[64];
+    int RT = 0, RK = 0;
+    for (int i = 0; i < N; i++) {
+        int off = seg_off[i], dl = dlens[i];
+        int a = 0;
+        while (a < dl && drafts[(size_t)i * maxd + a] == emit[off + a]) a++;
+        int m = a + 1;                           // committed emissions e_0..e_a
+        for (int j = 0; j < m; j++) out_tokens[(size_t)i * (maxd + 1) + j] = emit[off + j];
+        out_m[i] = m;
+        if (a < dl) {                            // partial: restore, then replay accepted inputs
+            paged_state_to_slot(g_pg_spec_state + (size_t)i * g_pg_spec_sf, slots[i]);
+            r_ss[RK] = slots[i]; r_so[RK] = RT; r_sl[RK] = a + 1; r_sf[RK] = 0; RK++;
+            r_ct[RT] = seeds[i]; r_cs[RT] = slots[i]; r_cp[RT] = poss[i]; RT++;
+            for (int j = 0; j < a; j++) {
+                r_ct[RT] = drafts[(size_t)i * maxd + j];
+                r_cs[RT] = slots[i]; r_cp[RT] = poss[i] + 1 + j; RT++;
+            }
+        }
+    }
+    if (RK > 0) {
+        wide_quant_reset();
+        rc = run_paged_prefill_wave_core(r_ct, r_cs, r_cp, r_ss, r_so, r_sl, r_sf, RK, RT, r_os);
+        if (rc != 0) return rc;
+    }
+    return 0;
 }
 
 // ============================ Chunked prefill ============================

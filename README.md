@@ -242,6 +242,29 @@ cta now carries all six query heads that share a kv head:
 now sustains 1.56 tb/s = 87% of this card's dram peak, so decode's remaining headroom is
 attention and the deltanet recurrence, not the weight read.
 
+### paged sampling + paged spec decode (status)
+
+the batched server now samples per slot: `temperature`/`seed` in the request map to
+an engine-side gumbel-max draw (spec-sampler semantics, `TQ_MIN_P` tail floor,
+position-keyed rng -> same seed + prompt replays the same tokens). temp 0 stays the
+bit-exact greedy path; gated on cross-build greedy regression, seed replay, and
+concurrent slot isolation. omitted temperature stays greedy on purpose (agentic
+clients want determinism and apc-friendly replays).
+
+paged speculative decoding (chain verify: server-side 4-gram drafts, one fused wave
+verifies every slot's chain, deltanet snapshot/rollback, apc-safe by construction,
+first spec path that runs on the nvfp4 tier at all) is implemented, greedy-bit-exact
+gated, and measured across (2k..128k) x (n=1,2,4) -- and ships OFF by default
+(`TQ_PAGED_SPEC=1` opts in): the verify wave runs chunk-256 deltanet scans and
+mma-prefill attention on ~9-column chains, costing 4-8x a decode step, which the
+measured 2.8-8.7 accepted tokens/round never repays. the drafter and the round are
+the keepers; the follow-up is a small-T spec path in the wave core (decode-attention
+batching + the spec-class fused deltanet) with break-even at round <= step x
+tok/round.
+
+![spec matrix](docs/apc/spec_matrix.svg)
+![spec accept rates](docs/apc/spec_accept.svg)
+
 ---
 
 ## how it works

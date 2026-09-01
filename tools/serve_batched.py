@@ -47,6 +47,8 @@ def load_lib(path):
     L.qwn_paged_reset_slot.argtypes = [ctypes.c_int]; L.qwn_paged_reset_slot.restype = ctypes.c_int
     L.qwn_paged_set_sampling.argtypes = [ctypes.c_int, ctypes.c_float, ctypes.c_ulonglong]
     L.qwn_paged_set_sampling.restype = ctypes.c_int
+    L.qwn_paged_spec_round.argtypes = [ctypes.POINTER(ctypes.c_int)] * 5 + [ctypes.c_int, ctypes.c_int] + [ctypes.POINTER(ctypes.c_int)] * 2
+    L.qwn_paged_spec_round.restype = ctypes.c_int
     L.qwn_paged_load_client.argtypes = [ctypes.c_int, ctypes.c_int]; L.qwn_paged_load_client.restype = ctypes.c_int
     L.qwn_paged_ckpt_save.argtypes = [ctypes.c_int, ctypes.c_int]; L.qwn_paged_ckpt_save.restype = ctypes.c_int
     L.qwn_paged_ckpt_adopt.argtypes = [ctypes.c_int, ctypes.c_int]; L.qwn_paged_ckpt_adopt.restype = ctypes.c_int
@@ -123,11 +125,12 @@ def ck(r, what):
 class Request:
     __slots__ = ("ids", "max_new", "eos", "out", "done", "slot", "pos", "next_tok",
                  "started", "t_admit", "t_first", "t_done", "t_tok", "n_prompt", "err",
-                 "progress", "cancel", "temp", "seed")
+                 "progress", "cancel", "temp", "seed", "ng", "ng_n", "acc_ema")
 
     def __init__(self, ids, max_new, eos, temp=0.0, seed=0):
         self.ids = ids; self.max_new = max_new; self.eos = set(eos)
         self.temp = float(temp); self.seed = int(seed) & 0xFFFFFFFFFFFFFFFF
+        self.ng = None; self.ng_n = 0; self.acc_ema = 1.0
         self.out = []; self.done = threading.Event(); self.slot = -1
         self.pos = 0; self.next_tok = 0; self.started = False
         self.t_admit = self.t_first = self.t_done = self.t_tok = 0.0; self.n_prompt = len(ids); self.err = None
@@ -174,6 +177,17 @@ class BatchedEngine:
         self.running = True
         self.steps = 0; self.decoded_tokens = 0
         self.prefill_waves = 0; self.prefilled_tokens = 0
+        # paged speculative decoding (chain verify): CORRECT (greedy bit-exact,
+        # APC-safe, NVFP4-native) but not yet PROFITABLE -- the verify wave runs
+        # chunk-256 DeltaNet scans + MMA-prefill attention on ~9-column chains,
+        # costing 4-8x a decode step (measured 2026-09-01: slower at every
+        # (ctx, n) cell despite 2.8-8.7 accepted tokens/round). Opt-in until the
+        # wave core grows a small-T spec path (decode-attention batching + the
+        # spec-class fused DeltaNet); break-even needs round <= step * tok/round.
+        self.spec_on = os.environ.get("TQ_PAGED_SPEC", "0") == "1"
+        self.spec_slots = max(1, int(os.environ.get("TQ_PG_SPEC_SLOTS", "4")))
+        self.spec_maxd = max(0, min(15, int(os.environ.get("TQ_PAGED_SPEC_D", "8"))))
+        self.spec_rounds = 0; self.spec_committed = 0; self.spec_drafted = 0
         # wave cost accounting (see _wave / _loop)
         self.t_marshal = 0.0; self.t_engine = 0.0; self.t_loop = 0.0; self.t_idle = 0.0
         # per-wave timeline for scheduler diagnosis: (t_end, engine_ms, pref_cols,
@@ -419,7 +433,11 @@ class BatchedEngine:
         if not self.pref:
             self.starve = 0
             if self.active:
-                self._step(); self.last_decode = time.time()
+                if self.spec_on and len(self.active) <= self.spec_slots:
+                    self._spec_step()
+                else:
+                    self._step()
+                self.last_decode = time.time()
             return
         cols_tok = []; cols_slot = []; cols_pos = []
         seg_slot = []; seg_off = []; seg_len = []; seg_fin = []
@@ -515,6 +533,89 @@ class BatchedEngine:
         req.t_done = time.time()
         req.done.set()
         req.progress.set()
+
+    def _draft(self, req):
+        """Recency n-gram draft from the request's OWN history: 4-grams of
+        (prompt + generated) are indexed incrementally; the draft is whatever
+        followed the latest PRIOR occurrence of the current 4-token tail.
+        Gated by a per-request accept EMA: requests whose drafts keep getting
+        rejected stop paying for verify waves (prose degrades to plain decode),
+        with a slow upward probe so bursty repetition re-enables drafting."""
+        if req.acc_ema < 0.2:
+            req.acc_ema = min(1.0, req.acc_ema + 0.01)   # re-probe after ~20 rounds
+            return []
+        seq = req.ids + req.out
+        n = len(seq)
+        if req.ng is None:
+            req.ng = {}; req.ng_n = 0
+        g = req.ng
+        for i in range(max(req.ng_n, 3), n - 1):   # exclude the live tail gram
+            g[(seq[i - 3], seq[i - 2], seq[i - 1], seq[i])] = i + 1
+        req.ng_n = max(req.ng_n, n - 1)
+        if n < 4:
+            return []
+        j = g.get((seq[n - 4], seq[n - 3], seq[n - 2], seq[n - 1]))
+        if not j or j >= n:
+            return []
+        return seq[j:j + self.spec_maxd]
+
+    def _spec_step(self):
+        """One fused speculative round over every active slot (chain verify;
+        dlen=0 slots are plain decode inside the same wave). Greedy outputs are
+        token-exact vs _step; sampled outputs are seed-replayable within spec
+        mode and eps-equivalent across modes (wave-path logits differ from the
+        decode step at float eps; a Gumbel draw can flip a near-tie)."""
+        slots = list(self.active.keys())
+        n = len(slots)
+        maxd = self.spec_maxd
+        sl = (ctypes.c_int * n)(*slots)
+        seeds = (ctypes.c_int * n)(*[self.active[s].next_tok for s in slots])
+        pos = (ctypes.c_int * n)(*[self.active[s].pos for s in slots])
+        dl = (ctypes.c_int * n)()
+        dr = (ctypes.c_int * max(1, n * maxd))()
+        for j, s in enumerate(slots):
+            d = self._draft(self.active[s]) if maxd > 0 else []
+            dl[j] = len(d)
+            for k2, t in enumerate(d):
+                dr[j * maxd + k2] = t
+            self.spec_drafted += len(d)
+        if not any(dl[j] for j in range(n)):
+            return self._step()                    # nothing drafted: zero-overhead round
+        out = (ctypes.c_int * (n * (maxd + 1)))()
+        om = (ctypes.c_int * n)()
+        _t1 = time.perf_counter()
+        rc = self.L.qwn_paged_spec_round(sl, seeds, pos, dr, dl, n, maxd, out, om)
+        _t2 = time.perf_counter()
+        if rc != 0:
+            # a failed round can leave a partial slot rewound-but-unreplayed:
+            # fail the participants (the _loop wave-error contract handles it)
+            raise RuntimeError(f"paged spec round rc={rc} (N={n} maxd={maxd})")
+        if len(self.wavelog) < 65536:
+            self.wavelog.append((_t2, (_t2 - _t1) * 1e3, 0, n, n, 2))
+        self.spec_rounds += 1
+        finished = []
+        _tnow = time.time()
+        for j, s in enumerate(slots):
+            req = self.active[s]
+            m = om[j]
+            self.spec_committed += m
+            self.decoded_tokens += m
+            if dl[j] > 0:                          # accept EMA drives the draft gate
+                req.acc_ema = 0.7 * req.acc_ema + 0.3 * ((m - 1) / dl[j])
+            fin = False
+            for k2 in range(m):
+                o = out[j * (maxd + 1) + k2]
+                req.out.append(o); req.pos += 1; req.next_tok = o
+                if req.cancel or o in req.eos or len(req.out) >= req.max_new:
+                    fin = True
+                    break
+            req.t_tok = _tnow
+            req.progress.set()
+            if fin or req.cancel:
+                finished.append(s)
+        self.steps += 1
+        for s in finished:
+            self._detach(s)
 
     def _step(self):
         slots = list(self.active.keys())
@@ -796,7 +897,13 @@ def make_handler(eng, tok, args):
                                                   "checkpoints": len(eng.cks),
                                                   "hits": eng.pc_hits, "misses": eng.pc_misses,
                                                   "builds": eng.pc_builds,
-                                                  "tokens_saved": eng.pc_saved}})
+                                                  "tokens_saved": eng.pc_saved},
+                                 "spec": {"enabled": eng.spec_on,
+                                          "rounds": eng.spec_rounds,
+                                          "committed": eng.spec_committed,
+                                          "drafted": eng.spec_drafted,
+                                          "tokens_per_round": (eng.spec_committed / eng.spec_rounds)
+                                                              if eng.spec_rounds else 0.0}})
             elif self.path.startswith("/waveprof"):
                 # Where a wave's wall time actually goes. `engine_inside` is measured by
                 # the engine itself; `engine` is what Python sees around the ctypes call,
