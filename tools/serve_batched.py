@@ -125,12 +125,12 @@ def ck(r, what):
 class Request:
     __slots__ = ("ids", "max_new", "eos", "out", "done", "slot", "pos", "next_tok",
                  "started", "t_admit", "t_first", "t_done", "t_tok", "n_prompt", "err",
-                 "progress", "cancel", "temp", "seed", "ng", "ng_n", "acc_ema")
+                 "progress", "cancel", "temp", "seed", "ng", "ng_n", "acc_ema", "seq")
 
     def __init__(self, ids, max_new, eos, temp=0.0, seed=0):
         self.ids = ids; self.max_new = max_new; self.eos = set(eos)
         self.temp = float(temp); self.seed = int(seed) & 0xFFFFFFFFFFFFFFFF
-        self.ng = None; self.ng_n = 0; self.acc_ema = 1.0
+        self.ng = None; self.ng_n = 0; self.acc_ema = 1.0; self.seq = None
         self.out = []; self.done = threading.Event(); self.slot = -1
         self.pos = 0; self.next_tok = 0; self.started = False
         self.t_admit = self.t_first = self.t_done = self.t_tok = 0.0; self.n_prompt = len(ids); self.err = None
@@ -433,7 +433,13 @@ class BatchedEngine:
         if not self.pref:
             self.starve = 0
             if self.active:
-                if self.spec_on and len(self.active) <= self.spec_slots:
+                # depth gate: the verify round costs step x 1.23@1.5k / 1.47@8k /
+                # 2.0@24k (wavelog microbench 2026-09-01) -- spec only where the
+                # accept rate can pay. TQ_PAGED_SPEC_MAXPOS=0 removes the gate.
+                spec_maxpos = int(os.environ.get("TQ_PAGED_SPEC_MAXPOS", "65536"))
+                if (self.spec_on and len(self.active) <= self.spec_slots
+                        and (spec_maxpos <= 0
+                             or all(r.pos <= spec_maxpos for r in self.active.values()))):
                     self._spec_step()
                 else:
                     self._step()
@@ -535,26 +541,33 @@ class BatchedEngine:
         req.progress.set()
 
     def _draft(self, req):
-        """Recency n-gram draft from the request's OWN history: 4-grams of
-        (prompt + generated) are indexed incrementally; the draft is whatever
-        followed the latest PRIOR occurrence of the current 4-token tail.
-        Gated by a per-request accept EMA: requests whose drafts keep getting
-        rejected stop paying for verify waves (prose degrades to plain decode),
-        with a slow upward probe so bursty repetition re-enables drafting."""
+        """Recency n-gram draft from the request's OWN history, longest-suffix
+        cascade (5-gram, then 4, then 3 -- the vLLM prompt-lookup precision
+        order): the draft is whatever followed the latest PRIOR occurrence of
+        the current tail. The materialized token list lives on the request and
+        grows incrementally (req.seq): rebuilding ids+out per round was an
+        O(context) copy that ate the engine's win at depth. Gated by a
+        per-request accept EMA with a slow upward re-probe."""
         if req.acc_ema < 0.2:
             req.acc_ema = min(1.0, req.acc_ema + 0.01)   # re-probe after ~20 rounds
             return []
-        seq = req.ids + req.out
+        if req.seq is None or len(req.seq) != req.n_prompt + len(req.out):
+            req.seq = req.ids + req.out                  # one rebuild, then extended in place
+        seq = req.seq
         n = len(seq)
         if req.ng is None:
-            req.ng = {}; req.ng_n = 0
-        g = req.ng
-        for i in range(max(req.ng_n, 3), n - 1):   # exclude the live tail gram
-            g[(seq[i - 3], seq[i - 2], seq[i - 1], seq[i])] = i + 1
+            req.ng = ({}, {}, {}); req.ng_n = 0
+        g5, g4, g3 = req.ng
+        for i in range(max(req.ng_n, 4), n - 1):   # exclude the live tail gram
+            g5[(seq[i - 4], seq[i - 3], seq[i - 2], seq[i - 1], seq[i])] = i + 1
+            g4[(seq[i - 3], seq[i - 2], seq[i - 1], seq[i])] = i + 1
+            g3[(seq[i - 2], seq[i - 1], seq[i])] = i + 1
         req.ng_n = max(req.ng_n, n - 1)
-        if n < 4:
+        if n < 5:
             return []
-        j = g.get((seq[n - 4], seq[n - 3], seq[n - 2], seq[n - 1]))
+        j = (g5.get((seq[n - 5], seq[n - 4], seq[n - 3], seq[n - 2], seq[n - 1]))
+             or g4.get((seq[n - 4], seq[n - 3], seq[n - 2], seq[n - 1]))
+             or g3.get((seq[n - 3], seq[n - 2], seq[n - 1])))
         if not j or j >= n:
             return []
         return seq[j:j + self.spec_maxd]
@@ -608,6 +621,8 @@ class BatchedEngine:
             for k2 in range(m):
                 o = out[j * (maxd + 1) + k2]
                 req.out.append(o); req.pos += 1; req.next_tok = o
+                if req.seq is not None:
+                    req.seq.append(o)
                 if req.cancel or o in req.eos or len(req.out) >= req.max_new:
                     fin = True
                     break
