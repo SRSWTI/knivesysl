@@ -25,6 +25,9 @@ ap.add_argument("--workload", choices=["repetitive", "prose"], default="repetiti
                 help="prose = ngram-hostile (probes the EMA/depth gating cost floor)")
 ap.add_argument("--pool-tokens", type=int, default=230000, help="num_blocks*page budget")
 ap.add_argument("--slots", type=int, default=4)
+ap.add_argument("--only", default="", help="probe filter: 'ctx:n,ctx:n' (e.g. 8192:1,32768:2)")
+ap.add_argument("--ns", default="1,2,4", help="concurrency rungs, comma-separated")
+ap.add_argument("--model", default="ksl", help="served model name (sglang reference uses its own)")
 args = ap.parse_args()
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -32,7 +35,7 @@ corpus = open(os.path.join(HERE, "build-qwen", "tf_corpus_e3cdb42.txt")).read()
 CHR = 2.87                       # measured chars/token for this corpus+tokenizer
 
 CTXS = [2048, 8192, 32768, 65536, 94208, 131072]
-NS = [1, 2, 4]
+NS = [int(x) for x in args.ns.split(",")]
 
 def prompt_for(ctx_tok, ci):
     need = int(ctx_tok * CHR)
@@ -46,7 +49,7 @@ def prompt_for(ctx_tok, ci):
 
 
 def stream_one(prompt, out, ci=0):
-    body = {"model": "ksl", "max_tokens": args.gen, "temperature": args.temp, "stream": True,
+    body = {"model": args.model, "max_tokens": args.gen, "temperature": args.temp, "stream": True,
             "ignore_eos": True, "messages": [{"role": "user", "content": prompt}],
             "chat_template_kwargs": {"enable_thinking": False}}
     if args.temp > 0:
@@ -72,7 +75,11 @@ def stream_one(prompt, out, ci=0):
 
 
 def health():
-    return json.loads(urllib.request.urlopen(args.url + "/health", timeout=10).read())
+    # foreign servers (sglang reference) have no knivesysl /health contract
+    try:
+        return json.loads(urllib.request.urlopen(args.url + "/health", timeout=10).read())
+    except Exception:
+        return {}
 
 
 def run_cell(ctx, n):
@@ -86,8 +93,9 @@ def run_cell(ctx, n):
     h1 = health()
     toks = sum(o["n_tok"] for o in outs)
     dec = [o["n_tok"] / o["dec_s"] for o in outs if o["dec_s"] > 0]
-    rounds = h1["spec"]["rounds"] - h0["spec"]["rounds"]
-    committed = h1["spec"]["committed"] - h0["spec"]["committed"]
+    s0, s1 = h0.get("spec", {}), h1.get("spec", {})
+    rounds = s1.get("rounds", 0) - s0.get("rounds", 0)
+    committed = s1.get("committed", 0) - s0.get("committed", 0)
     return {"ctx": ctx, "n": n, "wall": wall,
             "ttft_max": max((o["ttft"] or 0) for o in outs),
             "dec_toks": toks,
@@ -103,8 +111,11 @@ def main():
     # warmup: autotune + allocator paths
     w = []; stream_one(prompt_for(2048, 99), w)
     results = []
+    only = {tuple(map(int, c.split(":"))) for c in args.only.split(",") if c}
     for ctx in CTXS:
         for n in NS:
+            if only and (ctx, n) not in only:
+                continue
             if n * (ctx + args.gen + 64) > args.pool_tokens or n > args.slots:
                 continue
             r = run_cell(ctx, n)
