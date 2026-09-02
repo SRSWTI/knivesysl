@@ -25232,9 +25232,13 @@ static int paged_split_S_gqa(int N, int max_pos) {
 // v2 runs 2 CTAs/SM (35 KB smem); size S so nkv*N*S fills whole resident waves.
 // Measured at 131k n=1: auto-64 (1.5 waves at 1/SM) 44.0 tok/s, S=42 47.7,
 // S=84 48.4 -- wave-aligned splits win. s_work floor keeps partials cheap.
+// Decode-graph capture pins S so the captured grid matches the bucket key;
+// -1 = normal heuristic. Set/cleared around capture and its eager warm run.
+static int g_paged_S_force = -1;
 static int paged_split_S_gqa_v2(int N, int max_pos) {
     static int forced = -2;
     if (forced == -2) { const char *e = getenv("TQ_PAGED_SPLIT"); forced = e ? atoi(e) : -1; }
+    if (g_paged_S_force > 0) return g_paged_S_force;
     if (forced >= 0) return forced < 1 ? 1 : forced;
     int total = max_pos + 1, sm = paged_sm_count(), blocks0 = g_qwen.nkv * N;
     if (blocks0 < 1) blocks0 = 1;
@@ -26027,29 +26031,57 @@ extern "C" int qwn_paged_fork(int src, int dst, int pos) {
     return 0;
 }
 
+// --- decode-step CUDA graph (SGLang recipe, ported): the whole step is one
+// captured kernel+copy sequence whose input BUFFERS are address-stable; each
+// replay only rewrites buffer CONTENTS (pinned staging + block table + samp
+// params). Bucketed by (N, attention split S, sampling branch); the eager
+// first step pre-sizes every lazy allocation so capture never hits cudaMalloc.
+// TQ_DECODE_GRAPH=0 disables (default on once validated; see handoff 5.6.2).
+static int *h_dec_tok = NULL, *h_dec_slot = NULL, *h_dec_pos = NULL;   // pinned staging
+static int *g_dec_tok = NULL;                                          // device token ids
+static float *hs_samp_t = NULL;                                        // pinned samp staging
+static unsigned long long *hs_samp_s = NULL;
+static int *hs_samp_c = NULL;
+#define TQ_DEC_GRAPHS 8
+static struct { int key_n, key_s, key_samp, valid; cudaGraphExec_t exec; } g_dec_graph[TQ_DEC_GRAPHS];
+static int g_dec_graph_n = 0, g_dec_graph_warm = 0, g_dec_graph_dead = 0;
+static int dec_graph_enabled(void) {
+    static int en = -1;
+    if (en < 0) { const char *e = getenv("TQ_DECODE_GRAPH"); en = (e && e[0]) ? !!atoi(e) : 0; }
+    return en;
+}
+static int ensure_dec_staging(void) {
+    if (h_dec_tok) return 0;
+    int cap = g_pg_maxslots < 256 ? 256 : g_pg_maxslots;
+    if (cudaMallocHost(&h_dec_tok, cap * sizeof(int)) != cudaSuccess) return -1;
+    if (cudaMallocHost(&h_dec_slot, cap * sizeof(int)) != cudaSuccess) return -1;
+    if (cudaMallocHost(&h_dec_pos, cap * sizeof(int)) != cudaSuccess) return -1;
+    if (cudaMallocHost(&hs_samp_t, cap * sizeof(float)) != cudaSuccess) return -1;
+    if (cudaMallocHost(&hs_samp_s, cap * sizeof(unsigned long long)) != cudaSuccess) return -1;
+    if (cudaMallocHost(&hs_samp_c, cap * sizeof(int)) != cudaSuccess) return -1;
+    if (cudaMalloc(&g_dec_tok, cap * sizeof(int)) != cudaSuccess) return -1;
+    return 0;
+}
+
 // One paged decode step over N active columns. column j -> slot_ids[j] (persistent slot);
 // tokens[j] is decoded at positions[j] (its own KV history via the block table).
-static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, const int *positions, int N) {
+static int run_paged_decode_step_core(int N, int any_samp) {
     int H = g_qwen.H, attn_m = g_qwen.nh * g_qwen.hd;
     int lkh = g_qwen.linear_num_key_heads, lvh = g_qwen.linear_num_value_heads, ld = g_qwen.linear_value_head_dim;
     int value_dim = lvh * ld, key_dim = lkh * ld, conv_dim = 2 * key_dim + value_dim;
     int recur_f = batched_recur_floats(), conv_f = batched_conv_floats();
     int ret;
-    int dec_maxpos = 0;
-    for (int j = 0; j < N; j++) {
-        int slot = slot_ids_h[j];
-        if (slot < 0 || slot >= g_pg_maxslots) return -60;
-        if (positions[j] < 0 || positions[j] >= g_qwen.max_seq) return -61;
-        if (paged_ensure_blocks(slot, positions[j]) != 0) return -62;     // admission / pool full
-        if (positions[j] > dec_maxpos) dec_maxpos = positions[j];
-    }
+    int dec_maxpos = 0;                              // only steers the S heuristic;
+    for (int j = 0; j < N; j++)                      // under capture S is forced.
+        if (h_dec_pos[j] > dec_maxpos) dec_maxpos = h_dec_pos[j];
     cudaMemcpyAsync(g_block_table, h_block_table, (size_t)g_pg_maxslots * g_pg_maxblk * sizeof(int),
                     cudaMemcpyHostToDevice, g_qwen.stream);
-    cudaMemcpyAsync(g_slot_ids, slot_ids_h, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
-    cudaMemcpyAsync(g_wide_pos, positions, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+    cudaMemcpyAsync(g_slot_ids, h_dec_slot, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+    cudaMemcpyAsync(g_wide_pos, h_dec_pos, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+    cudaMemcpyAsync(g_dec_tok, h_dec_tok, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
     for (int j = 0; j < N; j++)
-        k_tq_embed_lookup<<<(H + 255) / 256, 256, 0, g_qwen.stream>>>(
-            g_wide_h + (size_t)j * H, g_qwen.d_embed, tokens[j], H);
+        k_tq_embed_lookup_ptr<<<(H + 255) / 256, 256, 0, g_qwen.stream>>>(
+            g_wide_h + (size_t)j * H, g_qwen.d_embed, g_dec_tok + j, H);
     for (int L = 0; L < g_qwen.L; L++) {
         tq_layer_t *l = &g_qwen.layers[L];
         if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION) {
@@ -26095,18 +26127,10 @@ static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, 
         !g_qwen.lm_head.word_major && can_use_qmma_sf_weight(&g_qwen.lm_head) && !g_qwen.lm_head.row_major) {
         if ((ret = wide_quant_input(g_wide_norm, H, N)) != 0) return -78;
         if ((ret = wide_proj(&g_qwen.lm_head, g_pg_logits, N)) != 0) return -78;
-        int any_samp = 0;
-        for (int j = 0; j < N && j < 256; j++)
-            if (h_samp_temp[slot_ids_h[j]] > 0.0f) { any_samp = 1; break; }
         if (any_samp && N <= 256) {
-            static float hs_t[256]; static unsigned long long hs_s[256]; static int hs_c[256];
-            for (int j = 0; j < N; j++) {
-                int s = slot_ids_h[j];
-                hs_t[j] = h_samp_temp[s]; hs_s[j] = h_samp_seed[s]; hs_c[j] = positions[j] + 1;
-            }
-            cudaMemcpyAsync(g_samp_temp, hs_t, (size_t)N * sizeof(float), cudaMemcpyHostToDevice, g_qwen.stream);
-            cudaMemcpyAsync(g_samp_seed, hs_s, (size_t)N * sizeof(unsigned long long), cudaMemcpyHostToDevice, g_qwen.stream);
-            cudaMemcpyAsync(g_samp_ctr, hs_c, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+            cudaMemcpyAsync(g_samp_temp, hs_samp_t, (size_t)N * sizeof(float), cudaMemcpyHostToDevice, g_qwen.stream);
+            cudaMemcpyAsync(g_samp_seed, hs_samp_s, (size_t)N * sizeof(unsigned long long), cudaMemcpyHostToDevice, g_qwen.stream);
+            cudaMemcpyAsync(g_samp_ctr, hs_samp_c, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
             float mp = spec_min_p();
             k_tq_batched_sample<<<N, 256, 0, g_qwen.stream>>>(g_pg_argmax, g_pg_logits, g_qwen.V, N,
                 g_samp_temp, g_samp_seed, g_samp_ctr, (mp > 0.0f) ? logf(mp) : -3.0e38f);
@@ -26131,7 +26155,86 @@ extern "C" int qwn_paged_decode_step(const int *tokens, const int *slot_ids, con
     if (N < 1 || N > g_pg_maxslots) return -2;
     wide_quant_reset();
     if (!g_qwen.kv_q4) return -3;
-    int ret = run_paged_decode_step_core(tokens, slot_ids, positions, N);
+    if (ensure_dec_staging() != 0) return -8;
+    // host pre-work (never captured): validation, block admission, staging fill
+    int dec_maxpos = 0, any_samp = 0;
+    for (int j = 0; j < N; j++) {
+        int slot = slot_ids[j];
+        if (slot < 0 || slot >= g_pg_maxslots) return -60;
+        if (positions[j] < 0 || positions[j] >= g_qwen.max_seq) return -61;
+        if (paged_ensure_blocks(slot, positions[j]) != 0) return -62;    // admission / pool full
+        if (positions[j] > dec_maxpos) dec_maxpos = positions[j];
+        h_dec_tok[j] = tokens[j]; h_dec_slot[j] = slot; h_dec_pos[j] = positions[j];
+        if (j < 256 && h_samp_temp[slot] > 0.0f) any_samp = 1;
+    }
+    if (any_samp && N <= 256)
+        for (int j = 0; j < N; j++) {
+            int s = slot_ids[j];
+            hs_samp_t[j] = h_samp_temp[s]; hs_samp_s[j] = h_samp_seed[s]; hs_samp_c[j] = positions[j] + 1;
+        }
+    int ret;
+    // graph path: QMMA lm_head + v2 attention only; anything else runs eager.
+    int graphable = dec_graph_enabled() && !g_dec_graph_dead && !g_qwen.tie_word_embeddings &&
+                    g_qwen.lm_head.e2m3 && !g_qwen.lm_head.e2m3_byte && !g_qwen.lm_head.word_major &&
+                    can_use_qmma_sf_weight(&g_qwen.lm_head) && !g_qwen.lm_head.row_major &&
+                    paged_attn_gqa() && paged_attn_v2();
+    if (!graphable) {
+        ret = run_paged_decode_step_core(N, any_samp);
+    } else {
+        int S = paged_split_S_gqa_v2(N, dec_maxpos);
+        int hit = -1;
+        for (int i = 0; i < g_dec_graph_n; i++)
+            if (g_dec_graph[i].valid && g_dec_graph[i].key_n == N &&
+                g_dec_graph[i].key_s == S && g_dec_graph[i].key_samp == any_samp) { hit = i; break; }
+        if (hit >= 0) {
+            ret = cudaGraphLaunch(g_dec_graph[hit].exec, g_qwen.stream) == cudaSuccess ? 0 : -81;
+        } else if (!g_dec_graph_warm) {
+            // first decode step sizes every lazy allocation at this exact shape
+            g_paged_S_force = S;
+            ret = run_paged_decode_step_core(N, any_samp);
+            g_paged_S_force = -1;
+            if (ret == 0) g_dec_graph_warm = 1;
+        } else {
+            g_paged_S_force = S;
+            cudaGraph_t graph = NULL;
+            cudaError_t cb = cudaStreamBeginCapture(g_qwen.stream, cudaStreamCaptureModeThreadLocal);
+            if (cb != cudaSuccess) {
+                fprintf(stderr, "TQ_DECODE_GRAPH: begin-capture failed (%s); eager this step\n",
+                        cudaGetErrorString(cb));
+                g_paged_S_force = -1;
+                ret = run_paged_decode_step_core(N, any_samp);
+            } else {
+                ret = run_paged_decode_step_core(N, any_samp);
+                cudaError_t ce = cudaStreamEndCapture(g_qwen.stream, &graph);
+                g_paged_S_force = -1;
+                if (ret != 0 || ce != cudaSuccess || !graph) {
+                    // A capture-hostile op invalidates the capture and errors every
+                    // later call in the core; nothing real executed. Exit capture,
+                    // clear the poison, disable further attempts, run the step for real.
+                    if (graph) cudaGraphDestroy(graph);
+                    cudaGetLastError();
+                    g_dec_graph_dead = 1;
+                    fprintf(stderr, "TQ_DECODE_GRAPH: capture failed (core=%d cuda=%s); eager fallback locked\n",
+                            ret, cudaGetErrorString(ce));
+                    ret = run_paged_decode_step_core(N, any_samp);
+                } else {
+                    cudaGraphExec_t exec = NULL;
+                    if (cudaGraphInstantiate(&exec, graph, NULL, NULL, 0) == cudaSuccess && exec) {
+                        int slot_i = g_dec_graph_n < TQ_DEC_GRAPHS ? g_dec_graph_n++ : 0;
+                        if (g_dec_graph[slot_i].valid) cudaGraphExecDestroy(g_dec_graph[slot_i].exec);
+                        g_dec_graph[slot_i].key_n = N; g_dec_graph[slot_i].key_s = S;
+                        g_dec_graph[slot_i].key_samp = any_samp; g_dec_graph[slot_i].valid = 1;
+                        g_dec_graph[slot_i].exec = exec;
+                        fprintf(stderr, "TQ_DECODE_GRAPH: captured bucket N=%d S=%d samp=%d\n", N, S, any_samp);
+                        ret = cudaGraphLaunch(exec, g_qwen.stream) == cudaSuccess ? 0 : -81;
+                    } else {
+                        ret = run_paged_decode_step_core(N, any_samp);   // capture ran nothing
+                    }
+                    cudaGraphDestroy(graph);
+                }
+            }
+        }
+    }
     if (ret != 0) return ret;
     if (out_argmax)
         cudaMemcpyAsync(out_argmax, g_pg_argmax, (size_t)N * sizeof(int), cudaMemcpyDeviceToHost, g_qwen.stream);
