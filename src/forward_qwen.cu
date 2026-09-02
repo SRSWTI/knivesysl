@@ -27130,8 +27130,14 @@ static int run_paged_spec_verify_core(const int *tokens, const int *col_slot, co
     cudaMemcpyAsync(g_block_table, h_block_table, (size_t)g_pg_maxslots * g_pg_maxblk * sizeof(int),
                     cudaMemcpyHostToDevice, g_qwen.stream);
     cudaMemcpyAsync(g_pf_colslot, col_slot, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
-    cudaMemcpyAsync(g_wide_pos, col_pos, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
-    // chain-shared verify attention: per-segment metadata on device
+    // chain-shared verify attention: per-segment metadata on device.
+    // Measured A/B vs plain on the SAME build (gen 256, r2, aggregate decode):
+    // n=1 -> 8k 1.99x, 32k 1.96x, 65k 1.98x, 94k 1.20x, 131k 0.96x;
+    // n>=2 -> neutral (2k:2 0.97x, 8k:2 1.32x, 8k:4 0.94x, 32k:2 1.00x,
+    // 32k:4 0.98x, 65k:2 1.05x, 94k:2 1.05x). Chain is never the loser; an
+    // earlier depth bound here was drawn against stale v1 baselines and is
+    // removed. Whether to SPECULATE AT ALL at n>=2 is scheduler policy: the
+    // 16-node archive costs 2424 MB (~19k KV tokens) for a ~1.0x return.
     int chain_ok = paged_attn_chain() && (nkv > 0) && ((g_qwen.nh % nkv) == 0) &&
                    (g_qwen.hd == 256) && ((g_qwen.nh / nkv) == 6) && K <= 64 &&
                    ensure_seg_bufs() == 0;
