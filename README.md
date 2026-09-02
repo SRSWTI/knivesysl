@@ -1,119 +1,231 @@
 # knivesysl
 
-**a bare-cuda inference engine for qwen3.8-27b on one rtx 5090. fp6 weights, 4-bit kv,
-256k context, hand-written sm120 tensor-core kernels. no pytorch, no cublas, no cutlass
-on the run path — one cuda translation unit behind a c ctypes abi.**
+**a bare-cuda inference engine for qwen3.8-27b on one rtx 5090: knivesysl fp6 or
+nvfp4 weights, q4 kv, 256k context, and hand-written sm120 tensor-core kernels.
+no pytorch, cublas, cutlass, or flashinfer on the steady-state run path — one cuda
+translation unit behind a c ctypes abi.**
 
 knivesysl is two things:
 
-- **the engine** — 22k lines of cuda in a single tu, loaded by python over ctypes.
-  the python side tokenizes and speaks http; every flop happens in `libforward_qwen.so`.
-- **the format** — knivesysl fp6 (e2m3, 128-wide block scales, qmma fragment layout).
-  6 bits per weight on the tensor cores, which is what makes 27b + 256k fit in 32 gb
-  while staying above nvfp4 on quality.
+- **the engine** — the cuda implementation is one translation unit loaded by python
+  over ctypes. python tokenizes, schedules, and speaks http; model execution stays in
+  `libforward_qwen.so`.
+- **the format family** — three supported service layouts: knivesysl fp6/e2m3,
+  nvfp4 w4a4 for every projection, and nvfp4-mlp with the fp6 path retained outside
+  the mlp. q4 k plus e4m3 v provides the long-context kv tier.
 
-right now it runs **exactly one model**: the qwen3.8-27b text tower (64 layers, 5120
-hidden, 16 full-attention + 48 gated-deltanet). same layout as qwen3.6-27b, which also
-converts. it is sm120-only and not portable — that is the trade being made.
+the current target is the qwen3.8-27b text tower: 64 layers, hidden size 5120,
+16 full-attention layers, and 48 gated-deltanet layers. the kernels are deliberately
+sm120-specific. portability is not the goal; owning the blackwell hot path is.
 
 ```
-qwen3.8-27b (hf, bf16)
-   --> convert_qwen_tqf.py --> model.tqf   (fp6 e2m3 + block scales + mtp head, 22.6 gb)
-   --> libforward_qwen.so                  (one cuda tu, compute_120f)
-   --> serve_openai.py                     (single stream + mtp spec-decode)
-    or serve_batched.py                    (paged kv + continuous batching)
+qwen3.8-27b (hf)
+   --> convert_qwen_tqf.py --> model.tqf
+   --> libforward_qwen.so   --> one cuda tu, compute_120f
+   --> serve_openai.py      --> single-stream service
+    or serve_batched.py     --> paged kv, continuous batching, apc, optional n-gram
    --> /v1/chat/completions
 ```
 
 ---
 
-## why fp6
+## formats
 
-nvfp4 is 4 bits with a scale per 16 values. knivesysl fp6 is 6 bits with a pow2 scale per
-128. more mantissa, coarser scaling --> better reconstruction of the weight distribution
-at 1.4x the bytes, and still small enough that the whole tower plus a 256k kv cache lives
-on one consumer card.
+the supported service formats are intentionally narrow:
 
-| format | bits/param | tf-top1 vs bf16 |
-|---|--:|--:|
-| fp8 | 8 | 95.94 |
-| **knivesysl fp6 (e2m3)** | **6** | **91.30** |
-| e2m1 (opt-in 4-bit tier) | 4 | 86.46 |
-| nvfp4 | 4 | 85.78 |
+| format | role | quality status |
+|---|---|---:|
+| **knivesysl fp6 (e2m3)** | quality tier; e4m3 activations | **91.30 tf-top1 vs bf16** |
+| **nvfp4-all** | default performance/capacity tier; w4a4 on every projection | **85.78 tf-top1 vs bf16** |
+| **nvfp4-mlp** | hybrid tier; nvfp4 mlp with fp6 outside it | separate end-to-end quality gate pending |
 
-quality figures carry over from the fork this began as and are pending our own
-re-measurement; every performance number below we measured ourselves on this card.
+fp6 uses six-bit e2m3 values with a power-of-two scale per 128 weights. nvfp4 uses
+four-bit values with a scale per 16. fp6 spends about 1.4x the weight bytes for more
+mantissa; nvfp4 reaches the sm120 k64 fp4 instruction and leaves more room for kv,
+slots, and checkpoints. the quality figures above carry over from the project fork
+and remain labelled until our independent quality campaign is complete.
 
 ---
+## current benchmark
 
-## numbers
+this is the canonical performance snapshot. older decode, prefill, and speculative
+charts were removed because they mixed superseded kernels, cache policy, generation
+lengths, or event counts. raw schema-3 artifacts retain every repetition.
 
-all measured 2026-08 on one rtx 5090 (gb202, sm120, 170 sm, 32 gb, 128 mb l2), cuda 13.3,
-driver 595. the vllm column is vllm 0.27.1 serving `unsloth/qwen3.8-27b-nvfp4` (mixed
-w8a8 + w4a4, 22.5 gb — footprint-matched to our 22.6 gb) at `--max-model-len 16384
---gpu-memory-utilization 0.90`. both engines driven by the same client, greedy, thinking
-off.
+**matched contract**
 
-### decode — we win
+- one rtx 5090: gb202, sm120, 170 sms, 32 gb, 128 mb l2; cuda 13.3, driver 595;
+- exact tokenizer-constructed prompts; repetitive code-continuation workload;
+- 512 generated tokens per request, temperature 0, three repeats; table values are medians;
+- prefix caching disabled on every engine;
+- sglang is the pinned clean reference with radix cache disabled;
+- vllm serves `qwen38-27b-nvfp4-radixark` with default compiled/graph execution,
+  fp8 kv, `--no-enable-prefix-caching`, and a harness warmup before measurement;
+- vllm's prefix-cache query, hit, and external-hit counters remained exactly zero
+  after the full campaign;
+- knivesysl plain is nvfp4-all with the staged v2 paged-attention kernel;
+- knivesysl boosted is the same target path plus a 16-node n-gram verify archive.
 
-![decode ceiling](assets/decode-ceiling.svg)
+`128k*` is the only non-identical prompt length: sglang and knivesysl use 131,072
+prompt tokens; vllm uses 130,496 so its 512-token completion stays inside
+`--max-model-len 131072`.
 
-a decode step is one pass over ~20 gib of weights whatever the batch size, so decode is
-memory-bound and fewer weight bytes wins. the lead widens with concurrency because the
-4-bit kv and the o(1) deltanet state keep 52 sequences resident in 30.8 gib.
+### throughput
 
-single stream with mtp spec-decode: **86.8 tok/s** end-to-end vs vllm's 58.7 (+48%),
-accept-length 2.7-3.3.
+each cell is `aggregate decode / per-request decode / end-to-end aggregate`, in tok/s.
 
-### decode holds its shape with depth
+| context | n | sglang plain | vllm plain | knivesysl plain | knivesysl boosted (n-gram) | aggregate winner |
+|---:|---:|---:|---:|---:|---:|---|
+| 2k | 1 | 71.7 / 71.7 / 70.2 | **71.7 / 71.7 / 70.2** | 65.8 / 65.8 / 64.1 | 68.6 / 68.6 / 66.5 | sglang ~= vllm |
+| 2k | 2 | 120.5 / 60.8 / 118.1 | 130.3 / 65.5 / 126.4 | 125.9 / 63.7 / 122.9 | **130.8 / 125.9 / 127.5** | **knivesysl boosted** |
+| 2k | 4 | 229.2 / 58.9 / 224.6 | 246.0 / 62.9 / 234.6 | 222.5 / 57.9 / 217.7 | **247.5 / 88.9 / 241.6** | **knivesysl boosted** |
+| 8k | 1 | 69.2 / 69.2 / 63.2 | 72.1 / 72.1 / 65.7 | 64.7 / 64.7 / 57.7 | **146.4 / 146.4 / 116.1** | **knivesysl boosted, 2.03x vllm** |
+| 8k | 2 | 111.0 / 57.7 / 102.6 | **123.2 / 63.1 / 109.6** | 110.1 / 58.3 / 100.6 | 120.9 / 98.2 / 109.2 | vllm; boosted -1.9% |
+| 8k | 4 | 112.3 / 58.2 / 107.9 | **204.8 / 57.6 / 185.6** | 177.9 / 51.4 / 165.6 | 168.4 / 57.5 / 156.3 | vllm |
+| 32k | 1 | 66.9 / 66.9 / 44.0 | 69.8 / 69.8 / 46.6 | 61.1 / 61.1 / 39.7 | **103.2 / 103.2 / 53.1** | **knivesysl boosted, 1.48x vllm** |
+| 32k | 2 | 77.8 / 47.5 / 59.2 | **87.3 / 52.3 / 65.0** | 68.6 / 43.0 / 51.7 | 61.3 / 43.6 / 48.0 | vllm |
+| 32k | 4 | 70.8 / 47.2 / 62.1 | **103.2 / 39.7 / 85.9** | 80.2 / 30.1 / 68.3 | 72.5 / 29.8 / 61.8 | vllm |
+| 64k | 1 | 63.0 / 63.0 / 26.6 | 65.9 / 65.9 / **29.0** | 58.7 / 58.7 / 25.0 | **66.0 / 66.0 / 25.8** | boosted ~= vllm decode |
+| 64k | 2 | 49.1 / 38.7 / 32.1 | **50.8 / 39.1 / 32.8** | 43.3 / 33.2 / 28.8 | 39.4 / 29.6 / 27.0 | vllm |
+| 64k | 4 | — | **41.0 / 32.7 / 33.6** | 38.9 / 18.3 / 31.7 | — | vllm; plain -5.1% |
+| 128k* | 1 | **58.0 / 58.0 / 11.6** | 57.8 / 57.8 / **12.6** | 50.1 / 50.1 / 11.1 | 46.3 / 46.3 / 11.0 | sglang decode; vllm e2e |
+| 128k* | 2 | — | **20.8 / 57.9 / 12.7** | 20.1 / 22.0 / 11.9 | — | vllm; plain -3.4% |
 
-![decode scaling](assets/decode-scaling.svg)
+### aggregate decode versus vllm
 
-after retuning the split-k gate for the paged attention: 16384/n=8 went **129.5 --> 45.9
-ms/step**, 4096/n=8 **46.0 --> 25.1**. split-k is a different reduction order, so it is
-eps-equivalent rather than bit-exact — 98.32% teacher-forced top-1 agreement (13 flips in
-776 positions). `TQ_PAGED_SPLIT=1` forces the single-kernel path.
+| context | n | sglang / vllm | knivesysl plain / vllm | knivesysl boosted / vllm |
+|---:|---:|---:|---:|---:|
+| 2k | 1 | 1.00x | 0.92x | 0.96x |
+| 2k | 2 | 0.92x | 0.97x | **1.00x** |
+| 2k | 4 | 0.93x | 0.90x | **1.01x** |
+| 8k | 1 | 0.96x | 0.90x | **2.03x** |
+| 8k | 2 | 0.90x | 0.89x | **0.98x** |
+| 8k | 4 | 0.55x | **0.87x** | 0.82x |
+| 32k | 1 | 0.96x | 0.88x | **1.48x** |
+| 32k | 2 | 0.89x | 0.79x | 0.70x |
+| 32k | 4 | 0.69x | **0.78x** | 0.70x |
+| 64k | 1 | 0.96x | 0.89x | **1.00x** |
+| 64k | 2 | 0.97x | 0.85x | 0.78x |
+| 64k | 4 | — | **0.95x** | — |
+| 128k* | 1 | **1.00x** | 0.87x | 0.80x |
+| 128k* | 2 | — | **0.97x** | — |
 
-### prefix reuse
+### time to first token
 
-the single-stream path snapshots kv **and** the deltanet recurrent state at a 128-aligned
-anchor, so a follow-up turn re-prefills only the suffix:
+each cell is `maximum / median` client ttft in seconds.
 
-```
-159k-token conversation --> cold 126.9 s --> follow-up 0.52 s   (158 848 / 158 967 reused)
-  8k-token conversation --> cold   3.6 s --> follow-up 0.23 s   (  7 808 /   8 203 reused)
-```
+| context | n | sglang | vllm | knivesysl plain | knivesysl boosted |
+|---:|---:|---:|---:|---:|---:|
+| 2k | 1 | 0.16 / 0.16 | **0.15 / 0.15** | 0.20 / 0.20 | 0.20 / 0.20 |
+| 2k | 2 | 0.32 / 0.25 | 0.32 / 0.28 | 0.40 / 0.30 | 0.40 / 0.30 |
+| 2k | 4 | **0.64 / 0.41** | 0.65 / 0.63 | 0.80 / 0.60 | 0.80 / 0.60 |
+| 8k | 1 | 0.72 / 0.72 | **0.70 / 0.70** | 0.93 / 0.93 | 0.91 / 0.91 |
+| 8k | 2 | 1.45 / 1.10 | **1.38 / 1.21** | 1.85 / 1.38 | 1.80 / 1.33 |
+| 8k | 4 | 11.61 / 1.81 | **2.74 / 2.22** | 3.58 / 2.43 | 3.76 / 2.51 |
+| 32k | 1 | 3.97 / 3.97 | **3.67 / 3.67** | 4.60 / 4.60 | 4.68 / 4.68 |
+| 32k | 2 | 8.10 / 6.12 | **7.33 / 5.68** | 9.84 / 7.36 | 9.39 / 7.00 |
+| 32k | 4 | 25.34 / 9.94 | **14.63 / 10.27** | 18.10 / 11.51 | 18.75 / 11.79 |
+| 64k | 1 | 11.14 / 11.14 | **9.87 / 9.87** | 11.70 / 11.70 | 12.05 / 12.05 |
+| 64k | 2 | 22.21 / 16.64 | **21.40 / 16.25** | 23.91 / 17.89 | 23.88 / 17.87 |
+| 64k | 4 | — | 51.06 / 30.75 | **48.54 / 30.56** | — |
+| 128k* | 1 | 35.14 / 35.14 | **32.11 / 32.11** | 35.77 / 35.77 | 35.55 / 35.55 |
+| 128k* | 2 | — | 71.56 / **51.52** | **70.58** / 52.80 | — |
 
-the batched server has the same primitive for a shared system prompt: **340 --> 784 tok/s**
-at n=32, p50 latency 14.5 --> 6.2 s.
+### inter-token latency
 
-### apc phase 3 — mid-prefill checkpoints, coalescing admission
+each cell is p50 / p99 milliseconds. large batched p99 values include inter-client
+scheduling gaps; they are not one kernel's execution time.
 
-the hybrid cannot reuse kv at arbitrary block boundaries — the deltanet state is not
-rewindable — so a cache entry is a *checkpoint*: refcounted references to the full kv
-blocks plus a copy of the o(1) recurrent state (151.5 mb), saved mid-prefill at the two
-boundaries agentic traffic actually revisits: the lcp junction with the previous prompt
-(turn append) and `n_prompt - 8` (exact resend, trimmed so the next turn's `<think>`
-re-render still prefix-matches). admission adopts the deepest match and prefills only
-the suffix; same-prefix requests arriving while a donor is mid-prefill are held a few
-waves and adopt its checkpoint instead of racing it (6 concurrent arrivals = 2 full
-prefills, not 6). n-way lru, state slabs in one pool allocated on first save
-(`TQ_CKPT_POOL`, default 6 x 151.5 mb), every failure path degrades to a plain full
-prefill. save/evict/adopt are logged as `[ckpt]` lines.
+| context | n | sglang | vllm | knivesysl plain | knivesysl boosted |
+|---:|---:|---:|---:|---:|---:|
+| 2k | 1 | 13.9 / 14.7 | **13.7 / 15.2** | 15.2 / 15.7 | 16.1 / 24.8 |
+| 2k | 2 | 16.2 / 17.8 | **15.0 / 17.0** | 15.5 / 31.2 | 21.1 / 74.2 |
+| 2k | 4 | 16.5 / 17.6 | **15.6 / 17.4** | 16.5 / 33.0 | 20.9 / 82.5 |
+| 8k | 1 | 14.1 / 15.8 | **13.7 / 15.3** | 16.6 / 51.4 | 22.4 / 64.0 |
+| 8k | 2 | 16.6 / 35.7 | 16.2 / 33.8 | **16.3 / 18.3** | 30.7 / 398.3 |
+| 8k | 4 | 16.9 / 33.4 | **16.0 / 17.9** | 17.0 / 394.1 | 27.2 / 475.4 |
+| 32k | 1 | 14.8 / 16.5 | **14.2 / 15.8** | 16.1 / 18.5 | 17.8 / 41.4 |
+| 32k | 2 | 17.8 / 19.3 | **16.3 / 18.1** | 20.1 / 536.5 | 42.7 / 684.5 |
+| 32k | 4 | 18.4 / 19.9 | **17.9 / 904.3** | 23.6 / 660.7 | 40.1 / 709.3 |
+| 64k | 1 | 15.5 / 33.1 | **14.9 / 16.8** | 17.0 / 18.6 | 18.7 / 53.2 |
+| 64k | 2 | 18.9 / 20.5 | **18.4 / 985.0** | 22.9 / 834.6 | 63.1 / 965.0 |
+| 64k | 4 | — | **19.4 / 1042.1** | 31.9 / 1040.3 | — |
+| 128k* | 1 | 17.2 / 18.9 | **16.9 / 19.7** | 19.9 / 22.5 | 21.5 / 83.3 |
+| 128k* | 2 | — | **17.5 / 20.0** | 31.2 / 1545.0 | — |
 
-measured 2026-08-31 on the production build, same server with `--no-prefix-cache` as
-the control, real token counts (the bench's chars/token estimate undercounts — "24k"
-labels are 33.2k real tokens):
+### prefill throughput and total wall time
 
-| scenario | off | on | |
+each cell is `estimated prefill tok/s / total wall seconds`.
+
+| context | n | sglang | vllm | knivesysl plain | knivesysl boosted |
+|---:|---:|---:|---:|---:|---:|
+| 2k | 1 | 13,136 / 7.30 | **13,251 / 7.29** | 10,120 / 7.99 | 10,102 / 7.70 |
+| 2k | 2 | 12,870 / 8.67 | **12,893 / 8.10** | 10,341 / 8.33 | 10,159 / 8.03 |
+| 2k | 4 | **12,820 / 9.12** | 12,660 / 8.73 | 10,210 / 9.41 | 10,192 / 8.48 |
+| 8k | 1 | 11,326 / 8.10 | **11,780 / 7.79** | 8,838 / 8.88 | 9,034 / **4.41** |
+| 8k | 2 | 11,330 / 9.98 | **11,874 / 9.34** | 8,856 / 10.18 | 9,111 / 9.38 |
+| 8k | 4 | 2,822 / 18.98 | **11,975 / 11.03** | 9,145 / 12.37 | 8,720 / 13.10 |
+| 32k | 1 | 8,245 / 11.65 | **8,930 / 10.99** | 7,129 / 12.89 | 7,009 / **9.64** |
+| 32k | 2 | 8,093 / 17.31 | **8,942 / 15.75** | 6,663 / 19.79 | 6,982 / 21.31 |
+| 32k | 4 | 5,173 / 32.97 | **8,957 / 23.85** | 7,243 / 30.01 | 6,990 / 33.13 |
+| 64k | 1 | 5,882 / 19.26 | **6,638 / 17.64** | 5,599 / 20.51 | 5,438 / 19.82 |
+| 64k | 2 | 5,900 / 31.91 | **6,126 / 31.20** | 5,482 / 35.50 | 5,490 / 37.96 |
+| 64k | 4 | — | 5,134 / **60.87** | **5,400** / 64.54 | — |
+| 128k* | 1 | 3,730 / 43.97 | **4,064 / 40.67** | 3,665 / 45.95 | 3,687 / 46.47 |
+| 128k* | 2 | — | 3,647 / **80.44** | **3,714** / 85.73 | — |
+
+### n-gram behavior
+
+| context | n | committed tokens | verify rounds | tokens/round | aggregate speedup vs plain |
+|---:|---:|---:|---:|---:|---:|
+| 2k | 1 | 137 | 65 | 2.11 | 1.04x |
+| 2k | 2 | 668 | 129 | 5.18 | 1.04x |
+| 2k | 4 | 1,747 | 255 | 6.88 | 1.11x |
+| 8k | 1 | 475 | 110 | 4.32 | **2.26x** |
+| 8k | 2 | 783 | 121 | 6.47 | 1.10x |
+| 8k | 4 | 1,801 | 270 | 6.69 | 0.95x |
+| 32k | 1 | 428 | 86 | 4.98 | **1.69x** |
+| 32k | 2 | 649 | 152 | 4.09 | 0.89x |
+| 32k | 4 | 1,698 | 273 | 6.22 | 0.90x |
+| 64k | 1 | 322 | 93 | 3.46 | 1.12x |
+| 64k | 2 | 844 | 170 | 4.70 | 0.91x |
+| 128k* | 1 | 337 | 102 | 3.30 | 0.92x |
+
+the plain engine is close, not yet ahead: vllm leads single-request decode by about
+8-13%, unique prefill by about 10-25%, and the difficult 32k multi-request decode
+cells by 21-22%. the gap narrows to 3-5% at the measured 64kx4 and 128kx2 capacity
+edge. the n-gram path is a workload-specific accelerator, not a blanket claim:
+it wins the repetitive 8k/32k single-agent cells, reaches shallow batch parity,
+and loses where verification traffic or archive pressure outweighs acceptance.
+
+unrounded data and every schema metric:
+`results/comparisons/core-v2-sglang-vllm-knivesysl-plain-ngram-all-metrics.json`.
+
+### apc — checkpointed prefix reuse
+
+the hybrid cannot reuse kv alone at arbitrary boundaries because deltanet state is
+not rewindable. an apc entry therefore owns refcounted full kv blocks, a private
+partial tail, and a copy of the recurrent and convolution state. checkpoints are
+saved at the lcp junction with the previous prompt and near the completed prompt;
+admission adopts the deepest match and prefills only the suffix. same-prefix requests
+arriving during a donor's prefill can wait briefly and adopt its checkpoint rather
+than racing another full prefill.
+
+the resident state slabs are allocated as one pool (`TQ_CKPT_POOL`, default six
+151.5 mb slabs). every allocation, save, evict, and adopt failure degrades to a plain
+full prefill.
+
+measured 2026-08-31 on the production build, with `--no-prefix-cache` as the control:
+
+| scenario | apc off | apc on | result |
 |---|--:|--:|--:|
-| turn append, 36k -> 50.4k ctx (+2.9k/turn) | 5.97-8.22 s | 0.61-0.78 s flat | 9-11x |
+| turn append, 36k -> 50.4k context (+2.9k/turn) | 5.97-8.22 s | 0.61-0.78 s flat | 9-11x |
 | session resend, all six depths | 5.6-8.2 s | **0.071-0.085 s** | **75-98x** |
-| 6-way fan-out, 33.2k shared, cold | wall 24.6 s | wall 5.26 s | 4.7x |
-| 6-way fan-out, checkpoint pre-exists | wall 24.6 s | **wall 0.67 s** | **37x** |
+| six-way fan-out, 33.2k shared, cold | wall 24.6 s | wall 5.26 s | 4.7x |
+| six-way fan-out, checkpoint pre-exists | wall 24.6 s | **wall 0.67 s** | **37x** |
 | decode on adopted state | 58.0 tok/s cold | 58.1 tok/s | no penalty |
 
-adopted output is bit-identical at temperature 0 (probed live on the production build).
+adopted output is bit-identical at temperature 0.
 
 ![ttft vs depth](docs/apc/ttft_vs_depth.svg)
 ![speedups](docs/apc/speedups.svg)
@@ -121,166 +233,36 @@ adopted output is bit-identical at temperature 0 (probed live on the production 
 ![prefill throughput](docs/apc/prefill_curve.svg)
 ![decode at depth](docs/apc/decode_depth.svg)
 
-vs vllm v1's hybrid apc (dense align-mode, 528-token blocks): a resend hit here
-recomputes 8 tokens against their <=527 (0% hit below 528 tokens — their #40696); a
-cached 33k session pins 0.15 gb of state here against ~4.7 gb dense [derived on our
-state shapes], which on a 32 gb card is ~6 resident sessions vs ~2; and they have no
-fan-out coalescing (tracking #26201). the honest losses: a mid-context divergence at a
-junction never seen as consecutive admissions pays a full prefill where their 528 grid
-reuses up to the divergence block (the lcp save catches any junction after one
-co-occurrence), and absolute single-stream decode (58-67 tok/s, dense ~27b active)
-sits below moe-class numbers on this card — apc stops you re-paying prefill, it does
-not move the weight-read roofline.
+compared with dense block-aligned reuse, apc retains more sessions because its durable
+state is the hybrid checkpoint rather than a dense kv image. the honest loss is a
+previously unseen mid-context divergence: until that junction has been observed as an
+admission boundary, the request pays a full prefill. apc prevents repeated prefill;
+it does not move the weight-read roofline.
 
 ![vs vllm](docs/apc/vs_vllm.svg)
 ![the honest loss](docs/apc/divergence_loss.svg)
 
-production runs under `tools/serve_prod.sh` (restart wrapper, core dumps enabled); the
-engine exits after 8 consecutive step errors instead of zombie-serving a dead cuda
-context, and a stale pending-quant record can no longer leak across waves (the old
-`rc=-94` cascade — kernel-log-confirmed as xid 31 null-pointer writes — is gone: zero
-gpu faults under real 40-60k-token traffic on the fixed build).
-
-### prefill — the gemm deficit is closed
-
-![gemm headroom](assets/gemm-headroom.svg)
-
-the hand-written fp6 gemm used to run at **124 tflops** against cutlass 4.8's sm120
-block-scaled collective at 255 (m=128) / 572 (m=512) on the identical numerics and
-shapes. it ran one warp per cta with every operand arriving from global through `__ldg`.
-it is now a proper tiled kernel: 128-row x 256-column block tile, 8 warps, k staged 128
-at a time into a `cp.async` circular buffer, split-k on `grid.y`. flop-weighted over this
-model's real projection mix:
-
-| columns/wave | before | after | cutlass sm120 collective |
-|---|--:|--:|--:|
-| 128 | 88.9 tflops | **392.8** | 255 (its m=128) |
-| 256 | 88.1 tflops | **477.7** | 572 (its m=512) |
-
-at `k_splits == 1` it is **bit-exact** vs the kernel it replaces — verified with
-exactly-representable operands so summation order cannot mask an indexing bug. the two
-largest projections now run at 1.29-1.40 tb/s, i.e. against the dram roofline rather
-than the tensor cores.
-
-![prefill profile](assets/prefill-profile.svg)
-
-the gemm was 55% of prefill and the 48 gated-deltanet layers' chunkwise scan 22.5%, so
-the scan was rewritten too — recurrent state held in registers across the whole chunk
-instead of re-read and re-written every 8 tokens, the per-token prep hoisted out of the
-sub-chunk loop and parallelised, and the idle-lane substitution phase removed. 1.56-1.59x
-at every chunk width. the scan has since been rewritten AGAIN as a chunk-64 factored
-matmul (`TQ_DN_MM`): every state-independent quantity hoists to a fully parallel prep
-and the serial dimension shrinks 32 -> 4 steps of register-tiled fp32 matmuls per 256
-tokens — 269 -> 188 us/layer-wave, needle 4/4 at 262k, paged parity 11/11.
-
-```
-prefill, single stream, 4096-token prompt:  2579 --> 4630 tok/s   (1.80x)
-prefill, paged, 32 clients x 2048 tokens:   1198 --> 2216 tok/s   (1.85x)
-```
-
-with the nvfp4 w4a4 tier, tma staging, the matmul scan, 512-column waves and the
-z-batched gemm column tiles on top, the same 4096-token single-stream prefill is now
-**7769 tok/s** (8042 at 2048) and the paged path 6948 at n=1.
-
-**and the server-level comparison has now been run against vllm's real production
-config** -- same client, both engines over http. the earlier run used `--enforce-eager`,
-which i wrongly believed this checkpoint forced; `--language-model-only` skips the vision
-tower and vllm runs its full config, cuda graphs included, which is worth **2.3x** to its
-decode:
-
-`vllm serve unsloth/Qwen3.8-27B-NVFP4 --max-model-len 140000 --max-num-seqs 32
---gpu-memory-utilization 0.92 --kv-cache-dtype fp8 --max-num-batched-tokens 8192
---enable-prefix-caching --language-model-only`
-
-| | vllm | knivesysl | |
-|---|--:|--:|---|
-| prefill 2048, unique, cold (fresh server) | 5218 | 7939 | 1.52x ours |
-| prefill 2048, unique, fully warm | 10304 | 8026 | 1.28x theirs |
-| prefill 4096, unique, fully warm | 16080 | 7544 | 2.13x theirs |
-| prefill 4096, shared prefix, warm | 40282 | **174093** | **4.32x ours** |
-| prefill 16384 (conc 2) | 10104 | 6157 | 1.64x theirs |
-| prefill 16384 | 9173 | 8896 | 3.1% behind |
-| prefill 32768 | 7978 | 7524 | 6.0% behind |
-| prefill 65536 | 6090 | 5743 | 6.0% behind |
-| prefill 98304 | 4908 | 4645 | 5.7% behind |
-| prefill 131072 | **cannot (max-len 116032)** | **3885** | ours alone |
-
-(cold, same client, both servers fresh, vllm prefix cache off. one day of
-probe-driven campaigns -- gqa-shared attention, wide-wave ks=1, full-width
-waves, the paged conv routing fix, fused silu quantization -- moved the band
-from 1.28-1.60x behind to **3-6%**, every change bit-exact-gated)
-| ttft p50, 8 clients x 2048 | 1.425 s | **1.230 s** | ours |
-| decode n=1, paged | 69.2 | 61.1 | 1.13x theirs |
-| decode n=1, fp6 mtp spec decode | 69.2 | **141.4** | **2.04x ours** |
-
-**the honest summary: we win shared-prefix prefill ~4.3x, single-request cold starts,
-ttft under batch load, and single-stream decode when the fp6 spec-decode path is used
-(2x). vllm's fully-warmed unique prefill is ahead — 1.4x at 2k growing to 2.6x at 64k —
-and its lead grows with context because its flashattention prefill scales better than
-our wide-attention kernel.** their kv is fp8 and ours is int4, so quality is not
-like-for-like. the n>1 server decode cells are prefill-residency-bound in both engines:
-engine-level our paged decode is 17.98 ms/step at n=8 and 20.0 at n=16 — within 5% of
-theirs — so those cells track the prefill gap, not the decode kernels. what remains is
-(a) long-context prefill attention, now the largest single deficit, and (b) the gemm at
-54% of this card's measured 2051 tflop/s fp4 issue roof against cutlass's 68%.
-
-### decode at depth — gqa-shared paged attention
-
-the paged decode attention ran one cta per *query* head, and this model is 24 q heads
-over 4 kv heads, so six ctas independently streamed the same kv rows. at 131k context
-that was ~21 gib of kv traffic per step for a 3.5 gib working set — 27 of the 46 ms. one
-cta now carries all six query heads that share a kv head:
-
-| case | before | after | |
-|---|--:|--:|--:|
-| n=32, ctx 2048 | 41.98 ms | **29.36** | 1.43x |
-| n=1, ctx 65536 | 31.31 | **21.93** | 1.43x |
-| n=1, ctx 131072 | 46.53 | **27.83** | 1.67x |
-| n=1, ctx 147456 | 50.06 | **29.24** | 1.71x |
-
-6/6 argmax match vs single-stream q4 decode. the projection gemm inside a decode step
-now sustains 1.56 tb/s = 87% of this card's dram peak, so decode's remaining headroom is
-attention and the deltanet recurrence, not the weight read.
-
-### paged sampling + paged spec decode (status)
-
-the batched server now samples per slot: `temperature`/`seed` in the request map to
-an engine-side gumbel-max draw (spec-sampler semantics, `TQ_MIN_P` tail floor,
-position-keyed rng -> same seed + prompt replays the same tokens). temp 0 stays the
-bit-exact greedy path; gated on cross-build greedy regression, seed replay, and
-concurrent slot isolation. omitted temperature stays greedy on purpose (agentic
-clients want determinism and apc-friendly replays).
-
-paged speculative decoding (chain verify: server-side 4-gram drafts, one fused wave
-verifies every slot's chain, deltanet snapshot/rollback, apc-safe by construction,
-first spec path that runs on the nvfp4 tier at all) is implemented, greedy-bit-exact
-gated, and measured across (2k..128k) x (n=1,2,4) -- and ships OFF by default
-(`TQ_PAGED_SPEC=1` opts in): the verify wave runs chunk-256 deltanet scans and
-mma-prefill attention on ~9-column chains, costing 4-8x a decode step, which the
-measured 2.8-8.7 accepted tokens/round never repays. the drafter and the round are
-the keepers; the follow-up is a small-T spec path in the wave core (decode-attention
-batching + the spec-class fused deltanet) with break-even at round <= step x
-tok/round.
-
-![spec matrix](docs/apc/spec_matrix.svg)
-![spec accept rates](docs/apc/spec_accept.svg)
+production uses `tools/serve_prod.sh`, a restart wrapper with core dumps enabled.
+the engine exits after consecutive step failures instead of serving through a poisoned
+cuda context.
 
 ---
-
 ## how it works
 
-- **weights** — fp6 e2m3, 128-wide pow2 block scales, stored in the qmma fragment layout
-  the tensor cores want. ~20 gib for 27b.
-- **kv cache** — 4-bit k (rotated int4 + hadamard) + e4m3 v. this is what buys 256k.
-- **attention** — 16 full-attention layers on hand-written `mma.sync ...
-  kind::mxf8f6f4.block_scale` with `ldmatrix ... b6x16` fp6 unpack; 48 gated-deltanet
-  layers on a fused chunkwise scan.
-- **spec decode** — an mtp covering tree --> batched k-split fp6 verify (weights read once
-  for the whole tree) --> dense-argmax descent --> single-path commit.
-- **prefill** — one wide fp6 gemm per projection --> chunk-parallel deltanet --> tensor-core
-  wide attention against the q4 cache at any length.
-- **batching** — paged kv pool, continuous batching, decode rows fused into prompt waves
-  so both ride one weight read.
+- **weights** — knivesysl fp6/e2m3 or nvfp4 w4a4, packed directly in the fragment
+  layout consumed by the sm120 tensor-core kernels.
+- **kv cache** — rotated asymmetric int4 k with hadamard preprocessing, e4m3 v,
+  and per-row scales in a refcounted physical block pool.
+- **attention** — 16 full-attention layers use owned wide-prefill and three-stage
+  paged-decode kernels; gqa heads share each kv read.
+- **deltanet** — 48 gated-deltanet layers use a chunk-64 wy/ut transform and an
+  fp32/tf32 recurrent scan.
+- **activation pipeline** — rms and silu application fuse into nvfp4 quantization
+  where consumer contracts permit it.
+- **speculation** — optional server-side n-gram chains are verified by one fused
+  target-model wave; shallow exactness and deep cost gates select the plain path.
+- **batching** — continuous scheduling over paged kv, with decode rows optionally
+  riding prompt waves and apc checkpoints sharing immutable full blocks.
 
 everything is compiled by stock `nvcc`/`ptxas` from cuda 13. no external assembler, no
 precompiled cubins.
@@ -449,28 +431,11 @@ see `CHANGELOG.md` for the measurement log behind every number here.
 
 ## where this is going
 
-**done: the gqa-shared attention rewrite** (`k_tq_wide_attn_mma6`, default on) -
-one cta per kv head, six query heads packed into the mma's m dimension, cp.async
-K staging, 8-row batched q prep. engine +1.3% at 2k growing to +8.3% at 96k;
-the server band vs vllm narrowed to 1.21-1.34x. `TQ_WIDE_ATTN_PROBE` scaffolds
-attribute the remaining cost: the mma-issue floor + gemm + deltanet - i.e. the
-megakernel/tma lever below, not more attention scheduling.
+the immediate goal is plain-engine parity and then a durable overtake. the working
+campaign is maintained in [`docs/level-up.md`](docs/level-up.md).
 
-**next steps, in order:**
-
-1. nvfp4 gemv decode kernel - lift the single-stream `-120` guard so the nvfp4
-   tiers get the fp6 spec-decode path (~60 -> ~135+ tok/s interactive)
-2. warm unique-prefill gemm: the tma producer/consumer pipeline rewrite
-   (cutlass-class scheduling; closes the 1.28-2.13x warm 2-4k cells)
-3. **the 4-5x ladder** (after vllm is beaten everywhere) - the dense fp4 issue
-   roof on this card is 2051 tf/s (~38k tok/s ceiling), so the leap must change
-   the work, not just the efficiency:
-   - 2:4 structured sparsity (`mma.sp`, `TQ_FLAG_SPARSE_24_E2M3` reserved): x2 roof
-   - whole-prompt waves (weights read once per prefill): x1.2-1.3, unblocked by
-     the gqa attention rewrite above
-   - per-layer persistent megakernel (activations never touch dram): x1.2-1.4
-   - deltanet-scan/gemm co-scheduling on partitioned sms: x1.10-1.15
-   - l2 weight prefetch + pdl kernel-tail overlap: x1.03-1.05
-4. more models - the converter and the format are architecture-agnostic; the
-   kernels are not, yet
-
+the core path is deliberately profile-driven: remove global nvfp4 split-k partial
+round trips, fuse projection epilogues into residual/rms/quant publication, integrate
+current-row attention preparation, and remeasure the complete matrix after every
+accepted stage. paged mtp and durable apc are optional increments after the plain
+path meets its own gates; neither is counted as proof that plain execution is fast.
