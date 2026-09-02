@@ -27130,17 +27130,17 @@ static int run_paged_spec_verify_core(const int *tokens, const int *col_slot, co
     cudaMemcpyAsync(g_block_table, h_block_table, (size_t)g_pg_maxslots * g_pg_maxblk * sizeof(int),
                     cudaMemcpyHostToDevice, g_qwen.stream);
     cudaMemcpyAsync(g_pf_colslot, col_slot, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
-    // chain-shared verify attention: per-segment metadata on device.
-    // Measured A/B vs plain on the SAME build (gen 256, r2, aggregate decode):
-    // n=1 -> 8k 1.99x, 32k 1.96x, 65k 1.98x, 94k 1.20x, 131k 0.96x;
-    // n>=2 -> neutral (2k:2 0.97x, 8k:2 1.32x, 8k:4 0.94x, 32k:2 1.00x,
-    // 32k:4 0.98x, 65k:2 1.05x, 94k:2 1.05x). Chain is never the loser; an
-    // earlier depth bound here was drawn against stale v1 baselines and is
-    // removed. Whether to SPECULATE AT ALL at n>=2 is scheduler policy: the
-    // 16-node archive costs 2424 MB (~19k KV tokens) for a ~1.0x return.
-    int chain_ok = paged_attn_chain() && (nkv > 0) && ((g_qwen.nh % nkv) == 0) &&
-                   (g_qwen.hd == 256) && ((g_qwen.nh / nkv) == 6) && K <= 64 &&
-                   ensure_seg_bufs() == 0;
+    cudaMemcpyAsync(g_wide_pos, col_pos, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+    // Chain-shared verify attention amortizes each paged KV read across draft
+    // columns. Keep shallow verification on the per-column v2 path: at 2k the
+    // chain path bought only ~3% and flipped one greedy near-tie, while the
+    // per-column path is byte-identical to plain decode. The chain path is
+    // byte-identical at 32k and materially faster at 8k/32k.
+    // Whether to speculate at n>=2 remains scheduler policy: a 16-node archive
+    // costs 2424 MB (~19k KV tokens).
+    int chain_ok = paged_attn_chain() && pf_maxpos >= 8192 && (nkv > 0) &&
+                   ((g_qwen.nh % nkv) == 0) && (g_qwen.hd == 256) &&
+                   ((g_qwen.nh / nkv) == 6) && K <= 64 && ensure_seg_bufs() == 0;
     if (chain_ok) {
         cudaMemcpyAsync(g_seg_slot_d, seg_slot, (size_t)K * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
         cudaMemcpyAsync(g_seg_off_d, seg_off, (size_t)K * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
@@ -27160,11 +27160,13 @@ static int run_paged_spec_verify_core(const int *tokens, const int *col_slot, co
             if ((ret = wide_proj(&l->q_proj, g_wide_q, T)) != 0) return -93;
             if ((ret = wide_proj(&l->k_proj, g_wide_k, T)) != 0) return -93;
             if ((ret = wide_proj(&l->v_proj, g_wide_v, T)) != 0) return -93;
+            TQ_WV_CK("qkv");
             k_tq_paged_attn_kv_write_q4<<<dim3(nkv, T), g_qwen.hd, 0, g_qwen.stream>>>(
                 g_pool_k4[L], g_pool_kq4s[L], g_pool_v8[L], g_pool_vscale[L],
                 g_wide_k, g_wide_v, l->d_k_norm, g_wide_pos, g_pf_colslot,
                 g_block_table, g_pg_maxblk, g_pg_page, g_pg_plog, nkv, g_qwen.hd, kv_m,
                 g_qwen.eps, g_qwen.rope_theta);
+            TQ_WV_CK("kvwrite");
             if (chain_ok) {
                 if (launch_paged_attn_q4_chain(g_wide_core, g_wide_q, l->d_q_norm,
                                                g_pool_k4[L], g_pool_kq4s[L], g_pool_v8[L], g_pool_vscale[L],
@@ -27174,9 +27176,11 @@ static int run_paged_spec_verify_core(const int *tokens, const int *col_slot, co
                                      g_pool_k4[L], g_pool_kq4s[L], g_pool_v8[L], g_pool_vscale[L],
                                      g_wide_pos, g_pf_colslot, g_block_table, g_pg_maxblk, g_pg_page, g_pg_plog,
                                      T, pf_maxpos, g_qwen.stream) != 0) return -94;
+            TQ_WV_CK("attn");
             if ((ret = wide_quant_input(g_wide_core, attn_m, T)) != 0) return -95;
             if ((ret = wide_proj(&l->o_proj, g_wide_o, T)) != 0) return -95;
             if ((ret = wide_mlp_x(l, g_wide_h, g_wide_o, g_wide_resid, g_wide_resid, g_wide_h, T)) != 0) return -96;
+            TQ_WV_CK("mlp");
         } else {
             if (!(tq_wide_fmt_ok(&l->linear_in_qkv) && tq_wide_fmt_ok(&l->linear_in_z) &&
                   tq_wide_fmt_ok(&l->linear_in_b) && tq_wide_fmt_ok(&l->linear_in_a) &&
@@ -27188,6 +27192,7 @@ static int run_paged_spec_verify_core(const int *tokens, const int *col_slot, co
             if ((ret = wide_proj(&l->linear_in_z, g_wide_z, T)) != 0) return -98;
             if ((ret = wide_proj(&l->linear_in_b, g_wide_b, T)) != 0) return -98;
             if ((ret = wide_proj(&l->linear_in_a, g_wide_a, T)) != 0) return -98;
+            TQ_WV_CK("gdn-proj");
             float *recur_base = g_pga_recur + (size_t)lin_idx * g_pga_nodes * recur_f;
             float *conv_base  = g_pga_conv  + (size_t)lin_idx * g_pga_nodes * conv_f;
             cudaMemsetAsync(g_pga_done, 0, sizeof(int), g_qwen.stream);
@@ -27199,15 +27204,18 @@ static int run_paged_spec_verify_core(const int *tokens, const int *col_slot, co
                                            g_pga_off, n_depths,
                                            g_pga_done,
                                            g_pga_root, recur_f, conv_f) != 0) return -89;
+            TQ_WV_CK("gdn-fused");
             {
                 size_t shB = (size_t)ld * sizeof(float);
                 k_tq_linear_decode_gated_norm_b<<<dim3(lvh, T), ld, shB, g_qwen.stream>>>(
                     g_wide_lcore, g_wide_z, l->d_linear_norm, lvh, ld, g_qwen.eps,
                     g_pga_grp, value_dim);
             }
+            TQ_WV_CK("gdn-norm");
             if ((ret = wide_quant_input(g_wide_lcore, value_dim, T)) != 0) return -100;
             if ((ret = wide_proj(&l->linear_out, g_wide_o, T)) != 0) return -100;
             if ((ret = wide_mlp_x(l, g_wide_h, g_wide_o, g_wide_resid, g_wide_resid, g_wide_h, T)) != 0) return -101;
+            TQ_WV_CK("gdn-mlp");
             lin_idx++;
         }
     }
