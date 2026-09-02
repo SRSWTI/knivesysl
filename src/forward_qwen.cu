@@ -25192,6 +25192,248 @@ void k_tq_paged_attn_q4_split_gqa_v2(
     }
 }
 
+// ===========================================================================
+// E.gqa.chain: CHAIN-SHARED paged verify attention.
+// ---------------------------------------------------------------------------
+// A speculative verify wave sends T chain columns; the per-column kernels walk
+// the SAME [0..pos] history once per column, so a depth-8 round reads the pool
+// 8x (28 GiB per round at 131k -- why deep n-gram measured a net loss). Here
+// one CTA owns a (kv head, SEGMENT, split): each staged K/V row is read ONCE
+// and scored against a GROUP of TG chain columns x GQA heads. Per-column
+// causality (row t visible to column c iff t <= pos_c) is a mask to -inf
+// before the online softmax. Groups of TG loop inside the CTA (re-walk per
+// group), so traffic drops ~min(TG, seg_len)x. Q prep, dot order, V fold
+// association and the split/merge contract match the v2 kernel exactly.
+// TQ_PAGED_CHAIN=0 reverts to per-column v2.
+// ===========================================================================
+#define TQ_PCH_TG   4
+#define TQ_PCH_CH   24
+#define TQ_PCH_NST  2
+#define TQ_PCH_SKB  (TQ_PCH_CH * 128)
+#define TQ_PCH_SCB  (TQ_PCH_CH * 64)
+#define TQ_PCH_SVB  (TQ_PCH_CH * 256)
+#define TQ_PCH_OFF_QN  0                            // TG*6*256 f32 = 24576
+#define TQ_PCH_OFF_SK  (TQ_PCH_TG * 6 * 256 * 4)
+#define TQ_PCH_OFF_SC  (TQ_PCH_OFF_SK + TQ_PCH_NST * TQ_PCH_SKB)
+#define TQ_PCH_OFF_SV  (TQ_PCH_OFF_SC + TQ_PCH_NST * TQ_PCH_SCB)
+#define TQ_PCH_OFF_VS  (TQ_PCH_OFF_SV + TQ_PCH_NST * TQ_PCH_SVB)
+#define TQ_PCH_OFF_SCH (TQ_PCH_OFF_VS + TQ_PCH_NST * TQ_PCH_CH * 4)
+#define TQ_PCH_OFF_CTL (TQ_PCH_OFF_SCH + TQ_PCH_TG * 6 * TQ_PCH_CH * 4)
+#define TQ_PCH_SMEM    (TQ_PCH_OFF_CTL + TQ_PCH_TG * 6 * 5 * 4 + 64)
+template <int GQA>
+__global__ __launch_bounds__(256, 2)
+void k_tq_paged_attn_q4_chain_v2(
+    const float *q_proj_base, const uint16_t *q_norm_w,
+    const uint8_t *k4_pool, const float *kq4s_pool, const uint8_t *v8_pool, const float *vscale_pool,
+    const int *positions, const int *seg_slot_d, const int *seg_off_d, const int *seg_len_d,
+    const int *block_table, int max_blocks, int page, int page_log,
+    int nh, int nkv, int hd, int q_m, int S, int Tcols,
+    float eps, float rope_theta, float *part_acc, float *part_ml) {
+    extern __shared__ uint32_t sm_u32c[];
+    char *sm = (char *)sm_u32c;
+    float *qn = (float *)(sm + TQ_PCH_OFF_QN);       // [TG][GQA][256]
+    float *sch = (float *)(sm + TQ_PCH_OFF_SCH);     // [TG][GQA][CH]
+    float *ctl = (float *)(sm + TQ_PCH_OFF_CTL);     // m/l/mnew/alpha/lch [TG*GQA] each
+    const int TGQ = TQ_PCH_TG * GQA;
+    float *m_run = ctl, *l_run = ctl + TGQ, *m_new_s = ctl + 2 * TGQ,
+          *alpha_s = ctl + 3 * TGQ, *l_chunk_s = ctl + 4 * TGQ;
+    float *partial = ctl + 5 * TGQ;                  // [8] + q_sum
+    float *q_sum_shared = partial + 8;
+    const int kv_head = blockIdx.x, seg = blockIdx.y, split = blockIdx.z, tid = threadIdx.x;
+    if (kv_head >= nkv || tid >= hd) return;
+    const int group = nh / nkv;
+    const int rotary_dim = 64;
+    const int slot = seg_slot_d[seg];
+    const int soff = seg_off_d[seg], slen = seg_len_d[seg];
+    const size_t bt_base = (size_t)slot * max_blocks;
+    const size_t k4_pp = (size_t)(nkv * hd) >> 1, kq4s_pp = (size_t)nkv * 16, v8_pp = (size_t)nkv * hd;
+    const int warp = tid >> 5, lane = tid & 31;
+    const float scale = rsqrtf((float)hd);
+
+    for (int g0 = 0; g0 < slen; g0 += TQ_PCH_TG) {
+        const int ncol = (slen - g0) < TQ_PCH_TG ? (slen - g0) : TQ_PCH_TG;
+        // ---- Q prep for the group's columns (same math as v2, per column)
+        for (int cc = 0; cc < ncol; cc++) {
+            const int col = soff + g0 + cc;
+            const int pos = positions[col];
+            const float *q_proj = q_proj_base + (size_t)col * q_m;
+            #pragma unroll
+            for (int g = 0; g < GQA; g++) {
+                int head = kv_head * group + g;
+                float qv = q_proj[head * (2 * hd) + tid];
+                float qsum = qv * qv;
+                for (int off = 16; off > 0; off >>= 1) qsum += __shfl_down_sync(0xffffffff, qsum, off);
+                if ((tid & 31) == 0) partial[tid >> 5] = qsum;
+                __syncthreads();
+                if (tid < 8) {
+                    float vtmp = partial[tid];
+                    for (int off = 4; off > 0; off >>= 1) vtmp += __shfl_down_sync(0xff, vtmp, off);
+                    if (tid == 0) *q_sum_shared = vtmp;
+                }
+                __syncthreads();
+                float rms = rsqrtf(*q_sum_shared / (float)hd + eps);
+                qv = qv * rms * (1.0f + tq_bf16_to_float(q_norm_w[tid]));
+                if (tid < rotary_dim) {
+                    int idx = tid & 31;
+                    float freq = powf(rope_theta, -((float)(2 * idx) / (float)rotary_dim));
+                    float angle = (float)pos * freq;
+                    float cth = cosf(angle), sth = sinf(angle);
+                    int pi = (tid < 32) ? tid + 32 : tid - 32;
+                    float q_pair = q_proj[head * (2 * hd) + pi];
+                    q_pair = q_pair * rms * (1.0f + tq_bf16_to_float(q_norm_w[pi]));
+                    float q_rot = (tid < 32) ? -q_pair : q_pair;
+                    qv = qv * cth + q_rot * sth;
+                }
+                qn[(cc * GQA + g) * 256 + tid] = qv;
+                __syncthreads();
+                tq_fwht256(&qn[(cc * GQA + g) * 256], tid);
+            }
+        }
+        if (tid < ncol * GQA) { m_run[tid] = -3.402823466e38f; l_run[tid] = 0.0f; }
+        __syncthreads();
+        float acc[TQ_PCH_TG][GQA];
+        #pragma unroll
+        for (int cc = 0; cc < TQ_PCH_TG; cc++)
+            #pragma unroll
+            for (int g = 0; g < GQA; g++) acc[cc][g] = 0.0f;
+        const int maxpos = positions[soff + g0 + ncol - 1];
+        const int total = maxpos + 1;
+        const int per = (total + S - 1) / S;
+        const int lo = split * per;
+        int hi = lo + per; if (hi > total) hi = total;
+
+        auto issue = [&](int c0i) {
+            int clen = hi - c0i; if (clen > TQ_PCH_CH) clen = TQ_PCH_CH;
+            int buf = ((c0i - lo) / TQ_PCH_CH) % TQ_PCH_NST;
+            for (int id = tid; id < (clen << 3); id += 256) {
+                int j = id >> 3, sgm = id & 7, t = c0i + j;
+                int phys = block_table[bt_base + (t >> page_log)];
+                size_t pr = (size_t)phys * page + (t & (page - 1));
+                tq_cp_async16((uint32_t)__cvta_generic_to_shared(sm + TQ_PCH_OFF_SK + buf * TQ_PCH_SKB + j * 128 + sgm * 16),
+                              k4_pool + pr * k4_pp + (size_t)kv_head * (hd >> 1) + sgm * 16);
+            }
+            int scseg = gc_kv_q4_fp32s ? 4 : 2;
+            for (int id = tid; id < clen * scseg; id += 256) {
+                int j = id / scseg, sgm = id % scseg, t = c0i + j;
+                int phys = block_table[bt_base + (t >> page_log)];
+                size_t pr = (size_t)phys * page + (t & (page - 1));
+                const char *src = (const char *)q4s_adv(kq4s_pool, pr * kq4s_pp + (size_t)kv_head * 16) + sgm * 16;
+                tq_cp_async16((uint32_t)__cvta_generic_to_shared(sm + TQ_PCH_OFF_SC + buf * TQ_PCH_SCB + j * 64 + sgm * 16), src);
+            }
+            for (int id = tid; id < (clen << 4); id += 256) {
+                int j = id >> 4, sgm = id & 15, t = c0i + j;
+                int phys = block_table[bt_base + (t >> page_log)];
+                size_t pr = (size_t)phys * page + (t & (page - 1));
+                tq_cp_async16((uint32_t)__cvta_generic_to_shared(sm + TQ_PCH_OFF_SV + buf * TQ_PCH_SVB + j * 256 + sgm * 16),
+                              v8_pool + pr * v8_pp + (size_t)kv_head * hd + sgm * 16);
+            }
+            for (int j = tid; j < clen; j += 256) {
+                int t = c0i + j;
+                int phys = block_table[bt_base + (t >> page_log)];
+                size_t pr = (size_t)phys * page + (t & (page - 1));
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                    :: "r"((uint32_t)__cvta_generic_to_shared(sm + TQ_PCH_OFF_VS + buf * (TQ_PCH_CH * 4) + j * 4)),
+                       "l"(vscale_pool + pr * nkv + kv_head));
+            }
+            asm volatile("cp.async.commit_group;\n");
+        };
+
+        if (lo < hi) {
+            issue(lo);
+            for (int c0 = lo; c0 < hi; c0 += TQ_PCH_CH) {
+                int clen = hi - c0; if (clen > TQ_PCH_CH) clen = TQ_PCH_CH;
+                const int buf = ((c0 - lo) / TQ_PCH_CH) % TQ_PCH_NST;
+                if (c0 + TQ_PCH_CH < hi) issue(c0 + TQ_PCH_CH);
+                else asm volatile("cp.async.commit_group;\n");
+                asm volatile("cp.async.wait_group 1;\n");
+                __syncthreads();
+                const uint8_t *skb = (const uint8_t *)(sm + TQ_PCH_OFF_SK + buf * TQ_PCH_SKB);
+                const char *scb = sm + TQ_PCH_OFF_SC + buf * TQ_PCH_SCB;
+                for (int j = warp; j < clen; j += 8) {
+                    const int t = c0 + j;
+                    const uint8_t *krow = skb + j * 128;
+                    const float *ksz = (const float *)(scb + j * 64);
+                    float kd[8];
+                    #pragma unroll
+                    for (int e = 0; e < 8; e++) {
+                        int d = lane + 32 * e;
+                        uint8_t byte = krow[d >> 1];
+                        float code = (float)((d & 1) ? (byte >> 4) : (byte & 15));
+                        kd[e] = (code - q4s_at(ksz, 2 * e + 1)) * q4s_at(ksz, 2 * e);
+                    }
+                    for (int cc = 0; cc < ncol; cc++) {
+                        const int okc = t <= positions[soff + g0 + cc];
+                        #pragma unroll
+                        for (int g = 0; g < GQA; g++) {
+                            float dot = 0.0f;
+                            #pragma unroll
+                            for (int e = 0; e < 8; e++) dot += qn[(cc * GQA + g) * 256 + lane + 32 * e] * kd[e];
+                            #pragma unroll
+                            for (int off = 16; off > 0; off >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, off);
+                            if (lane == 0) sch[(cc * GQA + g) * TQ_PCH_CH + j] = okc ? dot * scale : -3.402823466e38f;
+                        }
+                    }
+                }
+                __syncthreads();
+                if (warp < GQA) {
+                    const int g = warp;
+                    for (int cc = 0; cc < ncol; cc++) {
+                        const int cg = cc * GQA + g;
+                        float v0 = (lane < clen) ? sch[cg * TQ_PCH_CH + lane] : -3.402823466e38f;
+                        float m = v0;
+                        #pragma unroll
+                        for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+                        float m_old = m_run[cg], m_new = fmaxf(m_old, m);
+                        float p0 = (lane < clen && v0 > -3.0e38f) ? expf(v0 - m_new) : 0.0f;
+                        if (lane < clen) sch[cg * TQ_PCH_CH + lane] = p0;
+                        float ls = p0;
+                        #pragma unroll
+                        for (int off = 16; off > 0; off >>= 1) ls += __shfl_xor_sync(0xffffffffu, ls, off);
+                        if (lane == 0) {
+                            float m_valid = (m_new > -3.0e38f) ? m_new : 0.0f;   // all-masked chunk: no-op
+                            float alpha = expf(m_old - fmaxf(m_old, m_valid));
+                            if (m_old <= -3.0e38f) alpha = (ls > 0.0f) ? 0.0f : 1.0f;
+                            m_new_s[cg] = fmaxf(m_old, (ls > 0.0f) ? m_new : m_old);
+                            alpha_s[cg] = (ls > 0.0f) ? expf(m_old - m_new_s[cg]) : 1.0f;
+                            if (m_old <= -3.0e38f) alpha_s[cg] = 0.0f;
+                            l_chunk_s[cg] = ls;
+                            l_run[cg] = l_run[cg] * alpha_s[cg] + ls;
+                            m_run[cg] = m_new_s[cg];
+                        }
+                    }
+                }
+                __syncthreads();
+                const uint8_t *vb = (const uint8_t *)(sm + TQ_PCH_OFF_SV + buf * TQ_PCH_SVB);
+                const float *vsb = (const float *)(sm + TQ_PCH_OFF_VS + buf * (TQ_PCH_CH * 4));
+                for (int cc = 0; cc < ncol; cc++)
+                    #pragma unroll
+                    for (int g = 0; g < GQA; g++) acc[cc][g] *= alpha_s[cc * GQA + g];
+                for (int j = 0; j < clen; j++) {
+                    float vcode = tq_e4m3_dec_fast(vb[j * 256 + tid]);
+                    float vscl = vsb[j];
+                    for (int cc = 0; cc < ncol; cc++)
+                        #pragma unroll
+                        for (int g = 0; g < GQA; g++)
+                            acc[cc][g] += sch[(cc * GQA + g) * TQ_PCH_CH + j] * vcode * vscl;
+                }
+                __syncthreads();
+            }
+        }
+        // partials for the group's columns (same layout the merge kernel reads)
+        for (int cc = 0; cc < ncol; cc++) {
+            #pragma unroll
+            for (int g = 0; g < GQA; g++) {
+                const int cg = cc * GQA + g;
+                int head = kv_head * group + g;
+                size_t pidx = ((size_t)(head * Tcols + (soff + g0 + cc)) * S + split);
+                part_acc[pidx * hd + tid] = acc[cc][g];
+                if (tid == 0) { part_ml[pidx * 2 + 0] = m_run[cg]; part_ml[pidx * 2 + 1] = l_run[cg]; }
+            }
+        }
+        __syncthreads();
+    }
+}
+
 // combine S split partials per (head,col): m*=max m_s; acc*=sum exp(m_s-m*) acc_s; l* likewise;
 // out = (acc*/l*) * sigmoid(gate). One block per (head,col), thread tid = output channel.
 __global__ void k_tq_paged_attn_q4_merge(
@@ -25509,6 +25751,55 @@ static int launch_paged_attn_q4(float *out, const float *q_proj, const uint16_t 
         g_attn_pacc, g_attn_pml);
     k_tq_paged_attn_q4_merge<<<dim3(nh, N), hd, 0, st>>>(
         out, q_proj, positions, nh, hd, q_m, attn_m, S, g_attn_pacc, g_attn_pml);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+// Chain-shared verify attention: seg_* live on device (copied per verify wave).
+// KV rows must already be written (the verify core writes them explicitly).
+static int *g_seg_slot_d = NULL, *g_seg_off_d = NULL, *g_seg_len_d = NULL;
+static int ensure_seg_bufs(void) {
+    if (g_seg_slot_d) return 0;
+    if (cudaMalloc(&g_seg_slot_d, 64 * sizeof(int)) != cudaSuccess) return -1;
+    if (cudaMalloc(&g_seg_off_d, 64 * sizeof(int)) != cudaSuccess) return -1;
+    if (cudaMalloc(&g_seg_len_d, 64 * sizeof(int)) != cudaSuccess) return -1;
+    return 0;
+}
+static int paged_attn_chain(void) {
+    static int en = -1;
+    if (en < 0) { const char *e = getenv("TQ_PAGED_CHAIN"); en = (e && e[0]) ? !!atoi(e) : 1; }
+    return en;
+}
+static int launch_paged_attn_q4_chain(float *out, const float *q_proj, const uint16_t *q_norm_w,
+                                      uint8_t *k4_pool, float *kq4s_pool, uint8_t *v8_pool, float *vscale_pool,
+                                      const int *positions_d, const int *block_table,
+                                      int max_blocks, int page, int page_log,
+                                      int nseg, int T, int max_pos, cudaStream_t st) {
+    int nh = g_qwen.nh, nkv = g_qwen.nkv, hd = g_qwen.hd;
+    int q_m = nh * hd * 2, attn_m = nh * hd;
+    int blocks0 = nkv * nseg; if (blocks0 < 1) blocks0 = 1;
+    int total = max_pos + 1;
+    int s_occ = (2 * paged_sm_count() + blocks0 - 1) / blocks0;
+    int s_work = total / 512; if (s_work < 1) s_work = 1;
+    int S = s_occ < s_work ? s_occ : s_work;
+    if (S < 1) S = 1;
+    if (S > 96) S = 96;
+    if (ensure_attn_partials((size_t)nh * T * S) != 0) return -2;
+    static int ch_attr = 0;
+    if (!ch_attr) {
+        if (cudaFuncSetAttribute(k_tq_paged_attn_q4_chain_v2<6>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 TQ_PCH_SMEM) != cudaSuccess) ch_attr = -1;
+        else ch_attr = 1;
+    }
+    if (ch_attr < 0) return -3;
+    k_tq_paged_attn_q4_chain_v2<6><<<dim3(nkv, nseg, S), hd, TQ_PCH_SMEM, st>>>(
+        q_proj, q_norm_w, k4_pool, kq4s_pool, v8_pool, vscale_pool,
+        positions_d, g_seg_slot_d, g_seg_off_d, g_seg_len_d,
+        block_table, max_blocks, page, page_log,
+        nh, nkv, hd, q_m, S, T, g_qwen.eps, g_qwen.rope_theta,
+        g_attn_pacc, g_attn_pml);
+    k_tq_paged_attn_q4_merge<<<dim3(nh, T), hd, 0, st>>>(
+        out, q_proj, positions_d, nh, hd, q_m, attn_m, S, g_attn_pacc, g_attn_pml);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
@@ -26840,6 +27131,15 @@ static int run_paged_spec_verify_core(const int *tokens, const int *col_slot, co
                     cudaMemcpyHostToDevice, g_qwen.stream);
     cudaMemcpyAsync(g_pf_colslot, col_slot, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
     cudaMemcpyAsync(g_wide_pos, col_pos, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+    // chain-shared verify attention: per-segment metadata on device
+    int chain_ok = paged_attn_chain() && (nkv > 0) && ((g_qwen.nh % nkv) == 0) &&
+                   (g_qwen.hd == 256) && ((g_qwen.nh / nkv) == 6) && K <= 64 &&
+                   ensure_seg_bufs() == 0;
+    if (chain_ok) {
+        cudaMemcpyAsync(g_seg_slot_d, seg_slot, (size_t)K * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+        cudaMemcpyAsync(g_seg_off_d, seg_off, (size_t)K * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+        cudaMemcpyAsync(g_seg_len_d, seg_len, (size_t)K * sizeof(int), cudaMemcpyHostToDevice, g_qwen.stream);
+    }
     for (int j = 0; j < T; j++)
         k_tq_embed_lookup<<<(H + 255) / 256, 256, 0, g_qwen.stream>>>(
             g_wide_h + (size_t)j * H, g_qwen.d_embed, tokens[j], H);
@@ -26859,7 +27159,12 @@ static int run_paged_spec_verify_core(const int *tokens, const int *col_slot, co
                 g_wide_k, g_wide_v, l->d_k_norm, g_wide_pos, g_pf_colslot,
                 g_block_table, g_pg_maxblk, g_pg_page, g_pg_plog, nkv, g_qwen.hd, kv_m,
                 g_qwen.eps, g_qwen.rope_theta);
-            if (launch_paged_attn_q4(g_wide_core, g_wide_q, l->d_q_norm, g_wide_k, g_wide_v, l->d_k_norm,
+            if (chain_ok) {
+                if (launch_paged_attn_q4_chain(g_wide_core, g_wide_q, l->d_q_norm,
+                                               g_pool_k4[L], g_pool_kq4s[L], g_pool_v8[L], g_pool_vscale[L],
+                                               g_wide_pos, g_block_table, g_pg_maxblk, g_pg_page, g_pg_plog,
+                                               K, T, pf_maxpos, g_qwen.stream) != 0) return -94;
+            } else if (launch_paged_attn_q4(g_wide_core, g_wide_q, l->d_q_norm, g_wide_k, g_wide_v, l->d_k_norm,
                                      g_pool_k4[L], g_pool_kq4s[L], g_pool_v8[L], g_pool_vscale[L],
                                      g_wide_pos, g_pf_colslot, g_block_table, g_pg_maxblk, g_pg_page, g_pg_plog,
                                      T, pf_maxpos, g_qwen.stream) != 0) return -94;
