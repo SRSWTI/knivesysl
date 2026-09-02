@@ -24783,19 +24783,22 @@ void k_tq_paged_attn_q4_split_gqa(
 // drift the S-split boundary already introduces. Merge kernel unchanged.
 // TQ_PAGED_ATTN_V2=0 reverts to v1.
 // ===========================================================================
-#define TQ_PAV2_CH 32
-// dynamic smem layout (bytes), GQA=6 / hd=256 / 2 buffers of TQ_PAV2_CH rows.
-// 35.25 KB total -> 2 CTAs/SM under the 99 KB carveout: the second resident
-// CTA hides the single-chunk-deep cp.async pipeline's phase latency.
+#define TQ_PAV2_CH  24
+#define TQ_PAV2_NST 3
+// dynamic smem layout (bytes), GQA=6 / hd=256 / TQ_PAV2_NST buffers of
+// TQ_PAV2_CH rows. ~39.5 KB total -> still 2 CTAs/SM under the 99 KB carveout;
+// the 3-deep pipeline keeps TWO chunks' copies in flight so compute never
+// waits on the copy it is about to consume (the single-depth version measured
+// ~3x its traffic roofline on copy-latency stalls).
 #define TQ_PAV2_SKB      (TQ_PAV2_CH * 128)             // K4 codes per buffer
 #define TQ_PAV2_SCB      (TQ_PAV2_CH * 64)              // (scale,zp) bytes per buffer
 #define TQ_PAV2_SVB      (TQ_PAV2_CH * 256)             // V8 bytes per buffer
 #define TQ_PAV2_OFF_QN   0                              // 6*256 f32 = 6144
 #define TQ_PAV2_OFF_SK   6144
-#define TQ_PAV2_OFF_SC   (TQ_PAV2_OFF_SK + 2 * TQ_PAV2_SKB)
-#define TQ_PAV2_OFF_SV   (TQ_PAV2_OFF_SC + 2 * TQ_PAV2_SCB)
-#define TQ_PAV2_OFF_VS   (TQ_PAV2_OFF_SV + 2 * TQ_PAV2_SVB)
-#define TQ_PAV2_OFF_SCH  (TQ_PAV2_OFF_VS + 2 * TQ_PAV2_CH * 4)
+#define TQ_PAV2_OFF_SC   (TQ_PAV2_OFF_SK + TQ_PAV2_NST * TQ_PAV2_SKB)
+#define TQ_PAV2_OFF_SV   (TQ_PAV2_OFF_SC + TQ_PAV2_NST * TQ_PAV2_SCB)
+#define TQ_PAV2_OFF_VS   (TQ_PAV2_OFF_SV + TQ_PAV2_NST * TQ_PAV2_SVB)
+#define TQ_PAV2_OFF_SCH  (TQ_PAV2_OFF_VS + TQ_PAV2_NST * TQ_PAV2_CH * 4)
 #define TQ_PAV2_OFF_CTL  (TQ_PAV2_OFF_SCH + 6 * TQ_PAV2_CH * 4)
 #define TQ_PAV2_SMEM     (TQ_PAV2_OFF_CTL + 256)
 template <int GQA>
@@ -24884,7 +24887,7 @@ void k_tq_paged_attn_q4_split_gqa_v2(
     // one cp.async group per chunk: K 8 + scales 4/2 + V 16 + vscale segments
     auto issue = [&](int c0i) {
         int clen = hi - c0i; if (clen > TQ_PAV2_CH) clen = TQ_PAV2_CH;
-        int buf = ((c0i - lo) / TQ_PAV2_CH) & 1;
+        int buf = ((c0i - lo) / TQ_PAV2_CH) % TQ_PAV2_NST;
         for (int id = tid; id < (clen << 3); id += 256) {
             int j = id >> 3, seg = id & 7, t = c0i + j;
             int phys = block_table[bt_base + (t >> page_log)];
@@ -24918,13 +24921,19 @@ void k_tq_paged_attn_q4_split_gqa_v2(
         asm volatile("cp.async.commit_group;\n");
     };
 
+    // 3-deep: prologue commits groups 0 and 1; iteration ci commits group ci+2
+    // (real or empty) and waits "<=2 pending", i.e. group ci complete. Buffer
+    // (ci+2)%3 was consumed at iteration ci-1, whose tail __syncthreads fences
+    // the reuse.
     issue(lo);
+    if (lo + TQ_PAV2_CH < hi) issue(lo + TQ_PAV2_CH);
+    else asm volatile("cp.async.commit_group;\n");
     for (int c0 = lo; c0 < hi; c0 += TQ_PAV2_CH) {
         int clen = hi - c0; if (clen > TQ_PAV2_CH) clen = TQ_PAV2_CH;
-        const int buf = ((c0 - lo) / TQ_PAV2_CH) & 1;
-        if (c0 + TQ_PAV2_CH < hi) issue(c0 + TQ_PAV2_CH);
+        const int buf = ((c0 - lo) / TQ_PAV2_CH) % TQ_PAV2_NST;
+        if (c0 + 2 * TQ_PAV2_CH < hi) issue(c0 + 2 * TQ_PAV2_CH);
         else asm volatile("cp.async.commit_group;\n");  // keep group index == chunk index
-        asm volatile("cp.async.wait_group 1;\n");
+        asm volatile("cp.async.wait_group 2;\n");
         __syncthreads();
         // scores: one staged K row per (warp, position), all GQA heads
         const uint8_t *skb = (const uint8_t *)(sm + TQ_PAV2_OFF_SK + buf * TQ_PAV2_SKB);
