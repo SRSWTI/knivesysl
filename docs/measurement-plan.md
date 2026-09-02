@@ -61,16 +61,91 @@ and would have silently disabled speculation above four slots.
 
 ## execution
 
-Native artifacts complete first under `/tmp/gembench/raw/knivesysl/`. Production is
-restored by an EXIT trap. SGLang then runs separately into
-`/tmp/gembench/raw/sglang/`; one external boot cannot destroy native results.
+Execution is now staged. The immediate decision matrix deliberately excludes maximum
+concurrency and maximum-capacity frontiers because paged MTP and APC durability will
+change per-block/per-slot memory accounting and invalidate those measurements.
 
-### A. primary paged grids -- 6 configs
+Current native drivers:
+
+```text
+tools/bench_core_matrix.sh
+tools/bench_core_parity.sh
+```
+
+Run the parity supplement after the base matrix. It adds only cells deliberately
+omitted from the original sentinel grid; it does not overwrite or rerun completed
+samples.
+
+Current matched reference:
+
+```text
+tools/bench_sglang_core.sh
+```
+
+Persistent artifacts and live logs:
+
+```text
+results/core_matrix.log
+results/sglang_core.log
+results/raw/knivesysl/
+results/raw/sglang/
+```
+
+The combined native core campaign has at most 53 feasible cells:
+
+- NVFP4-all plain: 2k/8k/32k/65k/131k at n=1/2/4, pool-clipped;
+- NVFP4-MLP plain: the identical context/concurrency grid, pool-clipped;
+- FP6 plain: the identical context/concurrency grid, pool-clipped;
+- NVFP4-all n-gram: the identical context/concurrency grid, pool-clipped;
+- FP6 single-stream MTP: 2k/8k/32k/65k/131k at n=1. The current MTP server
+  serializes requests and cannot validly measure n=2/4.
+
+The base matrix's five artifacts remain authoritative. The parity supplement stores
+the 18 previously omitted cells in separate artifacts so strict resume metadata
+remains immutable. Consumers must union matching base and `-parity` artifacts by
+weight/spec tier before comparison.
+
+All retain tokenizer-exact prompts, 512 generated tokens, temperature zero, prefix
+cache off, three repetitions, server usage token counts, and raw per-client timing.
+
+## frozen core comparison (2026-09-02)
+
+The authoritative SGLang reference artifacts are the `sgl-core-nocache-*` labels
+(radix prefix cache disabled). The earlier `sgl-core-*` artifacts are marked
+`superseded`: radix caching across the three identical repetitions contaminated
+TTFT, prefill, and cohort admission (8k TTFT read 0.19s cached vs 0.72s clean;
+32k read 0.36s vs 3.97s). DSpark is likewise rerun cache-disabled
+(146.3/208.3 tok/s at 2k/8k, 13,276-token pool).
+
+Frozen knivesysl-NVFP4-plain / SGLang-clean ratios (decode agg, TTFT their/ours):
+
+```text
+ 2k:1 0.81x 0.77x | 8k:1 0.85x 0.82x | 32k:1 0.86x 0.89x | 65k:1 0.79x 0.96x | 131k:1 0.66x 1.01x
+ 8k:4 1.50x 3.22x | 32k:4 1.04x 1.36x   (we lead both concurrency cells)
+```
+
+n=1 decode ITL decomposition: flat ~3.2 ms base gap (CUDA-graph/launch, context-free)
++ context-scan gap growing to ~5.6 ms at 131k. The kernel campaign's staged GQA
+decode kernel (commit 642c51e, measured after this freeze) already recovers most of
+the scan gap (131k 38.9 -> 51.3 tok/s); those numbers re-enter through the
+final-acceptance campaign, not by editing the frozen core artifacts.
+
+The complete final-acceptance drivers remain:
+
+```text
+tools/bench_all_tiers.sh
+tools/bench_sglang_ref.sh
+```
+
+The A-H campaign below is deferred until paged MTP and APC durability finalize the
+state layout.
+
+### A. final-acceptance primary paged grids -- 6 configs
 
 `NVFP4-all / NVFP4-MLP / FP6 x plain / n-gram`, max-slots 4, contexts
-2k-131k, concurrency 1/2/4, prefix cache off, gen 192, three repetitions.
-Pools are 1800 / 1500 / 1200 blocks respectively, giving 17 / 17 / 16 feasible
-cells per config. The obsolete depth gate is lifted.
+2k-131k, concurrency 1/2/4, prefix cache off, gen 512, three repetitions.
+Pools are 1800 / 1500 / 1200 blocks respectively, giving feasible cells according
+to the exact `context + generation + 64` per-request guard. The obsolete depth gate is lifted.
 
 ### B. per-tier deep frontiers
 
@@ -92,9 +167,9 @@ Each tier boots with max-slots 16. The same boot measures:
 - its actual constant-total frontier at n=4, n=8, and n=16.
 
 For a successful pool of `B` 128-token blocks, each frontier context is computed
-as `floor((128B/N - 256)/128)*128`. NVFP4 at the production pool therefore targets
-approximately 4x65k, 8x32k, and 16x16k; lower-capacity tiers land at their own
-measured frontier.
+as `floor((128B/N - 576)/128)*128`, reserving 512 generated tokens plus a 64-token
+guard per request. NVFP4 at the production pool therefore targets approximately
+4x65k, 8x32k, and 16x16k; lower-capacity tiers land at their own measured frontier.
 
 ### D. high-concurrency n-gram fallback
 
@@ -131,15 +206,18 @@ cold/append/exact-resend/six-way-fan-out APC confirmation on production.
 
 ## artifact and metric contract
 
-Every JSON is schema 2 and written atomically after every repetition. It contains:
+Every current JSON is schema 3 and is durably checkpointed after every repetition:
+temporary file write, flush, file `fsync`, atomic replace, then directory `fsync`.
+`--resume` accepts only an exact configuration match, skips a complete artifact,
+and continues an incomplete cell from its next repetition. It contains:
 
-- launch arguments, engine identity, pool/slot capacity, and start/end health;
+- launch arguments, engine identity, pool/slot capacity, and every server-run start/end;
 - all skipped cells and the exact feasibility reason;
 - every raw per-client request timing for every repetition;
 - median/min/max for per-request decode tok/s, aggregate decode tok/s, end-to-end
   aggregate tok/s, TTFT max/median, estimated prefill tok/s, event ITL p50/p99,
   tokens/event, spec rounds, committed tokens, and tokens/round;
-- expected and observed spec behavior (`off`, `active`, or `fallback`).
+- expected and observed spec behavior (`off`, `active`, `tail-active`, or `fallback`).
 
 ITL intentionally remains per SSE event: speculative token bursts are the client
 experience. Token throughput always uses the server's usage `completion_tokens`,
@@ -147,10 +225,14 @@ never event count.
 
 ## cost and resolved decisions
 
-This is no longer a 60-minute spot check. Repetitions, long-context frontiers, and
-seven SGLang concurrency boots make it a multi-hour campaign (roughly 4-7 GPU
-hours, dominated by repeated 196k-261k prefills). Correctness takes precedence.
+The immediate core pass is approximately 35 native cells plus the matched n=1/2/4
+SGLang and two-cell DSpark reference: enough to freeze the kernel baseline without
+spending hours on soon-to-be-invalid capacity boundaries. The exhaustive campaign
+remains a roughly 4-7 GPU-hour final-acceptance gate, dominated by repeated
+196k-261k prefills and high-slot boots.
 
-Resolved: include NVFP4-MLP; measure every concurrency rung through 16; keep the
-DSpark reference; gen 192; three normal/two deep repetitions; raw engine artifacts
-before charts.
+Resolved: core matrix first; include exact 65,536-token cells; retain NVFP4-MLP and
+FP6 as bounded sentinels; keep DSpark; gen 512; three repetitions; tokenizer-exact
+input construction; server-reported prompt/completion counts; persistent `results/`
+artifacts. Defer n=8/12/15/16, constant-total frontiers, and 190k-261k capacity until
+paged MTP and APC finalize memory ownership.
