@@ -4696,6 +4696,58 @@ k_tq_add_rmsnorm_b(float *out, float *resid, const float *a, const float *b,
     }
 }
 
+// Norm->quant fusion phase 1: per-row rsqrt factor only (the normalized row is
+// never materialized; the NVFP4 quantizer applies fac * (1+w) inline). The
+// reduction is copied verbatim from k_tq_qwen_rmsnorm_b (same blockDim, same
+// shuffle order), so fac is bit-identical to that kernel's rms_inv.
+__global__ void __launch_bounds__(1024, 1)
+k_tq_rms_fac_b(float *fac, const float *x, int N, float eps) {
+    __shared__ float smem[32];
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp_id = tid >> 5;
+    const float *xn = x + (size_t)blockIdx.y * N;
+    float sum_sq = 0.0f;
+    for (int i = tid; i < N; i += blockDim.x) { float v = xn[i]; sum_sq += v * v; }
+    for (int offset = 16; offset > 0; offset >>= 1) sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    if (lane == 0) smem[warp_id] = sum_sq;
+    __syncthreads();
+    if (warp_id == 0) {
+        sum_sq = (lane < (blockDim.x + 31) / 32) ? smem[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+        if (lane == 0) fac[blockIdx.y] = rsqrtf(sum_sq / (float)N + eps);
+    }
+}
+
+// Fused add + factor: resid = a + b is still written (the down-proj residual
+// needs it); only the normalized 42 MB intermediate write + re-read disappear.
+// Same arithmetic as k_tq_add_rmsnorm_b minus the outn store.
+__global__ void __launch_bounds__(1024, 1)
+k_tq_add_rms_fac_b(float *fac, float *resid, const float *a, const float *b,
+                   int N, float eps) {
+    __shared__ float smem[32];
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp_id = tid >> 5;
+    const float *an = a + (size_t)blockIdx.y * N;
+    const float *bn = b + (size_t)blockIdx.y * N;
+    float *rn = resid + (size_t)blockIdx.y * N;
+    float sum_sq = 0.0f;
+    for (int i = tid; i < N; i += blockDim.x) {
+        float v = an[i] + bn[i];
+        rn[i] = v;
+        sum_sq += v * v;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    if (lane == 0) smem[warp_id] = sum_sq;
+    __syncthreads();
+    if (warp_id == 0) {
+        sum_sq = (lane < (blockDim.x + 31) / 32) ? smem[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+        if (lane == 0) fac[blockIdx.y] = rsqrtf(sum_sq / (float)N + eps);
+    }
+}
+
 // rmsnorm_b variant that also leaves each block's stripe absmax of the output in
 // amax[node * gridDim.x + blockIdx.x] (max over stripes = column absmax, exact) so
 // the persistent layer kernel can skip its absmax phase. Same norm arithmetic.
@@ -11824,6 +11876,57 @@ __global__ void k_tq_nvf4_quant_x(uint32_t *b, const float *X, int nvar, int K,
     dst[lane * 2 + 1] = words[1];
 }
 
+// Fused rmsnorm -> per-16 ue4m3 quantize: value = X[col][k] * fac[col] * (1 + nw[k]),
+// the exact expression k_tq_qwen_rmsnorm_b writes (fac carries that kernel's rms_inv
+// bits via k_tq_rms_fac_b). Same absmax pass, same encode as k_tq_nvf4_quant_x on the
+// identical floats -> bit-identical codes; the [N x K] normalized fp32 intermediate is
+// never written or re-read (~84 MB round-trip per 2048x5120 wave instance dropped).
+__global__ void k_tq_nvf4_quant_x_nw(uint32_t *b, const float *X, const float *fac,
+                                     const uint16_t *nw, int nvar, int K,
+                                     int NGgroups, int Kt64) {
+    long tile = (long)blockIdx.x;                      // (g8 * Kt64 + kt)
+    if (tile >= (long)NGgroups * Kt64) return;
+    int g8 = (int)(tile / Kt64), kt = (int)(tile % Kt64);
+    int lane = threadIdx.x;
+    uint32_t *dst = b + tile * TQ_NVF4_BW;
+    __shared__ float sc[8][4];
+    if (lane < 8) {
+        int col = g8 * 8 + lane;
+        float f = (col < nvar) ? fac[col] : 0.f;
+        uint32_t w = 0;
+        for (int g = 0; g < 4; g++) {
+            float mx = 0.f;
+            for (int t = 0; t < 16; t++) {
+                int k = kt * 64 + g * 16 + t;
+                float v = (col < nvar && k < K)
+                    ? X[(size_t)col * K + k] * f * (1.0f + tq_bf16_to_float(nw[k])) : 0.f;
+                mx = fmaxf(mx, fabsf(v));
+            }
+            uint8_t sb = tq_f2ue4m3(mx / 6.0f);
+            if (sb == 0) sb = 1;
+            w |= (uint32_t)sb << (8 * g);
+            sc[lane][g] = tq_ue4m3_to_f(sb);
+        }
+        dst[64 + lane] = w;
+    }
+    __syncthreads();
+    uint32_t words[2] = {0, 0};
+    int col = g8 * 8 + (lane >> 2);
+    float f = (col < nvar) ? fac[col] : 0.f;
+    for (int reg = 0; reg < 2; reg++) {
+        for (int j = 0; j < 8; j++) {
+            int k = tq_nvf4_b_k(lane, reg, j);
+            int gk = kt * 64 + k;
+            float v = (col < nvar && gk < K)
+                ? X[(size_t)col * K + gk] * f * (1.0f + tq_bf16_to_float(nw[gk])) : 0.f;
+            float s = sc[lane >> 2][k >> 4];
+            words[reg] |= tq_quant_e2m1_code(s > 0.f ? v / s : 0.f) << (4 * j);
+        }
+    }
+    dst[lane * 2 + 0] = words[0];
+    dst[lane * 2 + 1] = words[1];
+}
+
 // Fused silu(gate)*up -> per-16 ue4m3 quantize. Same scale math, same encode, same
 // fp32 silu expression as k_tq_silu_mul feeding k_tq_nvf4_quant_x -- bit-identical
 // codes -- but the [N x I] fp32 product never exists: computed ONCE into a 2 KB smem
@@ -13814,7 +13917,8 @@ static void nvf4_quant_invalidate(void) { g_nvf4_qvalid = 0; }
 // to whole 32-group (256-column) tiles so every host column tile starts on a tile
 // boundary and the GEMM's power-of-two NG never reads past what was written.
 static int nvf4_quant_ensure(const float *d_x, int K, int N, cudaStream_t st,
-                             const float *gate = NULL, const float *up = NULL) {
+                             const float *gate = NULL, const float *up = NULL,
+                             const float *fac = NULL, const uint16_t *nw = NULL) {
     if (g_nvf4_qvalid && g_nvf4_qsrc == d_x && g_nvf4_qK == K && g_nvf4_qN == N) return 0;
     if (K % 64 != 0) return -93;
     const int Kt64 = K / 64;
@@ -13841,6 +13945,9 @@ static int nvf4_quant_ensure(const float *d_x, int K, int N, cudaStream_t st,
     if (gate)
         k_tq_nvf4_quant_silu<<<(unsigned)((size_t)ng8 * Kt64), 32, 0, st>>>(
             g_nvf4_b, gate, up, N, K, ng8, Kt64);
+    else if (fac)
+        k_tq_nvf4_quant_x_nw<<<(unsigned)((size_t)ng8 * Kt64), 32, 0, st>>>(
+            g_nvf4_b, d_x, fac, nw, N, K, ng8, Kt64);
     else
         k_tq_nvf4_quant_x<<<(unsigned)((size_t)ng8 * Kt64), 32, 0, st>>>(
             g_nvf4_b, d_x, N, K, ng8, Kt64);
@@ -22752,6 +22859,7 @@ static int ensure_wide_prefill_buffers(int N) {
 
 static int wide_quant_input(const float *d_x, int K, int N);
 static int wide_quant_silu(const float *gate, const float *up, int K, int N);
+static int wide_quant_norm(const float *x, const float *fac, const uint16_t *nw, int K, int N);
 static int wide_proj(const tq_qmma_weight_t *w, float *out, int N);
 // Q4(K)+E4M3(V) batched/wide attention (defined in the roadmap-E section below). With
 // {k4,kq4s,v8,vscale}_stride = 0 every column shares ONE cache -> wide-prefill Q4 attention.
@@ -22770,6 +22878,34 @@ static inline int tq_wide_fmt_ok(const tq_qmma_weight_t *w) {
     return can_use_qmma_sf_weight(w) && !w->row_major && (w->e2m3 || w->e2m1);
 }
 
+// ---- norm->quant fusion shared state (TQ_NVF4_FUSE_NORM=0 reverts) ----
+static float *g_wide_fac = NULL; static int g_wide_fac_n = 0;
+static int ensure_wide_fac(int n) {
+    if (n <= g_wide_fac_n) return 0;
+    if (g_wide_fac) cudaFree(g_wide_fac);
+    int cap = n < 2048 ? 2048 : n;
+    if (cudaMalloc(&g_wide_fac, (size_t)cap * sizeof(float)) != cudaSuccess) { g_wide_fac = NULL; g_wide_fac_n = 0; return -8; }
+    g_wide_fac_n = cap;
+    return 0;
+}
+static int tq_fuse_norm(void) {
+    static int en = -1;
+    if (en < 0) { const char *e = getenv("TQ_NVF4_FUSE_NORM"); en = (e && e[0]) ? !!atoi(e) : 1; }
+    return en;
+}
+// input-norm -> quant: fused when every consumer of the normed activation is
+// NVFP4 (nvf4_ok), else the plain rmsnorm_b into `tmp` + wide_quant_input pair.
+// Both paths produce bit-identical B-frags (see k_tq_nvf4_quant_x_nw).
+static int wide_norm_quant(float *tmp, const float *x, const uint16_t *w_ln, int K, int N, int nvf4_ok) {
+    if (tq_fuse_norm() && nvf4_ok) {
+        if (ensure_wide_fac(N) != 0) return -8;
+        k_tq_rms_fac_b<<<dim3(1, N), 1024, 0, g_qwen.stream>>>(g_wide_fac, x, K, g_qwen.eps);
+        return wide_quant_norm(x, g_wide_fac, w_ln, K, N);
+    }
+    k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(N), N), 1024, 0, g_qwen.stream>>>(tmp, x, w_ln, K, g_qwen.eps);
+    return wide_quant_input(tmp, K, N);
+}
+
 // Wide MLP for a chunk of n tokens: post-rmsnorm(resid) -> gate/up (wide, shared B-frag)
 // -> silu*mul -> down (wide) -> layer_out = resid + down. resid and layer_out are [n x H]
 // (token-major); may NOT alias. Returns 0; -1 if mlp weights aren't e2m3-SF (caller falls back).
@@ -22781,11 +22917,30 @@ static int wide_mlp_x(tq_layer_t *l, const float *add_a, const float *add_b,
     int H = g_qwen.H, I = g_qwen.I;
     if (!(tq_wide_fmt_ok(&l->mlp_gate) && tq_wide_fmt_ok(&l->mlp_up) &&
           tq_wide_fmt_ok(&l->mlp_down))) return -1;
-    if (add_a)
-        k_tq_add_rmsnorm_b<<<dim3(1, n), 1024, 0, g_qwen.stream>>>(g_wide_pn, resid_w, add_a, add_b, l->d_post_ln, H, g_qwen.eps);
-    else
-        k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(n), n), 1024, 0, g_qwen.stream>>>(g_wide_pn, resid, l->d_post_ln, H, g_qwen.eps);
-    int ret = wide_quant_input(g_wide_pn, H, n);
+    // Norm->quant fusion (TQ_NVF4_FUSE_NORM=0 reverts): when gate AND up are
+    // NVFP4 the normalized [n x H] intermediate is never materialized -- the
+    // factor kernel emits per-row rms_inv and the quantizer applies
+    // fac * (1 + w) inline, bit-identically. FP6/mixed tiers keep the old path
+    // (the FP6 quantizer needs the fp32 normed buffer).
+    int ret;
+    if (tq_fuse_norm() && l->mlp_gate.nvf4 && l->mlp_up.nvf4 && l->mlp_down.nvf4) {
+        if (ensure_wide_fac(n) != 0) return -8;
+        const float *xsrc;
+        if (add_a) {
+            k_tq_add_rms_fac_b<<<dim3(1, n), 1024, 0, g_qwen.stream>>>(g_wide_fac, resid_w, add_a, add_b, H, g_qwen.eps);
+            xsrc = resid_w;
+        } else {
+            k_tq_rms_fac_b<<<dim3(1, n), 1024, 0, g_qwen.stream>>>(g_wide_fac, resid, H, g_qwen.eps);
+            xsrc = resid;
+        }
+        ret = wide_quant_norm(xsrc, g_wide_fac, l->d_post_ln, H, n);
+    } else {
+        if (add_a)
+            k_tq_add_rmsnorm_b<<<dim3(1, n), 1024, 0, g_qwen.stream>>>(g_wide_pn, resid_w, add_a, add_b, l->d_post_ln, H, g_qwen.eps);
+        else
+            k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(n), n), 1024, 0, g_qwen.stream>>>(g_wide_pn, resid, l->d_post_ln, H, g_qwen.eps);
+        ret = wide_quant_input(g_wide_pn, H, n);
+    }
     if (ret != 0) return ret;
     if ((ret = wide_proj(&l->mlp_gate, g_wide_gate, n)) != 0) return ret;
     if ((ret = wide_proj(&l->mlp_up, g_wide_up, n)) != 0) return ret;
@@ -22831,6 +22986,8 @@ static size_t g_wproj_b_bytes = 0, g_wproj_bscale_n = 0, g_wproj_part_bytes = 0;
 // With no NVFP4 weights it quantizes eagerly exactly as before.
 static const float *g_wq_pend_x = NULL;
 static const float *g_wq_pend_gate = NULL, *g_wq_pend_up = NULL;   // fused silu pending
+static const float *g_wq_pend_fac = NULL;                          // fused rmsnorm pending
+static const uint16_t *g_wq_pend_nw = NULL;
 static int g_wq_pend_K = 0, g_wq_pend_N = 0, g_wq_fp6_done = 0;
 
 static int wide_quant_input_fp6(const float *d_x, int K, int N) {
@@ -22863,6 +23020,7 @@ static int wide_quant_input_fp6(const float *d_x, int K, int N) {
 static int wide_quant_input(const float *d_x, int K, int N) {
     g_wq_pend_x = d_x; g_wq_pend_K = K; g_wq_pend_N = N;
     g_wq_pend_gate = NULL; g_wq_pend_up = NULL;
+    g_wq_pend_fac = NULL; g_wq_pend_nw = NULL;
     g_wq_fp6_done = 0;
     nvf4_quant_invalidate();
     if (!g_nvf4_any) {                     // default path: unchanged, eager
@@ -22880,6 +23038,7 @@ static int wide_quant_input(const float *d_x, int K, int N) {
 // Called at each paged entry point; costs nothing.
 static void wide_quant_reset(void) {
     g_wq_pend_x = NULL; g_wq_pend_gate = NULL; g_wq_pend_up = NULL;
+    g_wq_pend_fac = NULL; g_wq_pend_nw = NULL;
     g_wq_pend_K = 0; g_wq_pend_N = 0;
     g_wq_fp6_done = 0;
     nvf4_quant_invalidate();
@@ -22902,6 +23061,21 @@ static int wide_dbg(void) {
 static int wide_quant_silu(const float *gate, const float *up, int K, int N) {
     g_wq_pend_x = gate;                    // memo key (unique per production)
     g_wq_pend_gate = gate; g_wq_pend_up = up;
+    g_wq_pend_fac = NULL; g_wq_pend_nw = NULL;
+    g_wq_pend_K = K; g_wq_pend_N = N;
+    g_wq_fp6_done = 0;
+    nvf4_quant_invalidate();
+    return 0;
+}
+
+// Record a PENDING fused rmsnorm activation: the normalized row is never
+// materialized; the nvf4 quantizer applies fac[col] * (1 + nw[k]) inline
+// (bit-identical to rmsnorm_b + quant_x). Only valid when every consumer of
+// this activation is NVFP4 (the caller guards, like wide_quant_silu).
+static int wide_quant_norm(const float *x, const float *fac, const uint16_t *nw, int K, int N) {
+    g_wq_pend_x = x;
+    g_wq_pend_gate = NULL; g_wq_pend_up = NULL;
+    g_wq_pend_fac = fac; g_wq_pend_nw = nw;
     g_wq_pend_K = K; g_wq_pend_N = N;
     g_wq_fp6_done = 0;
     nvf4_quant_invalidate();
@@ -22912,7 +23086,8 @@ static int wide_proj(const tq_qmma_weight_t *w, float *out, int N) {
     if (w->nvf4) {
         if (!g_wq_pend_x || g_wq_pend_N != N || g_wq_pend_K != w->K) return -94;
         int rc = nvf4_quant_ensure(g_wq_pend_x, g_wq_pend_K, N, g_qwen.stream,
-                                   g_wq_pend_gate, g_wq_pend_up);
+                                   g_wq_pend_gate, g_wq_pend_up,
+                                   g_wq_pend_fac, g_wq_pend_nw);
         if (rc != 0) return rc;
         rc = nvf4_gemm_tiled(w, out, N, g_qwen.stream);
         if (rc == 0 && wide_dbg() && !g_wq_pend_gate) {
@@ -25871,8 +26046,8 @@ static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, 
         if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION) {
             if (!(tq_wide_fmt_ok(&l->q_proj) && tq_wide_fmt_ok(&l->o_proj) &&
                   tq_wide_fmt_ok(&l->mlp_gate) && tq_wide_fmt_ok(&l->mlp_down))) return -63;
-            k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(N), N), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
-            if ((ret = wide_quant_input(g_wide_norm, H, N)) != 0) return -64;
+            if ((ret = wide_norm_quant(g_wide_norm, g_wide_h, l->d_input_ln, H, N,
+                                       l->q_proj.nvf4 && l->k_proj.nvf4 && l->v_proj.nvf4)) != 0) return -64;
             if ((ret = wide_proj(&l->q_proj, g_wide_q, N)) != 0) return -64;
             if ((ret = wide_proj(&l->k_proj, g_wide_k, N)) != 0) return -65;
             if ((ret = wide_proj(&l->v_proj, g_wide_v, N)) != 0) return -66;
@@ -25888,8 +26063,9 @@ static int run_paged_decode_step_core(const int *tokens, const int *slot_ids_h, 
                   tq_wide_fmt_ok(&l->linear_in_b) && tq_wide_fmt_ok(&l->linear_in_a) &&
                   tq_wide_fmt_ok(&l->linear_out) && tq_wide_fmt_ok(&l->mlp_gate) &&
                   tq_wide_fmt_ok(&l->mlp_down))) return -70;
-            k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(N), N), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
-            if ((ret = wide_quant_input(g_wide_norm, H, N)) != 0) return -71;
+            if ((ret = wide_norm_quant(g_wide_norm, g_wide_h, l->d_input_ln, H, N,
+                                       l->linear_in_qkv.nvf4 && l->linear_in_z.nvf4 &&
+                                       l->linear_in_b.nvf4 && l->linear_in_a.nvf4)) != 0) return -71;
             if ((ret = wide_proj(&l->linear_in_qkv, g_wide_qkv, N)) != 0) return -71;
             if ((ret = wide_proj(&l->linear_in_z, g_wide_z, N)) != 0) return -72;
             if ((ret = wide_proj(&l->linear_in_b, g_wide_b, N)) != 0) return -73;
