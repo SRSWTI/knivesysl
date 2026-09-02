@@ -4209,6 +4209,10 @@ static int tq_dn_prep_enabled(void) {
 // fp32 stripes (measured slower). Routed only for N >= 128.
 static float *g_dnmm = nullptr;
 static int g_dnmm_floats = 0;
+static float *g_dnmm_spre = nullptr;             // D.5b split: per-chunk S_pre checkpoints
+static int g_dnmm_spre_floats = 0;
+static float *g_dnmm_dl = nullptr;               // D.5b split: per-chunk Dl checkpoints
+static int g_dnmm_dl_floats = 0;
 static int tq_dn_mm_mode(void) {
     static int c = -2;
     if (c < -1) { const char *e = getenv("TQ_DN_MM"); c = (e && e[0]) ? atoi(e) : 3; }
@@ -20707,6 +20711,163 @@ void k_tq_dnmm_scan_tf32(float *core_raw, float *recurrent_state, const float *p
         state[(size_t)(idx / VS) * D + v0 + idx % VS] = S[idx];
 }
 
+// ---------------------------------------------------------------------------------
+// D.5b (TQ_DNMM_SPLIT): serial/parallel split of the tf32 scan (SGLang chunk_delta_h
+// vs chunk_o structure, ported). The fused kernel's serial chunk loop carries THREE
+// matmul phases; only Dl and the S update are actually recurrent -- the core output
+// (EQ@S + Am@Dl) depends on the chunk's INCOMING state and Dl, both of which can be
+// checkpointed. The serial kernel stores S_pre and Dl per chunk and shrinks the
+// critical chain 56 -> 32 MMA steps; a fully parallel kernel over (chunk, head,
+// stripe) then rebuilds core with the SAME wmma ops on the SAME bits -> bit-exact
+// vs the fused kernel (validated by greedy equality; same tolerance class as D.5).
+// ---------------------------------------------------------------------------------
+template<int T, int D, int VS>
+__global__ __launch_bounds__(256, 2)
+void k_tq_dnmm_scan_tf32_state(float *recurrent_state, const float *prep,
+                               float *spre, float *dl_out, int N, int value_heads) {
+    using namespace nvcuda;
+    const int nstripe = D / VS;
+    const int head = blockIdx.x / nstripe;
+    const int stripe = blockIdx.x % nstripe;
+    if (head >= value_heads) return;
+    const int tid = threadIdx.x;
+    const int BS = 256;
+    const int warp = tid >> 5;
+    const int v0 = stripe * VS;
+    const int nchunk = (N + T - 1) / T;
+    const size_t BLK = (size_t)(4 * T * D + T * T + 16);
+    const size_t cs = (size_t)(head * nstripe + stripe) * nchunk;   // scratch chunk base
+
+    extern __shared__ float sm_dnmm[];
+    float *S  = sm_dnmm;                         // [D][VS]
+    float *Dl = S + D * VS;                      // [T][VS]
+    float *state = recurrent_state + (size_t)head * D * D;
+    for (int idx = tid; idx < D * VS; idx += BS)
+        S[idx] = state[(size_t)(idx / VS) * D + v0 + idx % VS];
+    __syncthreads();
+
+    #define DNMM_TF32(frag) _Pragma("unroll") \
+        for (int _i = 0; _i < (int)frag.num_elements; _i++) frag.x[_i] = wmma::__float_to_tf32(frag.x[_i]);
+
+    for (int c = 0; c < nchunk; c++) {
+        const float *o = prep + ((size_t)head * nchunk + c) * BLK;
+        const float *KW = o, *D0 = o + T * D, *KC = o + 3 * T * D;
+        const float *oAm = o + 4 * T * D;
+        const float gamma = oAm[T * T];
+        // checkpoint incoming state stripe for the parallel core kernel
+        float *sp = spre + (cs + c) * (size_t)(D * VS);
+        for (int idx = tid; idx < D * VS; idx += BS) sp[idx] = S[idx];
+        // Dl = D0 + KW @ S  (KW pre-negated)
+        {
+            const int tm = warp >> 1, tn = warp & 1;
+            wmma::fragment<wmma::accumulator, 16, 16, 8, float> cf;
+            wmma::load_matrix_sync(cf, D0 + tm * 16 * D + v0 + tn * 16, D, wmma::mem_row_major);
+            wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> bf;
+            #pragma unroll
+            for (int k = 0; k < D; k += 8) {
+                wmma::load_matrix_sync(af, KW + tm * 16 * D + k, D);
+                wmma::load_matrix_sync(bf, S + k * VS + tn * 16, VS);
+                DNMM_TF32(af); DNMM_TF32(bf);
+                wmma::mma_sync(cf, af, bf, cf);
+            }
+            #pragma unroll
+            for (int i = 0; i < (int)cf.num_elements; i++) cf.x[i] = dn_flush(cf.x[i]);
+            wmma::store_matrix_sync(Dl + tm * 16 * VS + tn * 16, cf, VS, wmma::mem_row_major);
+        }
+        __syncthreads();
+        // checkpoint Dl for the parallel core kernel
+        float *dp = dl_out + (cs + c) * (size_t)(T * VS);
+        for (int idx = tid; idx < T * VS; idx += BS) dp[idx] = Dl[idx];
+        // S = gamma * S + KC^T @ Dl
+        {
+            wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::col_major> af;
+            wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> bf;
+            #pragma unroll
+            for (int t2 = 0; t2 < 2; t2++) {
+                const int tile = warp * 2 + t2;
+                const int tm = tile >> 1, tn = tile & 1;
+                wmma::fragment<wmma::accumulator, 16, 16, 8, float> cf;
+                wmma::load_matrix_sync(cf, S + tm * 16 * VS + tn * 16, VS, wmma::mem_row_major);
+                #pragma unroll
+                for (int i = 0; i < (int)cf.num_elements; i++) cf.x[i] *= gamma;
+                #pragma unroll
+                for (int k = 0; k < T; k += 8) {
+                    wmma::load_matrix_sync(af, KC + k * D + tm * 16, D);
+                    wmma::load_matrix_sync(bf, Dl + k * VS + tn * 16, VS);
+                    DNMM_TF32(af); DNMM_TF32(bf);
+                    wmma::mma_sync(cf, af, bf, cf);
+                }
+                #pragma unroll
+                for (int i = 0; i < (int)cf.num_elements; i++) cf.x[i] = dn_flush(cf.x[i]);
+                __syncthreads();
+                wmma::store_matrix_sync(S + tm * 16 * VS + tn * 16, cf, VS, wmma::mem_row_major);
+            }
+        }
+        __syncthreads();
+    }
+    for (int idx = tid; idx < D * VS; idx += BS)
+        state[(size_t)(idx / VS) * D + v0 + idx % VS] = S[idx];
+    #undef DNMM_TF32
+}
+
+// Parallel core rebuild: core = EQ @ S_pre + Am @ Dl, one CTA per (chunk, head, stripe).
+// Identical wmma sequence and operand bits as the fused kernel's phase 2.
+template<int T, int D, int VS>
+__global__ __launch_bounds__(256, 2)
+void k_tq_dnmm_core_par(float *core_raw, const float *prep, const float *spre,
+                        const float *dl_in, int N, int value_heads) {
+    using namespace nvcuda;
+    const int nstripe = D / VS;
+    const int c = blockIdx.x;
+    const int head = blockIdx.y / nstripe;
+    const int stripe = blockIdx.y % nstripe;
+    const int tid = threadIdx.x;
+    const int BS = 256;
+    const int warp = tid >> 5;
+    const int value_dim = value_heads * D;
+    const int v0 = stripe * VS;
+    const int nchunk = (N + T - 1) / T;
+    if (c >= nchunk || head >= value_heads) return;
+    const size_t BLK = (size_t)(4 * T * D + T * T + 16);
+    const size_t cs = (size_t)(head * nstripe + stripe) * nchunk;
+    const float *o = prep + ((size_t)head * nchunk + c) * BLK;
+    const float *EQ = o + 2 * T * D;
+    const float *oAm = o + 4 * T * D;
+    const int L = (int)oAm[T * T + 1];
+    const float *sp = spre + (cs + c) * (size_t)(D * VS);
+    const float *dp = dl_in + (cs + c) * (size_t)(T * VS);
+    __shared__ float Cs[T * VS];
+    #define DNMM_TF32(frag) _Pragma("unroll") \
+        for (int _i = 0; _i < (int)frag.num_elements; _i++) frag.x[_i] = wmma::__float_to_tf32(frag.x[_i]);
+    {
+        const int tm = warp >> 1, tn = warp & 1;
+        wmma::fragment<wmma::accumulator, 16, 16, 8, float> cf;
+        wmma::fill_fragment(cf, 0.0f);
+        wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> af;
+        wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> bf;
+        #pragma unroll
+        for (int k = 0; k < D; k += 8) {
+            wmma::load_matrix_sync(af, EQ + tm * 16 * D + k, D);
+            wmma::load_matrix_sync(bf, sp + k * VS + tn * 16, VS);
+            DNMM_TF32(af); DNMM_TF32(bf);
+            wmma::mma_sync(cf, af, bf, cf);
+        }
+        #pragma unroll
+        for (int k = 0; k < T; k += 8) {
+            wmma::load_matrix_sync(af, oAm + tm * 16 * T + k, T);
+            wmma::load_matrix_sync(bf, dp + k * VS + tn * 16, VS);
+            DNMM_TF32(af); DNMM_TF32(bf);
+            wmma::mma_sync(cf, af, bf, cf);
+        }
+        wmma::store_matrix_sync(Cs + tm * 16 * VS + tn * 16, cf, VS, wmma::mem_row_major);
+    }
+    #undef DNMM_TF32
+    __syncthreads();
+    for (int idx = tid; idx < L * VS; idx += BS)
+        core_raw[(size_t)(c * T + idx / VS) * value_dim + (size_t)head * D + v0 + idx % VS] = Cs[idx];
+}
+
 // prep + scan + norm. vs = value-stripe width (32 or 64).
 static int launch_deltanet_chunk_mm(int vs, float *core_out, float *recurrent_state,
                                     const float *qkv_conv, const float *z,
@@ -20731,6 +20892,7 @@ static int launch_deltanet_chunk_mm(int vs, float *core_out, float *recurrent_st
         cudaFuncSetAttribute(k_tq_dnmm_prep<64, 128>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)psm);
         cudaFuncSetAttribute(k_tq_dnmm_scan<64, 128, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ssm16);
         cudaFuncSetAttribute(k_tq_dnmm_scan_tf32<64, 128, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024);
+        cudaFuncSetAttribute(k_tq_dnmm_scan_tf32_state<64, 128, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024);
         cudaFuncSetAttribute(k_tq_dnmm_scan<64, 128, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ssm32);
         cudaFuncSetAttribute(k_tq_dnmm_scan<64, 128, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ssm64);
         if (cudaGetLastError() != cudaSuccess) return -105;
@@ -20740,9 +20902,34 @@ static int launch_deltanet_chunk_mm(int vs, float *core_out, float *recurrent_st
     k_tq_dnmm_prep<64, 128><<<pg, 256, psm, st>>>(g_dnmm, qkv_conv, b_proj, a_proj,
                                                   A_log, dt_bias, N, value_heads, key_heads);
     if (vs == 99) {
+        // TQ_DNMM_SPLIT=1 opts into the D.5b serial/parallel split: the serial
+        // kernel carries only Dl + the S update; core is rebuilt by a fully
+        // parallel kernel from the S_pre/Dl checkpoints -- bit-exact. Default
+        // OFF: measured a net ~23 us/layer-wave (fp32 checkpoint round-trip eats
+        // the serial win); flips on once bf16 checkpoints land (Track B).
+        static int split_en = -1;
+        if (split_en < 0) { const char *e = getenv("TQ_DNMM_SPLIT"); split_en = (e && e[0]) ? !!atoi(e) : 0; }
+        const int nstripe = dim / 32;
         size_t ssmt = (size_t)(dim * 32 + T * 32 + T * 32) * sizeof(float);       // 32 KB
-        k_tq_dnmm_scan_tf32<64, 128, 32><<<value_heads * (dim / 32), 256, ssmt, st>>>(
-            core_out, recurrent_state, g_dnmm, N, value_heads);
+        int split_ok = 0;
+        if (split_en) {
+            size_t spre_f = (size_t)value_heads * nstripe * nchunk * (size_t)(dim * 32);
+            size_t dl_f = (size_t)value_heads * nstripe * nchunk * (size_t)(T * 32);
+            if (spre_f <= (size_t)0x7fffffff && dl_f <= (size_t)0x7fffffff &&
+                ensure_float_buffer(&g_dnmm_spre, &g_dnmm_spre_floats, (int)spre_f, "d_dnmm_spre") == 0 &&
+                ensure_float_buffer(&g_dnmm_dl, &g_dnmm_dl_floats, (int)dl_f, "d_dnmm_dl") == 0)
+                split_ok = 1;
+        }
+        if (split_ok) {
+            size_t ssms = (size_t)(dim * 32 + T * 32) * sizeof(float);            // 24 KB
+            k_tq_dnmm_scan_tf32_state<64, 128, 32><<<value_heads * nstripe, 256, ssms, st>>>(
+                recurrent_state, g_dnmm, g_dnmm_spre, g_dnmm_dl, N, value_heads);
+            k_tq_dnmm_core_par<64, 128, 32><<<dim3(nchunk, value_heads * nstripe), 256, 0, st>>>(
+                core_out, g_dnmm, g_dnmm_spre, g_dnmm_dl, N, value_heads);
+        } else {
+            k_tq_dnmm_scan_tf32<64, 128, 32><<<value_heads * (dim / 32), 256, ssmt, st>>>(
+                core_out, recurrent_state, g_dnmm, N, value_heads);
+        }
     } else if (vs == 64)
         k_tq_dnmm_scan<64, 128, 64><<<value_heads * (dim / 64), 256, ssm64, st>>>(
             core_out, recurrent_state, g_dnmm, N, value_heads);
