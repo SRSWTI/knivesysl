@@ -24583,6 +24583,244 @@ void k_tq_paged_attn_q4_split_gqa(
     }
 }
 
+// ===========================================================================
+// E.gqa.v2: cp.async-STAGED GQA paged decode attention.
+// ---------------------------------------------------------------------------
+// The v1 GQA kernel above removed the 6x multi-CTA pool read but still runs at
+// ~300 GB/s effective (746 us/layer at 131k vs a ~125 us traffic roofline,
+// nsys-measured 2026-09-02): its K dot issues 16-B-per-warp global
+// transactions (lane byte d>>1 spans 16 B per e step), the (scale,zp) pairs
+// are scattered scalar loads, and the V fold is a serial per-row global walk
+// with no prefetch -- all three phases run strictly in lockstep.
+//
+// Here the whole chunk (64 rows of K4 codes + scales + V8 bytes + V scale)
+// streams into double-buffered smem via 16-B cp.async issued by ALL 8 warps
+// (warp-specialized producers were measured to LOSE for cp.async -- see the
+// NVFP4 GEMM note: producer MLP == issuing warp count), so chunk c+1's bytes
+// land while chunk c computes. Global-side traffic becomes whole-row 16-B
+// segments; smem-side byte access costs nothing.
+//
+// Numerics vs v1: the K dot keeps the exact e=0..7 per-lane accumulation and
+// the same (code - zp) * scale expression; the V fold keeps j-ascending
+// `s * vcode * vscl` per-head association. The online-softmax chunk width is
+// 64 instead of 512 and the m/l reductions are warp-shuffle trees, so the
+// rescale/rounding sequence differs within fp tolerance -- the same class of
+// drift the S-split boundary already introduces. Merge kernel unchanged.
+// TQ_PAGED_ATTN_V2=0 reverts to v1.
+// ===========================================================================
+#define TQ_PAV2_CH 32
+// dynamic smem layout (bytes), GQA=6 / hd=256 / 2 buffers of TQ_PAV2_CH rows.
+// 35.25 KB total -> 2 CTAs/SM under the 99 KB carveout: the second resident
+// CTA hides the single-chunk-deep cp.async pipeline's phase latency.
+#define TQ_PAV2_SKB      (TQ_PAV2_CH * 128)             // K4 codes per buffer
+#define TQ_PAV2_SCB      (TQ_PAV2_CH * 64)              // (scale,zp) bytes per buffer
+#define TQ_PAV2_SVB      (TQ_PAV2_CH * 256)             // V8 bytes per buffer
+#define TQ_PAV2_OFF_QN   0                              // 6*256 f32 = 6144
+#define TQ_PAV2_OFF_SK   6144
+#define TQ_PAV2_OFF_SC   (TQ_PAV2_OFF_SK + 2 * TQ_PAV2_SKB)
+#define TQ_PAV2_OFF_SV   (TQ_PAV2_OFF_SC + 2 * TQ_PAV2_SCB)
+#define TQ_PAV2_OFF_VS   (TQ_PAV2_OFF_SV + 2 * TQ_PAV2_SVB)
+#define TQ_PAV2_OFF_SCH  (TQ_PAV2_OFF_VS + 2 * TQ_PAV2_CH * 4)
+#define TQ_PAV2_OFF_CTL  (TQ_PAV2_OFF_SCH + 6 * TQ_PAV2_CH * 4)
+#define TQ_PAV2_SMEM     (TQ_PAV2_OFF_CTL + 256)
+template <int GQA>
+__global__ __launch_bounds__(256, 2)
+void k_tq_paged_attn_q4_split_gqa_v2(
+    const float *q_proj_base, const uint16_t *q_norm_w,
+    const uint8_t *k4_pool, const float *kq4s_pool, const uint8_t *v8_pool, const float *vscale_pool,
+    const int *positions, const int *slot_ids,
+    const int *block_table, int max_blocks, int page, int page_log,
+    int nh, int nkv, int hd, int q_m, int S,
+    float eps, float rope_theta, float *part_acc, float *part_ml) {
+    extern __shared__ uint32_t sm_u32[];               // shared extern symbol (uint32 TU-wide)
+    char *sm = (char *)sm_u32;
+    float *qn = (float *)(sm + TQ_PAV2_OFF_QN);                    // [GQA][256]
+    float *sch = (float *)(sm + TQ_PAV2_OFF_SCH);                  // [GQA][64]
+    float *ctl = (float *)(sm + TQ_PAV2_OFF_CTL);
+    float *m_run = ctl, *l_run = ctl + GQA, *m_new_s = ctl + 2 * GQA,
+          *alpha_s = ctl + 3 * GQA, *l_chunk_s = ctl + 4 * GQA;
+    float *partial = ctl + 5 * GQA;                                // [8]
+    float *q_sum_shared = partial + 8;
+    const int kv_head = blockIdx.x, col = blockIdx.y, split = blockIdx.z, tid = threadIdx.x;
+    if (kv_head >= nkv || tid >= hd) return;
+    const int group = nh / nkv;                  // == GQA
+    const int pos = positions[col];
+    const int slot = slot_ids[col];
+    const int rotary_dim = 64;
+    const float *q_proj = q_proj_base + (size_t)col * q_m;
+
+    // ---- per-head Q prep (norm -> RoPE -> Hadamard), identical to v1
+    #pragma unroll
+    for (int g = 0; g < GQA; g++) {
+        int head = kv_head * group + g;
+        float qv = q_proj[head * (2 * hd) + tid];
+        float qsum = qv * qv;
+        for (int offset = 16; offset > 0; offset >>= 1) qsum += __shfl_down_sync(0xffffffff, qsum, offset);
+        if ((tid & 31) == 0) partial[tid >> 5] = qsum;
+        __syncthreads();
+        if (tid < 8) {
+            float vtmp = partial[tid];
+            for (int offset = 4; offset > 0; offset >>= 1) vtmp += __shfl_down_sync(0xff, vtmp, offset);
+            if (tid == 0) *q_sum_shared = vtmp;
+        }
+        __syncthreads();
+        float rms = rsqrtf(*q_sum_shared / (float)hd + eps);
+        qv = qv * rms * (1.0f + tq_bf16_to_float(q_norm_w[tid]));
+        if (tid < rotary_dim) {
+            int idx = tid & 31;
+            float freq = powf(rope_theta, -((float)(2 * idx) / (float)rotary_dim));
+            float angle = (float)pos * freq;
+            float c = cosf(angle), s = sinf(angle);
+            int pi = (tid < 32) ? tid + 32 : tid - 32;
+            float q_pair = q_proj[head * (2 * hd) + pi];
+            q_pair = q_pair * rms * (1.0f + tq_bf16_to_float(q_norm_w[pi]));
+            float q_rot = (tid < 32) ? -q_pair : q_pair;
+            qv = qv * c + q_rot * s;
+        }
+        qn[g * 256 + tid] = qv;
+        __syncthreads();
+        tq_fwht256(&qn[g * 256], tid);
+    }
+    if (tid < GQA) { m_run[tid] = -3.402823466e38f; l_run[tid] = 0.0f; }
+    __syncthreads();
+
+    const size_t bt_base = (size_t)slot * max_blocks;
+    const size_t k4_pp = (size_t)(nkv * hd) >> 1, kq4s_pp = (size_t)nkv * 16, v8_pp = (size_t)nkv * hd;
+    const int warp = tid >> 5, lane = tid & 31;
+    const float scale = rsqrtf((float)hd);
+    float acc[GQA];
+    #pragma unroll
+    for (int g = 0; g < GQA; g++) acc[g] = 0.0f;
+    const int total = pos + 1;
+    const int per = (total + S - 1) / S;
+    const int lo = split * per;
+    int hi = lo + per; if (hi > total) hi = total;
+    if (lo >= hi) {                                     // empty split: v1-equivalent partials
+        #pragma unroll
+        for (int g = 0; g < GQA; g++) {
+            int head = kv_head * group + g;
+            size_t pidx = ((size_t)(head * gridDim.y + col) * S + split);
+            part_acc[pidx * hd + tid] = 0.0f;
+            if (tid == 0) { part_ml[pidx * 2 + 0] = -3.402823466e38f; part_ml[pidx * 2 + 1] = 0.0f; }
+        }
+        return;
+    }
+
+    // one cp.async group per chunk: K 8 + scales 4/2 + V 16 + vscale segments
+    auto issue = [&](int c0i) {
+        int clen = hi - c0i; if (clen > TQ_PAV2_CH) clen = TQ_PAV2_CH;
+        int buf = ((c0i - lo) / TQ_PAV2_CH) & 1;
+        for (int id = tid; id < (clen << 3); id += 256) {
+            int j = id >> 3, seg = id & 7, t = c0i + j;
+            int phys = block_table[bt_base + (t >> page_log)];
+            size_t pr = (size_t)phys * page + (t & (page - 1));
+            tq_cp_async16((uint32_t)__cvta_generic_to_shared(sm + TQ_PAV2_OFF_SK + buf * TQ_PAV2_SKB + j * 128 + seg * 16),
+                          k4_pool + pr * k4_pp + (size_t)kv_head * (hd >> 1) + seg * 16);
+        }
+        int scseg = gc_kv_q4_fp32s ? 4 : 2;             // 64 B fp32 / 32 B fp16 per row
+        for (int id = tid; id < clen * scseg; id += 256) {
+            int j = id / scseg, seg = id % scseg, t = c0i + j;
+            int phys = block_table[bt_base + (t >> page_log)];
+            size_t pr = (size_t)phys * page + (t & (page - 1));
+            const char *src = (const char *)q4s_adv(kq4s_pool, pr * kq4s_pp + (size_t)kv_head * 16) + seg * 16;
+            tq_cp_async16((uint32_t)__cvta_generic_to_shared(sm + TQ_PAV2_OFF_SC + buf * TQ_PAV2_SCB + j * 64 + seg * 16), src);
+        }
+        for (int id = tid; id < (clen << 4); id += 256) {
+            int j = id >> 4, seg = id & 15, t = c0i + j;
+            int phys = block_table[bt_base + (t >> page_log)];
+            size_t pr = (size_t)phys * page + (t & (page - 1));
+            tq_cp_async16((uint32_t)__cvta_generic_to_shared(sm + TQ_PAV2_OFF_SV + buf * TQ_PAV2_SVB + j * 256 + seg * 16),
+                          v8_pool + pr * v8_pp + (size_t)kv_head * hd + seg * 16);
+        }
+        for (int j = tid; j < clen; j += 256) {
+            int t = c0i + j;
+            int phys = block_table[bt_base + (t >> page_log)];
+            size_t pr = (size_t)phys * page + (t & (page - 1));
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                :: "r"((uint32_t)__cvta_generic_to_shared(sm + TQ_PAV2_OFF_VS + buf * (TQ_PAV2_CH * 4) + j * 4)),
+                   "l"(vscale_pool + pr * nkv + kv_head));
+        }
+        asm volatile("cp.async.commit_group;\n");
+    };
+
+    issue(lo);
+    for (int c0 = lo; c0 < hi; c0 += TQ_PAV2_CH) {
+        int clen = hi - c0; if (clen > TQ_PAV2_CH) clen = TQ_PAV2_CH;
+        const int buf = ((c0 - lo) / TQ_PAV2_CH) & 1;
+        if (c0 + TQ_PAV2_CH < hi) issue(c0 + TQ_PAV2_CH);
+        else asm volatile("cp.async.commit_group;\n");  // keep group index == chunk index
+        asm volatile("cp.async.wait_group 1;\n");
+        __syncthreads();
+        // scores: one staged K row per (warp, position), all GQA heads
+        const uint8_t *skb = (const uint8_t *)(sm + TQ_PAV2_OFF_SK + buf * TQ_PAV2_SKB);
+        const char *scb = sm + TQ_PAV2_OFF_SC + buf * TQ_PAV2_SCB;
+        for (int j = warp; j < clen; j += 8) {
+            const uint8_t *krow = skb + j * 128;
+            const float *ksz = (const float *)(scb + j * 64);
+            float kd[8];
+            #pragma unroll
+            for (int e = 0; e < 8; e++) {
+                int d = lane + 32 * e;
+                uint8_t byte = krow[d >> 1];
+                float code = (float)((d & 1) ? (byte >> 4) : (byte & 15));
+                kd[e] = (code - q4s_at(ksz, 2 * e + 1)) * q4s_at(ksz, 2 * e);
+            }
+            #pragma unroll
+            for (int g = 0; g < GQA; g++) {
+                float dot = 0.0f;
+                #pragma unroll
+                for (int e = 0; e < 8; e++) dot += qn[g * 256 + lane + 32 * e] * kd[e];
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, off);
+                if (lane == 0) sch[g * TQ_PAV2_CH + j] = dot * scale;
+            }
+        }
+        __syncthreads();
+        // online softmax: warp g owns head g (64-wide shuffle trees)
+        if (warp < GQA) {
+            const int g = warp;
+            float v0 = (lane < clen) ? sch[g * TQ_PAV2_CH + lane] : -3.402823466e38f;
+            float v1 = (32 + lane < clen) ? sch[g * TQ_PAV2_CH + 32 + lane] : -3.402823466e38f;
+            float m = fmaxf(v0, v1);
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+            float m_old = m_run[g], m_new = fmaxf(m_old, m);
+            float p0 = (lane < clen) ? expf(v0 - m_new) : 0.0f;
+            float p1 = (32 + lane < clen) ? expf(v1 - m_new) : 0.0f;
+            if (lane < clen) sch[g * TQ_PAV2_CH + lane] = p0;
+            if (32 + lane < clen) sch[g * TQ_PAV2_CH + 32 + lane] = p1;
+            float ls = p0 + p1;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) ls += __shfl_xor_sync(0xffffffffu, ls, off);
+            if (lane == 0) {
+                float alpha = expf(m_old - m_new);
+                m_new_s[g] = m_new; alpha_s[g] = alpha; l_chunk_s[g] = ls;
+                l_run[g] = l_run[g] * alpha + ls; m_run[g] = m_new;
+            }
+        }
+        __syncthreads();
+        // V fold from staged bytes: thread owns dim, j ascending, v1 association
+        #pragma unroll
+        for (int g = 0; g < GQA; g++) acc[g] *= alpha_s[g];
+        const uint8_t *vb = (const uint8_t *)(sm + TQ_PAV2_OFF_SV + buf * TQ_PAV2_SVB);
+        const float *vsb = (const float *)(sm + TQ_PAV2_OFF_VS + buf * (TQ_PAV2_CH * 4));
+        for (int j = 0; j < clen; j++) {
+            float vcode = tq_e4m3_dec_fast(vb[j * 256 + tid]);
+            float vscl = vsb[j];
+            #pragma unroll
+            for (int g = 0; g < GQA; g++) acc[g] += sch[g * TQ_PAV2_CH + j] * vcode * vscl;
+        }
+        __syncthreads();                                // buffer + sch reuse fence
+    }
+    #pragma unroll
+    for (int g = 0; g < GQA; g++) {
+        int head = kv_head * group + g;
+        size_t pidx = ((size_t)(head * gridDim.y + col) * S + split);
+        part_acc[pidx * hd + tid] = acc[g];
+        if (tid == 0) { part_ml[pidx * 2 + 0] = m_run[g]; part_ml[pidx * 2 + 1] = l_run[g]; }
+    }
+}
+
 // combine S split partials per (head,col): m*=max m_s; acc*=sum exp(m_s-m*) acc_s; l* likewise;
 // out = (acc*/l*) * sigmoid(gate). One block per (head,col), thread tid = output channel.
 __global__ void k_tq_paged_attn_q4_merge(
@@ -24781,6 +25019,13 @@ static int paged_attn_gqa(void) {
     return en;
 }
 
+// TQ_PAGED_ATTN_V2=0 reverts to the unstaged v1 GQA kernel.
+static int paged_attn_v2(void) {
+    static int en = -1;
+    if (en < 0) { const char *e = getenv("TQ_PAGED_ATTN_V2"); en = (e && *e) ? (atoi(e) != 0) : 1; }
+    return en;
+}
+
 // The GQA kernel has nkv (not nh) CTAs per column, i.e. 6x fewer, so the split
 // has to work 6x harder to fill the SMs -- and it can, because the whole point is
 // that a split no longer re-reads the KV pool. The 512-row floor stays (partials
@@ -24797,6 +25042,24 @@ static int paged_split_S_gqa(int N, int max_pos) {
     int S = s_occ < s_work ? s_occ : s_work;
     if (S < 1) S = 1;
     if (S > 64) S = 64;
+    return S;
+}
+
+// v2 runs 2 CTAs/SM (35 KB smem); size S so nkv*N*S fills whole resident waves.
+// Measured at 131k n=1: auto-64 (1.5 waves at 1/SM) 44.0 tok/s, S=42 47.7,
+// S=84 48.4 -- wave-aligned splits win. s_work floor keeps partials cheap.
+static int paged_split_S_gqa_v2(int N, int max_pos) {
+    static int forced = -2;
+    if (forced == -2) { const char *e = getenv("TQ_PAGED_SPLIT"); forced = e ? atoi(e) : -1; }
+    if (forced >= 0) return forced < 1 ? 1 : forced;
+    int total = max_pos + 1, sm = paged_sm_count(), blocks0 = g_qwen.nkv * N;
+    if (blocks0 < 1) blocks0 = 1;
+    if (total < 1024) return 1;
+    int s_occ = (2 * sm + blocks0 - 1) / blocks0;        // one wave at 2 CTAs/SM
+    int s_work = total / 512;
+    int S = s_occ < s_work ? s_occ : s_work;
+    if (S < 1) S = 1;
+    if (S > 96) S = 96;
     return S;
 }
 
@@ -24829,8 +25092,26 @@ static int launch_paged_attn_q4(float *out, const float *q_proj, const uint16_t 
     // through split+merge -- at S=1 the merge is exp(0)=1 * acc / l * sigmoid(gate),
     // i.e. exactly what the single kernel writes.
     if (paged_attn_gqa() && nkv > 0 && (nh % nkv) == 0 && hd == 256 && (nh / nkv) == 6) {
-        int S = paged_split_S_gqa(N, max_pos);
+        int S = paged_attn_v2() ? paged_split_S_gqa_v2(N, max_pos) : paged_split_S_gqa(N, max_pos);
         if (ensure_attn_partials((size_t)nh * N * S) != 0) return -2;
+        if (paged_attn_v2()) {
+            static int v2_attr = 0;                     // >48 KB dynamic smem opt-in, once
+            if (!v2_attr) {
+                if (cudaFuncSetAttribute(k_tq_paged_attn_q4_split_gqa_v2<6>,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         TQ_PAV2_SMEM) != cudaSuccess) v2_attr = -1;
+                else v2_attr = 1;
+            }
+            if (v2_attr > 0) {
+                k_tq_paged_attn_q4_split_gqa_v2<6><<<dim3(nkv, N, S), hd, TQ_PAV2_SMEM, st>>>(
+                    q_proj, q_norm_w, k4_pool, kq4s_pool, v8_pool, vscale_pool, positions, slot_ids,
+                    block_table, max_blocks, page, page_log, nh, nkv, hd, q_m, S, g_qwen.eps, g_qwen.rope_theta,
+                    g_attn_pacc, g_attn_pml);
+                k_tq_paged_attn_q4_merge<<<dim3(nh, N), hd, 0, st>>>(
+                    out, q_proj, positions, nh, hd, q_m, attn_m, S, g_attn_pacc, g_attn_pml);
+                return cudaGetLastError() == cudaSuccess ? 0 : -1;
+            }
+        }
         k_tq_paged_attn_q4_split_gqa<6><<<dim3(nkv, N, S), hd, 0, st>>>(
             q_proj, q_norm_w, k4_pool, kq4s_pool, v8_pool, vscale_pool, positions, slot_ids,
             block_table, max_blocks, page, page_log, nh, nkv, hd, q_m, S, g_qwen.eps, g_qwen.rope_theta,
@@ -25207,10 +25488,26 @@ extern "C" int qwn_paged_load_client(int slot, int upto_pos) {
 #define TQ_PG_MAX_CKPT 24
 typedef struct {
     int used, pos, nfull, tail_blk, tail_rows;
+    int slab;                // state-pool slab index; -1 while demoted to host
     int *blocks;             // host list of nfull shared phys ids (one ref each)
     float *state;            // device slab: per LINEAR layer [recur_f][conv_f], layer order
+    uint8_t *host;           // pinned host image when demoted (NULL = resident)
+    size_t host_bytes;
 } tq_pg_ckpt;
 static tq_pg_ckpt g_pg_ck[TQ_PG_MAX_CKPT];
+static size_t g_pg_ck_host_bytes = 0;   // total pinned host bytes across demoted ckpts
+
+// Registry ids outnumber state slabs: a demoted entry keeps its id (so the
+// scheduler's match logic never changes) but hands its slab back.
+static int paged_ckpt_slab_alloc(int npool) {
+    for (int s = 0; s < npool; s++) {
+        int taken = 0;
+        for (int i = 0; i < TQ_PG_MAX_CKPT; i++)
+            if (g_pg_ck[i].used && g_pg_ck[i].slab == s) { taken = 1; break; }
+        if (!taken) return s;
+    }
+    return -1;
+}
 
 // State slabs are pool-backed: ONE up-front allocation (first save, all-or-
 // nothing with halving fallback) instead of a ~145 MB cudaMalloc per save.
@@ -25225,8 +25522,11 @@ static size_t g_pg_ck_sf = 0;        // floats per slab at alloc time
 void paged_ckpt_drop_all(void) {
     for (int i = 0; i < TQ_PG_MAX_CKPT; i++) {
         if (g_pg_ck[i].blocks) free(g_pg_ck[i].blocks);
+        if (g_pg_ck[i].host) cudaFreeHost(g_pg_ck[i].host);
         g_pg_ck[i].used = 0; g_pg_ck[i].blocks = NULL; g_pg_ck[i].state = NULL;
+        g_pg_ck[i].host = NULL; g_pg_ck[i].host_bytes = 0; g_pg_ck[i].slab = -1;
     }
+    g_pg_ck_host_bytes = 0;
     if (g_pg_ck_pool) cudaFree(g_pg_ck_pool);
     g_pg_ck_pool = NULL; g_pg_ck_pool_n = -1; g_pg_ck_sf = 0;
 }
@@ -25310,9 +25610,12 @@ extern "C" int qwn_paged_ckpt_save(int slot, int pos) {
     int npool = paged_ckpt_pool_init();
     if (npool < 1) return -3;                    // no state pool: saves disabled
     int id = -1;
-    for (int i = 0; i < npool; i++) if (!g_pg_ck[i].used) { id = i; break; }
+    for (int i = 0; i < TQ_PG_MAX_CKPT; i++) if (!g_pg_ck[i].used) { id = i; break; }
     if (id < 0) return -3;
+    int slab = paged_ckpt_slab_alloc(npool);
+    if (slab < 0) return -3;                     // every slab resident: demote one first
     tq_pg_ckpt *c = &g_pg_ck[id];
+    c->slab = slab; c->host = NULL; c->host_bytes = 0;
     int nfull = pos >> g_pg_plog, tail = pos & (g_pg_page - 1);
     int *row = h_block_table + (size_t)slot * g_pg_maxblk;
     c->blocks = nfull ? (int *)malloc((size_t)nfull * sizeof(int)) : NULL;
@@ -25325,7 +25628,7 @@ extern "C" int qwn_paged_ckpt_save(int slot, int pos) {
             if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION)
                 paged_copy_attn_rows(L, row[nfull], c->tail_blk, tail);
     }
-    c->state = g_pg_ck_pool + (size_t)id * g_pg_ck_sf;   // pool-backed slab
+    c->state = g_pg_ck_pool + (size_t)slab * g_pg_ck_sf;   // pool-backed slab
     paged_state_slot_to(c->state, slot);
     for (int lb = 0; lb < nfull; lb++) { c->blocks[lb] = row[lb]; h_blk_ref[row[lb]]++; }
     c->used = 1; c->pos = pos; c->nfull = nfull; c->tail_rows = tail;
@@ -25334,13 +25637,15 @@ extern "C" int qwn_paged_ckpt_save(int slot, int pos) {
 
 // Hand an EMPTY slot the checkpoint's state: full blocks shared by reference, tail rows
 // and DeltaNet state copied. Returns the position (prefill continues from there), or
-// -1 not ready / bad ids, -2 slot not empty, -3 unused ckpt, -4 tail alloc failure.
+// -1 not ready / bad ids, -2 slot not empty, -3 unused ckpt, -4 tail alloc failure,
+// -5 demoted to host (promote first).
 extern "C" int qwn_paged_ckpt_adopt(int slot, int id) {
     if (!g_pg_ready || slot < 0 || slot >= g_pg_maxslots ||
         id < 0 || id >= TQ_PG_MAX_CKPT) return -1;
     if (h_slot_nb[slot] != 0) return -2;
     tq_pg_ckpt *c = &g_pg_ck[id];
     if (!c->used) return -3;
+    if (c->host) return -5;                  // host-tier: caller must promote first
     int *row = h_block_table + (size_t)slot * g_pg_maxblk;
     if (c->tail_rows > 0) {
         int b = paged_alloc_block();
@@ -25360,13 +25665,146 @@ extern "C" int qwn_paged_ckpt_free(int id) {
     if (!g_pg_ready || id < 0 || id >= TQ_PG_MAX_CKPT) return -1;
     tq_pg_ckpt *c = &g_pg_ck[id];
     if (!c->used) return -2;
+    if (c->host) { cudaFreeHost(c->host); g_pg_ck_host_bytes -= c->host_bytes; }
+    else {
+        for (int lb = 0; lb < c->nfull; lb++) paged_block_unref(c->blocks[lb]);
+        if (c->tail_blk >= 0) paged_block_unref(c->tail_blk);
+    }
+    // state is pool-backed: the slab is reclaimed via paged_ckpt_slab_alloc once
+    // used drops; same-stream ordering serializes an in-flight adopt copy before
+    // a later save's write.
+    free(c->blocks);
+    c->blocks = NULL; c->state = NULL; c->used = 0; c->slab = -1;
+    c->host = NULL; c->host_bytes = 0;
+    return 0;
+}
+
+// ---- host-RAM checkpoint tier -------------------------------------------------
+// Demote copies a checkpoint's KV rows + DeltaNet state into pinned host memory and
+// hands back EVERY device resource (shared block refs, private tail block, state
+// slab). Promote reverses it into freshly allocated blocks and a free slab. The
+// registry id, position and shape survive, so the scheduler's match logic is
+// untouched -- only adopt has to promote first. Cost is a ~1 GB PCIe round trip
+// against a multi-second re-prefill.
+static size_t paged_ckpt_row_bytes(void) {
+    int kv_m = g_qwen.nkv * g_qwen.hd, nkv = g_qwen.nkv;
+    size_t qe = batched_q4s_elem_bytes(), nf = 0;
+    for (int L = 0; L < g_qwen.L; L++)
+        if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION) nf++;
+    return nf * ((size_t)(kv_m >> 1) + (size_t)nkv * 16 * qe +
+                 (size_t)kv_m + (size_t)nkv * sizeof(float));
+}
+
+static size_t paged_ckpt_host_budget(void) {
+    const char *e = getenv("TQ_CKPT_HOST_GB");
+    double g = e ? atof(e) : 8.0;
+    if (g < 0) g = 0;
+    return (size_t)(g * 1073741824.0);
+}
+
+// Walk one checkpoint's rows against its pinned image. dir picks the direction.
+static void paged_ckpt_host_xfer(tq_pg_ckpt *c, uint8_t *img, cudaMemcpyKind dir) {
+    int kv_m = g_qwen.nkv * g_qwen.hd, nkv = g_qwen.nkv, page = g_pg_page;
+    size_t qe = batched_q4s_elem_bytes();
+    size_t rows = (size_t)c->nfull * page + (size_t)c->tail_rows;
+    size_t off = g_pg_ck_sf * sizeof(float);
+    for (int L = 0; L < g_qwen.L; L++) {
+        if (g_qwen.layer_types[L] != TQ_LAYER_FULL_ATTENTION) continue;
+        size_t k4b = rows * (kv_m >> 1), ksb = rows * nkv * 16 * qe;
+        size_t v8b = rows * kv_m,        vsb = rows * nkv * sizeof(float);
+        for (int lb = 0; lb <= c->nfull; lb++) {
+            int phys = (lb < c->nfull) ? c->blocks[lb] : c->tail_blk;
+            int cnt  = (lb < c->nfull) ? page : c->tail_rows;
+            if (phys < 0 || cnt <= 0) continue;
+            size_t r0 = (size_t)lb * page, po = (size_t)phys * page;
+            uint8_t *hk = img + off + r0 * (kv_m >> 1);
+            uint8_t *hs = img + off + k4b + r0 * nkv * 16 * qe;
+            uint8_t *hv = img + off + k4b + ksb + r0 * kv_m;
+            uint8_t *hc = img + off + k4b + ksb + v8b + r0 * nkv * sizeof(float);
+            uint8_t *dk = g_pool_k4[L] + po * (kv_m >> 1);
+            uint8_t *ds = (uint8_t *)g_pool_kq4s[L] + po * nkv * 16 * qe;
+            uint8_t *dv = g_pool_v8[L] + po * kv_m;
+            uint8_t *dc = (uint8_t *)(g_pool_vscale[L] + po * nkv);
+            int out = (dir == cudaMemcpyDeviceToHost);
+            cudaMemcpyAsync(out ? hk : dk, out ? dk : hk, (size_t)cnt * (kv_m >> 1), dir, g_qwen.stream);
+            cudaMemcpyAsync(out ? hs : ds, out ? ds : hs, (size_t)cnt * nkv * 16 * qe, dir, g_qwen.stream);
+            cudaMemcpyAsync(out ? hv : dv, out ? dv : hv, (size_t)cnt * kv_m, dir, g_qwen.stream);
+            cudaMemcpyAsync(out ? hc : dc, out ? dc : hc, (size_t)cnt * nkv * sizeof(float), dir, g_qwen.stream);
+        }
+        off += k4b + ksb + v8b + vsb;
+    }
+}
+
+// 0 ok (or already demoted), -1 bad id, -2 unused, -3 over host budget,
+// -4 pinned alloc failed, -5 transfer failed. Every failure leaves the
+// checkpoint resident and usable, so the caller can fall back to free().
+extern "C" int qwn_paged_ckpt_demote(int id) {
+    if (!g_pg_ready || id < 0 || id >= TQ_PG_MAX_CKPT) return -1;
+    tq_pg_ckpt *c = &g_pg_ck[id];
+    if (!c->used) return -2;
+    if (c->host) return 0;
+    size_t rows = (size_t)c->nfull * g_pg_page + (size_t)c->tail_rows;
+    size_t state_b = g_pg_ck_sf * sizeof(float);
+    size_t bytes = state_b + rows * paged_ckpt_row_bytes();
+    if (g_pg_ck_host_bytes + bytes > paged_ckpt_host_budget()) return -3;
+    uint8_t *img = NULL;
+    if (cudaHostAlloc((void **)&img, bytes, cudaHostAllocDefault) != cudaSuccess) return -4;
+    cudaMemcpyAsync(img, c->state, state_b, cudaMemcpyDeviceToHost, g_qwen.stream);
+    paged_ckpt_host_xfer(c, img, cudaMemcpyDeviceToHost);
+    if (cudaStreamSynchronize(g_qwen.stream) != cudaSuccess) { cudaFreeHost(img); return -5; }
     for (int lb = 0; lb < c->nfull; lb++) paged_block_unref(c->blocks[lb]);
     if (c->tail_blk >= 0) paged_block_unref(c->tail_blk);
-    // state is pool-backed: the slab is reclaimed by id reuse; same-stream
-    // ordering serializes an in-flight adopt copy before a later save's write.
-    free(c->blocks);
-    c->blocks = NULL; c->state = NULL; c->used = 0;
+    c->tail_blk = -1; c->state = NULL; c->slab = -1;
+    c->host = img; c->host_bytes = bytes;
+    g_pg_ck_host_bytes += bytes;
     return 0;
+}
+
+// 0 ok (or already resident), -3 no free slab (demote another first),
+// -4 block pool exhausted, -5 transfer failed. Failures leave it demoted.
+extern "C" int qwn_paged_ckpt_promote(int id) {
+    if (!g_pg_ready || id < 0 || id >= TQ_PG_MAX_CKPT) return -1;
+    tq_pg_ckpt *c = &g_pg_ck[id];
+    if (!c->used) return -2;
+    if (!c->host) return 0;
+    int npool = paged_ckpt_pool_init();
+    if (npool < 1) return -3;
+    int slab = paged_ckpt_slab_alloc(npool);
+    if (slab < 0) return -3;
+    int tail_blk = -1, ok = 1, got = 0;
+    for (int lb = 0; lb < c->nfull && ok; lb++) {
+        c->blocks[lb] = paged_alloc_block();
+        if (c->blocks[lb] < 0) ok = 0; else got++;
+    }
+    if (ok && c->tail_rows > 0) { tail_blk = paged_alloc_block(); if (tail_blk < 0) ok = 0; }
+    if (!ok) {
+        for (int lb = 0; lb < got; lb++) paged_block_unref(c->blocks[lb]);
+        return -4;
+    }
+    c->tail_blk = tail_blk;
+    c->state = g_pg_ck_pool + (size_t)slab * g_pg_ck_sf;
+    cudaMemcpyAsync(c->state, c->host, g_pg_ck_sf * sizeof(float),
+                    cudaMemcpyHostToDevice, g_qwen.stream);
+    paged_ckpt_host_xfer(c, c->host, cudaMemcpyHostToDevice);
+    if (cudaStreamSynchronize(g_qwen.stream) != cudaSuccess) {
+        for (int lb = 0; lb < c->nfull; lb++) paged_block_unref(c->blocks[lb]);
+        if (tail_blk >= 0) paged_block_unref(tail_blk);
+        c->tail_blk = -1; c->state = NULL;
+        return -5;
+    }
+    cudaFreeHost(c->host);
+    g_pg_ck_host_bytes -= c->host_bytes;
+    c->host = NULL; c->host_bytes = 0; c->slab = slab;
+    return 0;
+}
+
+// 0 resident, 1 demoted to host, <0 bad/unused id. out_mb (optional) receives
+// total pinned host megabytes across every demoted checkpoint.
+extern "C" int qwn_paged_ckpt_tier(int id, int *out_mb) {
+    if (out_mb) *out_mb = (int)(g_pg_ck_host_bytes / 1048576);
+    if (!g_pg_ready || id < 0 || id >= TQ_PG_MAX_CKPT) return -1;
+    if (!g_pg_ck[id].used) return -2;
+    return g_pg_ck[id].host ? 1 : 0;
 }
 
 // Fork a LIVE slot into an empty one at position pos: the subagent-spawn primitive.
