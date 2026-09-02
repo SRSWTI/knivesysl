@@ -7,9 +7,12 @@ cd /home/shooting-brake007/srswti/qwen38/knivesysl
 PY=.venv/bin/python
 TQF=/home/shooting-brake007/models/knivesysl/qwen3_8-27b-e2m3-mtp.tqf
 MD=/home/shooting-brake007/models/knivesysl
-LOG=/tmp/gembench
+LOG=${TQ_BENCH_ROOT:-/home/shooting-brake007/srswti/qwen38/knivesysl/results}
 RAW=$LOG/raw/knivesysl
 mkdir -p "$LOG" "$RAW"
+CAMPAIGN_LOG=${TQ_CAMPAIGN_LOG:-$LOG/native_campaign.log}
+exec > >(tee -a "$CAMPAIGN_LOG") 2>&1
+echo "CAMPAIGN-LOG $CAMPAIGN_LOG"
 LIVE_BLOCKS=0
 LIVE_LOG=
 
@@ -50,7 +53,10 @@ teardown() {
 }
 
 restore_prod() {
-  teardown
+  if ! teardown; then
+    echo "!! refusing to start production while a model GPU process is still alive"
+    return 1
+  fi
   nohup tools/serve_prod.sh >> /tmp/knivesysl_serve.log 2>&1 &
   wait_http http://127.0.0.1:8000/v1/models "" production /tmp/knivesysl_serve.log
   echo "PRODUCTION-RESTORED"
@@ -88,7 +94,10 @@ assert_cfg() {   # logfile tier spec slots requested-blocks
 
 boot_once() {   # name tier spec ctx slots blocks spec-nodes
   local name=$1 tier=$2 spec=$3 ctx=$4 slots=$5 blocks=$6 nodes=$7
-  teardown
+  if ! teardown; then
+    echo "!! refusing to boot $name while a model GPU process is still alive"
+    return 1
+  fi
   local weight_env="" logfile=$LOG/grid_${name}_b${blocks}.log
   [ -n "$tier" ] && weight_env="TQ_W_NVFP4=$tier"
   env CUDA_VISIBLE_DEVICES=0 TQ_KV_Q4=1 TQ_CTX=$ctx TQ_EMBED_FP8=2 $weight_env \
@@ -124,10 +133,10 @@ run_bench() {   # label contexts ns only repeats kind nodes
   echo "=== $label blocks=$LIVE_BLOCKS capacity=$((LIVE_BLOCKS * 128)) ==="
   timeout 14400 "$PY" tools/bench_spec_matrix.py \
     --engine knivesysl --output-dir "$RAW" --label "$label" \
-    --contexts "$contexts" --ns "$ns" "${extra[@]}" \
+    --tokenizer "$MD" --contexts "$contexts" --ns "$ns" "${extra[@]}" \
     --slots "${LIVE_SLOTS}" --pool-tokens "$((LIVE_BLOCKS * 128))" \
-    --gen 192 --repeats "$repeats" --spec-kind "$kind" --spec-nodes "$nodes" \
-    2>&1 | grep -E "^ctx|^wrote"
+    --gen 512 --repeats "$repeats" --spec-kind "$kind" --spec-nodes "$nodes" \
+    --resume
 }
 
 run_main() {   # name tier spec blocks
@@ -157,8 +166,8 @@ run_deep_ngram_nvfp4() {
 
 frontier_context() {   # total-token rows divided across N, with gen+guard
   local total=$1 n=$2
-  local ctx=$((total / n - 256))
-  [ "$ctx" -lt 256 ] && ctx=256
+  local ctx=$((total / n - 576))
+  [ "$ctx" -lt 128 ] && ctx=128
   echo $((ctx / 128 * 128))
 }
 
@@ -202,19 +211,25 @@ run_wide_ngram() {   # name tier ctx start min -- active at n=4/8
 }
 
 run_single_stream() {
+  local label=${1:-fp6-mtp}
+  local contexts=${2:-2048,8192,16384,32768,65536,94208,131072}
   teardown
-  local logfile=$LOG/grid_fp6-mtp.log
+  local logfile=$LOG/grid_$label.log
   env CUDA_VISIBLE_DEVICES=0 TQ_KV_Q4=1 TQ_CTX=140288 TQ_EMBED_FP8=2 \
       nohup "$PY" -u tools/serve_openai.py --tqf "$TQF" --model-dir "$MD" \
         --lib build-qwen/libforward_qwen.so --model-name ksl --no-prefix-cache \
         --port 8000 > "$logfile" 2>&1 &
   local pid
   pid=$!
-  wait_http http://127.0.0.1:8000/v1/models "$pid" fp6-mtp "$logfile"
+  wait_http http://127.0.0.1:8000/v1/models "$pid" "$label" "$logfile"
   LIVE_BLOCKS=1100
   LIVE_SLOTS=1
-  run_bench fp6-mtp "2048,8192,16384,32768,65536,94208,131072" "1" "" 3 mtp 8
+  run_bench "$label" "$contexts" "1" "" 3 mtp 8
 }
+
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  return 0
+fi
 
 # A: primary service grids, every feasible ctx x {1,2,4}.
 run_main nvfp4-off all 0 1800

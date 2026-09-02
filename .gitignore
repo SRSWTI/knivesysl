@@ -28,8 +28,12 @@ bench/gptq_e2m1/
 # (engineering log knivesysl_live.md, docs/, the SM120 probes/, and bench/ corpora).
 # These dirs are never tracked by the public repo (recreated scratch stays ignored too).
 internal/
+
+# Machine-local live handoff; intentionally never committed.
+docs/handoff.md
 probes/
 bench/
+results/
 
 
 # Third-party reference checkouts stay local; keep only their inventory and updater.
