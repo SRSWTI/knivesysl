@@ -11,6 +11,35 @@ driven by the same client (`tools/bench_endpoint.py`).
 
 ## Unreleased
 
+### Production cache-capacity and liveness hardening
+
+Two production wedges at roughly 120k-token checkpoint churn exposed an unvalidated
+host-tier path and a separate admission livelock:
+
+1. Host checkpoint demotion/promote performed pinned allocation, a 151.5 MB state
+   copy, hundreds of KV-block copies, and a stream synchronization inside the engine
+   loop. The host tier is now opt-in (`TQ_CKPT_HOST_GB=0` by default and in
+   `tools/serve_prod.sh`) pending the asynchronous Track D implementation.
+2. Admission retried a request forever when prefix-cache reservations left fewer
+   blocks than its full prompt-plus-output footprint. It now accounts for active,
+   prefilling, resident-cache, partial-tail, and output reservations; evicts cold
+   nonmatching checkpoints until the request fits; and rejects an impossible request
+   once without wedging subsequent traffic. A promoted checkpoint that cannot be
+   adopted is invalidated and retried as a full prefill.
+
+Operational containment is now explicit: `/v1/healthz` is CUDA-free and exposes
+cached capacity, queue depths, engine-thread liveness, forward-progress age, recovery
+and failure counters, and the last engine error. An independent watchdog dumps all
+Python threads and exits after prolonged queued/active work without a completed wave;
+the production wrapper restarts the process. Repeated engine-step failures also
+terminate instead of continuing on a potentially poisoned CUDA context.
+
+Verified on fresh processes: a 5,000-token impossible request returns HTTP 500 in
+6 ms, health remains live, and the next completion succeeds in 234 ms; two concurrent
+26k-token requests plus a short request completed; forced no-progress returned HTTP
+503 and recovered; a forced 0.1-second watchdog dumped stacks and exited with status
+70. Production was restored on port 8000 and passed a 16-token completion smoke test.
+
 ### The 3-6% matrix: conv routing, silu fusion, and the GEMM verdict
 
 Campaign two of the day, probe-driven end to end:

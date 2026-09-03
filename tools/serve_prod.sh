@@ -15,6 +15,10 @@ export TQ_PAGED_SPEC=${TQ_PAGED_SPEC:-1} TQ_PG_SPEC_NODES=${TQ_PG_SPEC_NODES:-4}
 # Host-tier checkpoint demotion is opt-in only until Track D validates it under
 # long-context concurrency. The 2026-09-03 prod wedge hit this untested path.
 export TQ_CKPT_HOST_GB=${TQ_CKPT_HOST_GB:-0}
+# Health reports a stalled engine after 60s; the independent watchdog exits
+# after 120s so the wrapper can restart even when no external monitor is present.
+export TQ_HEALTH_STALL_S=${TQ_HEALTH_STALL_S:-60}
+export TQ_ENGINE_WATCHDOG_S=${TQ_ENGINE_WATCHDOG_S:-120}
 while true; do
   .venv/bin/python -u tools/serve_batched.py \
     --tqf /home/shooting-brake007/models/knivesysl/qwen3_8-27b-e2m3-mtp.tqf \

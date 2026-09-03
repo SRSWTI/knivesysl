@@ -129,7 +129,8 @@ def ck(r, what):
 class Request:
     __slots__ = ("ids", "max_new", "eos", "out", "done", "slot", "pos", "next_tok",
                  "started", "t_admit", "t_first", "t_done", "t_tok", "n_prompt", "err",
-                 "progress", "cancel", "temp", "seed", "ng", "ng_n", "acc_ema", "seq")
+                 "progress", "cancel", "temp", "seed", "ng", "ng_n", "acc_ema", "seq",
+                 "ck_epoch", "ck_hit")
 
     def __init__(self, ids, max_new, eos, temp=0.0, seed=0):
         self.ids = ids; self.max_new = max_new; self.eos = set(eos)
@@ -141,6 +142,7 @@ class Request:
         # progress: set by the engine when out grows, so a streaming handler wakes
         # per committed token instead of only at completion.
         # cancel: set by the handler when the client is gone -- the engine detaches
+        self.ck_epoch = -1; self.ck_hit = None
         # the slot at the next step instead of decoding into a dead socket.
         self.progress = threading.Event(); self.cancel = False
 
@@ -166,13 +168,17 @@ class BatchedEngine:
         self.pc_hits = self.pc_misses = self.pc_builds = self.pc_saved = 0
         # checkpoint registry (APC phase 2): engine ckpt id -> prefix ids + stats
         self.cks = []               # [{id, pos, ids, t_hit}]
+        self.ck_epoch = 0           # invalidates per-request checkpoint-match caches
         # With a host tier the registry is no longer bounded by the VRAM slab pool:
         # entries beyond it live demoted in pinned host RAM (engine cap is 24).
-        _hgb = float(os.environ.get("TQ_CKPT_HOST_GB", "8"))
+        _hgb = float(os.environ.get("TQ_CKPT_HOST_GB", "0"))
         self.ck_max = int(os.environ.get("TQ_CKPT_MAX", "16" if _hgb > 0 else "6"))
         self.ck_trim = max(0, int(os.environ.get("TQ_CKPT_TRIM", "8")))
         self.ck_last = None         # previous admitted prompt (LCP checkpoint candidate)
         self.pref = {}              # slot -> [Request, prefill cursor] (chunked prefill)
+        self._cached_free_blocks = num_blocks
+        self._cached_total_blocks = num_blocks
+        self._cached_stats_mono = time.monotonic()
         ck(self.L.qwn_paged_init(max_slots, num_blocks, page), "paged_init")
         fb, tb, pg, mb = self._stats()
         self.num_blocks = tb; self.max_blocks_per_seq = mb
@@ -184,6 +190,10 @@ class BatchedEngine:
         self.running = True
         self.steps = 0; self.decoded_tokens = 0
         self.prefill_waves = 0; self.prefilled_tokens = 0
+        self.started_mono = time.monotonic(); self.last_progress_mono = None
+        self.busy_since_mono = None
+        self.admission_recoveries = 0; self.admission_failures = 0
+        self.last_engine_error = None
         # paged speculative decoding (chain verify): CORRECT (greedy bit-exact,
         # APC-safe, NVFP4-native) but not yet PROFITABLE -- the verify wave runs
         # chunk-256 DeltaNet scans + MMA-prefill attention on ~9-column chains,
@@ -207,11 +217,19 @@ class BatchedEngine:
     def _stats(self):
         fb, tb, pg, mb = (ctypes.c_int(), ctypes.c_int(), ctypes.c_int(), ctypes.c_int())
         ck(self.L.qwn_paged_stats(ctypes.byref(fb), ctypes.byref(tb), ctypes.byref(pg), ctypes.byref(mb)), "stats")
+        # Health handlers must never enter CUDA: if the engine stream is wedged,
+        # a native stats call would wedge the watchdog too. Publish the latest
+        # engine-thread sample instead.
+        self._cached_free_blocks = fb.value
+        self._cached_total_blocks = tb.value
+        self._cached_stats_mono = time.monotonic()
         return fb.value, tb.value, pg.value, mb.value
 
     def submit(self, ids, max_new, eos, temp=0.0, seed=0):
         req = Request(ids, max_new, eos, temp, seed)
         with self.cv:
+            if not self.q and not self.active and not self.pref:
+                self.busy_since_mono = time.monotonic()
             self.q.append(req)
             self.cv.notify()
         return req
@@ -238,23 +256,31 @@ class BatchedEngine:
     # deepest matching checkpoint and prefills only the suffix. N-way, LRU, VRAM-capped;
     # every failure path degrades to a plain full prefill.
     def _ck_match(self, req):
+        # A capacity-blocked request may revisit admission many times. Cache the
+        # O(prefix length) comparison until the checkpoint registry changes.
+        if req.ck_epoch == self.ck_epoch:
+            return req.ck_hit
         best = None
         for c in self.cks:
             if c["pos"] < req.n_prompt and (best is None or c["pos"] > best["pos"]) \
                and req.ids[:c["pos"]] == c["ids"]:
                 best = c
+        req.ck_epoch = self.ck_epoch
+        req.ck_hit = best
         return best
 
-    def _ck_evict_one(self):
-        """Make room. Demoting the LRU RESIDENT entry hands back its state slab and
-        every KV block ref while keeping the entry matchable from host RAM, so
-        capacity stops being bounded by the slab pool. Only when nothing can be
-        demoted (host budget spent, or everything already demoted) do we destroy the
-        LRU outright."""
-        if not self.cks:
+    def _ck_evict_one(self, protect_id=None):
+        """Make room without evicting a checkpoint selected for this admission.
+
+        Demoting a resident entry returns its state slab and KV refs. If host
+        demotion is unavailable, destroy that same resident entry; removing an
+        already-demoted entry would reclaim no GPU capacity.
+        """
+        cands = [c for c in self.cks if c["id"] != protect_id]
+        if not cands:
             return False
         mb = ctypes.c_int(0)
-        res = [c for c in self.cks
+        res = [c for c in cands
                if self.L.qwn_paged_ckpt_tier(c["id"], ctypes.byref(mb)) == 0]
         if res:
             lru = min(res, key=lambda c: c["t_hit"])
@@ -262,11 +288,25 @@ class BatchedEngine:
                 self.L.qwn_paged_ckpt_tier(lru["id"], ctypes.byref(mb))
                 print(f"[ckpt] demote id={lru['id']} pos={lru['pos']} host={mb.value}MB", flush=True)
                 return True
-        lru = min(self.cks, key=lambda c: c["t_hit"])
+        else:
+            lru = min(cands, key=lambda c: c["t_hit"])
         self.cks.remove(lru)
         rc = self.L.qwn_paged_ckpt_free(lru["id"])
+        self.ck_epoch += 1
         print(f"[ckpt] evict id={lru['id']} pos={lru['pos']} rc={rc}", flush=True)
         return True
+
+    def _ck_flush(self, reason):
+        """Drop every checkpoint. Only called with no active/prefill work."""
+        entries = list(self.cks)
+        self.cks.clear()
+        self.ck_epoch += 1
+        failed = 0
+        for c in entries:
+            if self.L.qwn_paged_ckpt_free(c["id"]) != 0:
+                failed += 1
+        print(f"[ckpt] flush reason={reason} count={len(entries)} failed={failed}", flush=True)
+        return failed == 0
 
     def _ck_targets(self, req, cursor):
         """Checkpoint positions for this prompt's prefill (sorted). Two candidates:
@@ -314,26 +354,60 @@ class BatchedEngine:
         print(f"[ckpt] save pos={pos} -> id={cid}", flush=True)
         self.cks.append({"id": cid, "pos": pos, "ids": list(req.ids[:pos]),
                          "t_hit": time.time()})
+        self.ck_epoch += 1
         self.pc_builds += 1
+
+    def _request_blocks(self, req):
+        # The final emitted token is never fed back into KV. Reserve the exact
+        # worst-case footprint so two long requests cannot both admit and then
+        # deadlock at a later page boundary.
+        return (req.n_prompt + max(0, req.max_new - 1) + self.page - 1) // self.page
+
+    def _remaining_blocks(self, req, cursor):
+        return max(0, self._request_blocks(req) -
+                      (cursor + self.page - 1) // self.page)
+
+    def _admission_free_blocks(self):
+        """Pool blocks not already promised to an admitted request."""
+        free_blk = self._free_blocks()
+        for req in self.active.values():
+            free_blk -= self._remaining_blocks(req, req.pos)
+        for st in self.pref.values():
+            free_blk -= self._remaining_blocks(st[0], st[1])
+        return free_blk
 
     def _admit(self):
         """Move queued requests into the PREFILLING set (slot + blocks reserved).
         No prefill work happens here: _work() spends a bounded column budget per
         iteration, so an admission never stalls the active slots' decode."""
-        free_blk = self._free_blocks()
-        for st in self.pref.values():                    # blocks the in-flight prefills still need
-            free_blk -= (st[0].n_prompt - st[1] + self.page - 1) // self.page
+        free_blk = self._admission_free_blocks()
         qi = 0
         while qi < len(self.q) and self.free_slots:
             req = self.q[qi]
+            if req.n_prompt < 1:
+                self.q.pop(qi); req.err = "empty prompt"; req.done.set(); continue
+            # Include the whole requested decode budget, not just prompt pages.
+            total_need = self._request_blocks(req)
+            if total_need > self.max_blocks_per_seq:
+                self.q.pop(qi); req.err = "request exceeds context"; req.done.set(); continue
+            hit = self._ck_match(req)
+            # A resident hit shares every complete prefix block. Only a copied
+            # partial tail plus suffix blocks consume free pool capacity.
+            hit_tier = self.L.qwn_paged_ckpt_tier(hit["id"], None) if hit is not None else -1
+            need = (total_need - hit["pos"] // self.page) if hit_tier == 0 else \
+                   (total_need + (1 if hit is not None and hit["pos"] % self.page else 0))
+            # Prefix checkpoints are an optimization, never a reason to deadlock
+            # admission. Reclaim cold non-matching entries until this request fits.
+            while need > free_blk and self._ck_evict_one(hit["id"] if hit is not None else None):
+                free_blk = self._admission_free_blocks()
+            if need > free_blk:
+                break                                   # live slots must release capacity
+            if len(self.pref) >= self.max_prefill:
+                break                                   # cap concurrent prefills (TTFT fairness)
             # Cache-aware admission: if an IN-FLIGHT prefill is about to checkpoint a
             # boundary this request shares, wait the few waves for it instead of
-            # re-prefilling the whole shared prefix (the concurrent fan-out race:
-            # 6 subagents arriving together all missed and paid 24k tokens each).
-            # No deadlock: the donor always progresses or is torn down, and the
-            # hold lasts only while the target is ahead of the donor's cursor.
-            # Held requests are SKIPPED (qi advances): no head-of-line blocking.
-            if self._ck_match(req) is None:
+            # re-prefilling the whole shared prefix (the concurrent fan-out race).
+            if hit is None:
                 waiting = False
                 for st in self.pref.values():
                     for t in (st[2] if len(st) > 2 else []):
@@ -345,15 +419,6 @@ class BatchedEngine:
                 if waiting:
                     qi += 1
                     continue
-            if req.n_prompt < 1:
-                self.q.pop(qi); req.err = "empty prompt"; req.done.set(); continue
-            need = (req.n_prompt + self.page - 1) // self.page
-            if need > self.max_blocks_per_seq:
-                self.q.pop(qi); req.err = "prompt exceeds context"; req.done.set(); continue
-            if need > free_blk:
-                break                                   # pool full -> wait (admission control)
-            if len(self.pref) >= self.max_prefill:
-                break                                   # cap concurrent prefills (TTFT fairness)
             self.q.pop(qi); slot = self.free_slots.pop()
             try:
                 ck(self.L.qwn_paged_reset_slot(slot), "reset_slot")
@@ -361,11 +426,10 @@ class BatchedEngine:
                     ck(self.L.qwn_paged_set_sampling(slot, req.temp, req.seed), "set_sampling")
                 free_blk -= need
                 cursor = 0
-                hit = self._ck_match(req)
                 if hit is not None:
                     if self.L.qwn_paged_ckpt_tier(hit["id"], None) == 1:
                         pr = self.L.qwn_paged_ckpt_promote(hit["id"])
-                        if pr == -3 and self._ck_evict_one():   # freed a slab; retry once
+                        if pr == -3 and self._ck_evict_one(hit["id"]):   # freed a slab; retry once
                             pr = self.L.qwn_paged_ckpt_promote(hit["id"])
                         if pr != 0:                             # adopt below returns -5
                             print(f"[ckpt] promote id={hit['id']} rc={pr}", flush=True)
@@ -375,9 +439,24 @@ class BatchedEngine:
                         hit["t_hit"] = time.time()
                         self.pc_hits += 1; self.pc_saved += cursor
                     else:
+                        # A stale/corrupt hit must not turn the suffix reservation
+                        # into an unaccounted full prefill. Discard it, re-plan the
+                        # cold request, and either reserve that plan or wait.
                         ck(self.L.qwn_paged_reset_slot(slot), "reset_slot")
-                        print(f"[engine] ckpt adopt rc={pos}, full prefill instead", flush=True)
+                        self.cks.remove(hit)
+                        frc = self.L.qwn_paged_ckpt_free(hit["id"])
+                        self.ck_epoch += 1
+                        print(f"[engine] ckpt adopt rc={pos}; evict id={hit['id']} "
+                              f"rc={frc}, full prefill instead", flush=True)
                         self.pc_misses += 1
+                        free_blk = self._admission_free_blocks()
+                        while total_need > free_blk and self._ck_evict_one():
+                            free_blk = self._admission_free_blocks()
+                        if total_need > free_blk:
+                            self.q.insert(qi, req)
+                            self.free_slots.append(slot)
+                            break
+                        free_blk -= total_need
                 else:
                     self.pc_misses += 1
                 self.pref[slot] = [req, cursor, self._ck_targets(req, cursor)]
@@ -414,6 +493,7 @@ class BatchedEngine:
             self.wavelog.append((t2, (t2 - t1) * 1e3, T - len(dec_slots), len(dec_slots), K, 0))
         if rc != 0:
             raise RuntimeError(f"fused wave rc={rc} (K={K} T={T})")
+        self.last_progress_mono = t2
         self.prefill_waves += 1
         self.prefilled_tokens += T - len(dec_slots)
         self.decoded_tokens += len(dec_slots)
@@ -564,6 +644,7 @@ class BatchedEngine:
         req = self.active.pop(slot)
         ck(self.L.qwn_paged_reset_slot(slot), "reset_slot")
         self.free_slots.append(slot)
+        self._stats()
         req.t_done = time.time()
         req.done.set()
         req.progress.set()
@@ -641,6 +722,7 @@ class BatchedEngine:
             # a failed round can leave a partial slot rewound-but-unreplayed:
             # fail the participants (the _loop wave-error contract handles it)
             raise RuntimeError(f"paged spec round rc={rc} (N={n} maxd={maxd})")
+        self.last_progress_mono = _t2
         if len(self.wavelog) < 65536:
             self.wavelog.append((_t2, (_t2 - _t1) * 1e3, 0, n, n, 2))
         self.spec_rounds += 1
@@ -683,6 +765,7 @@ class BatchedEngine:
         _t2 = time.perf_counter()
         if len(self.wavelog) < 65536:
             self.wavelog.append((_t2, (_t2 - _t1) * 1e3, 0, n, n, 1))
+        self.last_progress_mono = _t2
         self.steps += 1; self.decoded_tokens += n
         finished = []
         _tnow = time.time()
@@ -706,15 +789,43 @@ class BatchedEngine:
                 try:
                     self._admit()
                 except Exception as e:
+                    # Admission exceptions are request-scoped. Never retry the
+                    # same poisoned head forever while the engine appears alive.
+                    self.admission_failures += 1
                     print(f"[engine] admit error: {e}", flush=True)
+                    if self.q:
+                        r = self.q.pop(0)
+                        r.err = f"admission failed: {e}"; r.done.set(); r.progress.set()
                 have = bool(self.active) or bool(self.pref)
-            if have:
+                if not have and self.q:
+                    # No live work can release capacity: waiting is a deadlock,
+                    # not backpressure. Drop optional cache state and retry once.
+                    self.admission_recoveries += 1
+                    fb = self._free_blocks()
+                    print(f"[engine] admission no-progress: queued={len(self.q)} "
+                          f"free={fb}/{self.num_blocks}; flushing prefix cache", flush=True)
+                    self._ck_flush("admission-no-progress")
+                    try:
+                        self._admit()
+                    except Exception as e:
+                        self.admission_failures += 1
+                        print(f"[engine] admission recovery error: {e}", flush=True)
+                    have = bool(self.active) or bool(self.pref)
+                    if not have and self.q:
+                        r = self.q.pop(0)
+                        self.admission_failures += 1
+                        r.err = (f"admission capacity invariant failed: "
+                                 f"prompt={r.n_prompt} free={self._free_blocks()} "
+                                 f"max_blocks={self.max_blocks_per_seq}")
+                        r.done.set(); r.progress.set()
+                        print(f"[engine] {r.err}", flush=True)
                 _t = time.perf_counter()
                 try:
                     self._work()
                     self.err_streak = 0
                 except Exception as e:                  # never let the engine thread die
                     print(f"[engine] step error: {e}", flush=True)
+                    self.last_engine_error = repr(e)
                     self.err_streak = getattr(self, "err_streak", 0) + 1
                     if self.err_streak >= 8:
                         # 8 consecutive failed steps = the CUDA context is gone
@@ -723,23 +834,26 @@ class BatchedEngine:
                         # instead of a zombie serving 100% errors.
                         print("[engine] FATAL: 8 consecutive step errors, exiting", flush=True)
                         os._exit(70)
-                    with self.cv:
-                        for s in list(self.active.keys()):
-                            r = self.active.pop(s)
-                            try:
-                                self.L.qwn_paged_reset_slot(s)
-                            except Exception:
-                                pass
-                            self.free_slots.append(s)
-                            r.err = f"step failed: {e}"; r.done.set()
-                        for s in list(self.pref.keys()):
-                            r = self.pref.pop(s)[0]
-                            try:
-                                self.L.qwn_paged_reset_slot(s)
-                            except Exception:
-                                pass
-                            self.free_slots.append(s)
-                            r.err = f"prefill failed: {e}"; r.done.set()
+                    # _loop already owns self.cv. Re-acquiring its non-reentrant
+                    # Lock here deadlocked the engine on the first failed wave.
+                    for s in list(self.active.keys()):
+                        r = self.active.pop(s)
+                        try:
+                            self.L.qwn_paged_reset_slot(s)
+                        except Exception:
+                            pass
+                        self.free_slots.append(s)
+                        r.err = f"step failed: {e}"; r.done.set(); r.progress.set()
+                    for s in list(self.pref.keys()):
+                        r = self.pref.pop(s)[0]
+                        try:
+                            self.L.qwn_paged_reset_slot(s)
+                        except Exception:
+                            pass
+                        self.free_slots.append(s)
+                        r.err = f"prefill failed: {e}"; r.done.set(); r.progress.set()
+                if not self.q and not self.active and not self.pref:
+                    self.busy_since_mono = None
                 self.t_loop += time.perf_counter() - _t
 
     def shutdown(self):
@@ -940,30 +1054,50 @@ def make_handler(eng, tok, args):
                                     "allow_fine_tuning": False, "organization": "*",
                                     "group": None, "is_blocking": False}]}]})
             elif self.path.startswith("/health") or self.path.startswith("/v1/healthz"):
-                fb, tb, _, _ = eng._stats()
-                last_wave_age_s = None
-                if eng.wavelog:
-                    last_wave_age_s = max(0.0, time.monotonic() - eng.wavelog[-1][0])
-                self._json(200, {"status": "ok", "free_blocks": fb, "total_blocks": tb,
-                                 "active": len(eng.active), "prefilling": len(eng.pref),
-                                 "queued": len(eng.q), "steps": eng.steps,
-                                 "decoded_tokens": eng.decoded_tokens,
-                                 "prefilled_tokens": eng.prefilled_tokens,
-                                 "engine_thread_alive": eng.thread.is_alive(),
-                                 "last_wave_age_s": last_wave_age_s,
-                                 "prefix_cache": {"enabled": eng.pc_enabled,
-                                                  "prefix_tokens": sum(c["pos"] for c in eng.cks),
-                                                  "checkpoints": len(eng.cks),
-                                                  "hits": eng.pc_hits, "misses": eng.pc_misses,
-                                                  "builds": eng.pc_builds,
-                                                  "tokens_saved": eng.pc_saved},
-                                 "spec": {"enabled": eng.spec_on,
-                                          "rounds": eng.spec_rounds,
-                                          "committed": eng.spec_committed,
-                                          "drafted": eng.spec_drafted,
-                                          "rounds_by_n": eng.spec_rounds_by_n,
-                                          "tokens_per_round": (eng.spec_committed / eng.spec_rounds)
-                                                              if eng.spec_rounds else 0.0}})
+                # Do not call into CUDA from the HTTP watchdog. A wedged engine
+                # stream must still yield an immediate 503 and a useful reason.
+                fb, tb = eng._cached_free_blocks, eng._cached_total_blocks
+                now = time.monotonic()
+                alive = eng.thread.is_alive()
+                busy = bool(eng.q or eng.active or eng.pref)
+                checkpoints = list(eng.cks)
+                spec_rounds_by_n = dict(eng.spec_rounds_by_n)
+                bases = [x for x in (eng.last_progress_mono, eng.busy_since_mono)
+                         if x is not None]
+                progress_base = max(bases) if bases else eng.started_mono
+                last_wave_age_s = max(0.0, now - progress_base)
+                stalled = (not alive) or (
+                    busy and last_wave_age_s > args.health_stall_seconds)
+                stalled_reason = ("engine-thread-dead" if not alive else
+                                  "no-forward-progress" if stalled else None)
+                self._json(503 if stalled else 200,
+                           {"status": "stalled" if stalled else "ok",
+                            "stalled_reason": stalled_reason,
+                            "free_blocks": fb, "total_blocks": tb,
+                            "free_blocks_sample_age_s":
+                                max(0.0, now - eng._cached_stats_mono),
+                            "active": len(eng.active), "prefilling": len(eng.pref),
+                            "queued": len(eng.q), "steps": eng.steps,
+                            "decoded_tokens": eng.decoded_tokens,
+                            "prefilled_tokens": eng.prefilled_tokens,
+                            "engine_thread_alive": alive,
+                            "last_wave_age_s": last_wave_age_s,
+                            "last_engine_error": eng.last_engine_error,
+                            "admission_recoveries": eng.admission_recoveries,
+                            "admission_failures": eng.admission_failures,
+                            "prefix_cache": {"enabled": eng.pc_enabled,
+                                             "prefix_tokens": sum(c["pos"] for c in checkpoints),
+                                             "checkpoints": len(checkpoints),
+                                             "hits": eng.pc_hits, "misses": eng.pc_misses,
+                                             "builds": eng.pc_builds,
+                                             "tokens_saved": eng.pc_saved},
+                            "spec": {"enabled": eng.spec_on,
+                                     "rounds": eng.spec_rounds,
+                                     "committed": eng.spec_committed,
+                                     "drafted": eng.spec_drafted,
+                                     "rounds_by_n": spec_rounds_by_n,
+                                     "tokens_per_round": (eng.spec_committed / eng.spec_rounds)
+                                                         if eng.spec_rounds else 0.0}})
             elif self.path.startswith("/waveprof"):
                 # Where a wave's wall time actually goes. `engine_inside` is measured by
                 # the engine itself; `engine` is what Python sees around the ctypes call,
@@ -1263,6 +1397,29 @@ def serve(args):
                         decode_min_rows=args.decode_min_rows,
                         decode_max_idle_ms=args.decode_max_idle_ms,
                         prefill_budget=args.prefill_budget)
+    def _watch_engine():
+        # ctypes releases the GIL around native calls. This thread therefore
+        # remains able to kill a process whose engine loop is blocked in CUDA,
+        # an allocator, or a Python deadlock while HTTP health still responds.
+        interval = max(0.1, min(1.0, args.engine_watchdog_seconds / 4.0))
+        while eng.running:
+            time.sleep(interval)
+            if not (eng.q or eng.active or eng.pref):
+                continue
+            now = time.monotonic()
+            bases = [x for x in (eng.last_progress_mono, eng.busy_since_mono)
+                     if x is not None]
+            progress_base = max(bases) if bases else eng.started_mono
+            age = now - progress_base
+            if age <= args.engine_watchdog_seconds:
+                continue
+            print(f"[engine] FATAL: no forward progress for {age:.1f}s; "
+                  f"queued={len(eng.q)} active={len(eng.active)} "
+                  f"prefilling={len(eng.pref)}", flush=True)
+            faulthandler.dump_traceback(all_threads=True)
+            os._exit(70)
+
+    threading.Thread(target=_watch_engine, name="engine-watchdog", daemon=True).start()
     fb, tb, pg, mb = eng._stats()
     print(f"batched server: pool blocks={tb} page={pg} max_slots={eng.max_slots} free={fb}", flush=True)
     # BaseHTTPServer's default backlog is 5: with N clients connecting at once the
@@ -1377,6 +1534,14 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8100)
     ap.add_argument("--timeout", type=float, default=300.0)
+    ap.add_argument("--health-stall-seconds", type=float,
+                    default=float(os.environ.get("TQ_HEALTH_STALL_S", "60")),
+                    help="return 503 when queued/active work makes no wave progress for "
+                         "this many seconds; the check never enters CUDA")
+    ap.add_argument("--engine-watchdog-seconds", type=float,
+                    default=float(os.environ.get("TQ_ENGINE_WATCHDOG_S", "120")),
+                    help="exit for supervisor restart after this many seconds of queued/active "
+                         "work without a completed engine wave")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--bench", action="store_true")
     ap.add_argument("--bench-ns", default="1,2,4,8,16,32")

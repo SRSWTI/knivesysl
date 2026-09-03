@@ -226,8 +226,11 @@ arriving during a donor's prefill can wait briefly and adopt its checkpoint rath
 than racing another full prefill.
 
 the resident state slabs are allocated as one pool (`TQ_CKPT_POOL`, default six
-151.5 mb slabs). every allocation, save, evict, and adopt failure degrades to a plain
-full prefill.
+151.5 mb slabs). admission reserves the full prompt-plus-output footprint, subtracts
+active/prefilling reservations and resident checkpoint blocks, evicts only optional
+cache entries when capacity is short, and rejects an impossible request without
+poisoning later requests. allocation, save, evict, promote, and adopt failures all
+degrade to a plain full prefill.
 
 measured 2026-08-31 on the production build, with `--no-prefix-cache` as the control:
 
@@ -257,8 +260,14 @@ it does not move the weight-read roofline.
 ![the honest loss](docs/apc/divergence_loss.svg)
 
 production uses `tools/serve_prod.sh`, a restart wrapper with core dumps enabled.
-the engine exits after consecutive step failures instead of serving through a poisoned
-cuda context.
+`/v1/healthz` reports queue depths, forward-progress age, the cached free-block
+sample, the engine-thread state, and the last engine error without entering cuda.
+an independent watchdog dumps every python thread and exits after 120 seconds of
+queued/active work without a completed wave, so the wrapper can replace a wedged
+process. the engine also exits after consecutive step failures instead of serving
+through a poisoned cuda context. host-tier checkpoint demotion remains opt-in:
+its current pinned allocation and full-image copies are synchronous and do not
+belong in the scheduler hot path until the asynchronous Track D implementation lands.
 
 ---
 ## how it works
@@ -408,6 +417,9 @@ turns.
 | `--fuse-idle-ms` | ride a decode row on a prompt wave only after this idle time (default 125; riding costs 1.2 ms/row/wave) |
 | `--prefill-budget` | prompt columns per wave, on top of the decode rows |
 | `--prefix-cache` | materialize a shared prompt prefix once (batched server) |
+| `TQ_CKPT_HOST_GB` | pinned-RAM checkpoint tier budget; default 0 because demote/promote is still synchronous |
+| `TQ_HEALTH_STALL_S` | `/v1/healthz` no-progress threshold (production default 60 seconds) |
+| `TQ_ENGINE_WATCHDOG_S` | fatal no-progress threshold before supervisor restart (production default 120 seconds) |
 
 ## verify
 
