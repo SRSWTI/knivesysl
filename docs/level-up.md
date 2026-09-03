@@ -51,18 +51,23 @@ more tile-size sweep.
 
 ## why the remaining gap exists
 
-### decode: global split-k reduction traffic
+### decode: the projection mainloop, not the reducer
 
-the current short-context profile records roughly 351 `k_tq_nvf4_reduce` launches per
-decode step. the nvfp4 projection path divides k across ctas, writes fp32 partials to
-global memory, launches a reducer, rereads the partials, and writes the final output.
-graph replay removes dispatch cost but not that traffic.
+the current short-context profile records 496 `k_tq_nvf4_gemm_tma` launches and 352
+`k_tq_nvf4_reduce` launches per token. the names made the reducer look like the obvious
+target; the current-build trace disproves that:
 
-large nvfp4 weight launches already stream around 1.56 tb/s, roughly 87% of the practical
-dram ceiling. asking the same algorithm to stream weights a little faster cannot close
-the whole gap. the partial and epilogue traffic has to disappear.
+- nvfp4 gemm mainloops consume 9.586 ms/token at 2k;
+- every nvfp4 reducer combined consumes 0.259 ms/token;
+- the source-derived split-partial round trip is 35.95 mb/token, whose ideal 1.56 tb/s
+  floor is only 0.023 ms/token;
+- forcing every projection to full-k `ks=1` removes decode-time reducers but slows the
+  model from about 66.8 to 57.2 tok/s.
 
-### projection boundaries: fp32 materialization
+split-k is buying occupancy. deleting its fold without preserving that parallelism cannot
+cross the plain gap, and switching globally to the vendor-style unsplit policy is worse.
+
+### projection boundaries: apparent bytes are not sufficient
 
 the remaining dataflow often looks like:
 
@@ -70,23 +75,61 @@ the remaining dataflow often looks like:
 projection -> fp32 output -> residual -> rms -> reread -> nvfp4 quant -> next projection
 ```
 
-rms application and silu application already fuse into quantization where legal. the
-projection output and residual pipeline still cross global memory more often than the
-consumer contract requires.
+rms application and silu application already fuse into quantization where legal.
+standalone experiments removed more of those apparent round trips exactly, but lost when
+they serialized independent nvfp4 k64 tiles or introduced cluster rendezvous. a production
+epilogue must retain the existing output-tile parallelism; launch deletion by itself has
+no value under graph replay.
 
-### attention: current-row preparation is separate
+### attention: history dominates at depth
 
-decode q/k/v projection, normalization, rope preparation, q4/e4m3 kv publication, history
-scan, and gated merge remain separate stages. staged v2 fixed the history-read disaster;
-the current row still pays preparation and publication traffic before the scan can use it.
+staged v2 fixed the original history-read disaster. on the current build, the full v2
+history kernel costs 1.330 ms/token at 2k and 5.441 ms/token at 128k. the separate current
+kv writer plus merge cost only 0.073 and 0.184 ms/token respectively. a standalone prepared-q
+slab was exact but added traffic and never beat repeated in-cta preparation. current-row
+fusion is therefore not the primary plain-parity rung.
 
-### prefill: peak gemm is not enough
+### prefill: deltanet ownership is the remaining structural target
 
-the measured 8k attribution before the final matrix was approximately 42% nvfp4 gemm,
-21% deltanet scan and prep, 13% wide attention, and 13% activation quantization/fusion
-kernels. the gemm's large launches are already hardware-class. prefill parity therefore
-needs a better activation and state dataflow around the gemm, not a benchmark-only gemm
-number.
+the fresh 8k prefill trace attributes 40.6% of gpu-busy time to nvfp4 gemms, 21.9% to
+deltanet prep plus scan, 14.6% to wide attention, and 13.2% to activation quantizers.
+the gemm launches are already hardware-class. producer-push dsm experiments for both the
+prep stream and the output epilogue were exact but slower. the remaining credible rewrite
+is a single-owner tf32/fp32 deltanet kernel that keeps the complete 128x128 recurrent state
+distributed in registers; a direct fp16/bf16 donor port is numerically incompatible.
+
+## source-mining findings
+
+the mining pass covered the current translation unit plus the pinned cutlass, flashinfer,
+flash-attention, tilegym, sglang, vllm, tensorcoreptx, and flashoverlap trees.
+
+| area | source-grounded finding | campaign consequence |
+|---|---|---|
+| current nvfp4 | `k_tq_nvf4_gemm_tma` keeps fp32 accumulators in registers, publishes split-k partials, then folds them in ascending split order | preserve split occupancy and reduction order; the fold is a small tail |
+| sm120 dense donors | flashinfer/vllm use unsplit `1x1x1` persistent ctas; cutlass sm120 has register mma and no tmem or stock multi-cta block-scaled builder | use their pipeline structure only; full-k ownership must first beat the live split policy |
+| dsm reduction | the reusable cutlass gqa mechanism is producer-push into receiver-local mailboxes; consumer-side remote reads fault on this gb202 | producer-push is validated locally, but only inside a producer that already owns the partial |
+| projection fusion | serving stacks fuse silu or add/rms/quant after materialized projections; none supplies gemm -> residual -> rms -> nvfp4 as one sm120 kernel | no library-shaped shortcut exists; a real port must own accumulator fragments and row completion |
+| attention | flashattention's fused append path assumes fp16/bf16 kv; tilegym's grouped decode assumes dense kv; neither consumes q4-hadamard k plus e4m3 v | retain v2 history math and port only representation-compatible publication ideas |
+| deltanet | flashinfer sm120 keeps a 128x128 fp32 state in registers across chunk-64 blocks, but converts state operands and its inverse to fp16/bf16 | retain ownership/warp-role structure; reject a direct precision port |
+| scheduling | sglang launches the next forward from gpu-resident token metadata while d2h publication trails on another stream | this is the source-backed route to the measured 0.64-0.65 ms/token host-gap ceiling |
+
+no vendor library enters the run path. provenance and license headers remain with any later
+source port.
+
+## measured campaign decisions — 2026-09-02
+
+| thesis | decision | measured reason |
+|---|---|---|
+| standalone cluster split-k fold | **reject** | exact and faster in isolation, but all live reducers total only 0.259 ms/token |
+| global full-k/unsplit nvfp4 | **reject** | `ks=1` removes post-load reducers and loses 14.4% end-to-end decode |
+| one-cta residual/rms/nvfp4 publication | **reject** | bit-exact, 2.25x slower under graph replay; 80 k64 tiles became serial |
+| four-cta deltanet norm/quant epilogue | **reject** | bit-exact, 1.90x slower under graph replay despite 6 mib removed |
+| standalone prepared-q slab | **reject** | bit-exact, 0-25% slower; publication/reload replaces cheap parallel arithmetic |
+| dsm-broadcast deltanet prep | **reject** | exact transport, 15.1% slower with 256 cluster barriers per 2k head |
+| same-thread scheduler overlap | **accept for implementation experiment** | current traces leave 0.64-0.65 ms/token outside gpu kernels |
+| single-owner tf32/fp32 deltanet prefill | **revise and retain** | only ownership pattern with a structural payoff; direct bf16/fp16 math is rejected |
+
+rejected mechanisms remain documented and their standalone sources remain in `tools/`.
 
 ## stage 0 — refresh the profile map
 
@@ -114,6 +157,37 @@ and the exact benchmark artifact/config. separate prefill and decode windows.
 
 at least 95% of gpu-busy time must have an owner before a kernel rewrite starts. empty or
 unflushed profiler output is not evidence.
+
+### current evidence — 2026-09-02
+
+fresh current-build artifacts:
+
+- `results/profiles/current-plain-2k-n1-full.sqlite`: 120 decode steps, 2k x1;
+- `results/profiles/current-plain-128k-n1.sqlite`: 120 decode steps, 128k x1;
+- `results/profiles/current-plain-prefill-8k-n1.sqlite`: one 8k prefill;
+- `results/microbench/level_up_experiments.json`: standalone controls, probes, resources,
+  exactness, and decisions.
+
+| owner | 2k ms/token | 128k ms/token | depth delta |
+|---|---:|---:|---:|
+| `k_tq_nvf4_gemm_tma` | 9.586 | 9.660 | +0.074 |
+| nvfp4 activation quantizers | 1.698 | 1.709 | +0.011 |
+| paged-attention v2 history scan | 1.330 | 5.441 | +4.111 |
+| deltanet decode kernels | 0.513 | 0.522 | +0.009 |
+| `k_tq_nvf4_reduce` | 0.259 | 0.265 | +0.006 |
+| fp6 lm head | 0.570 | 0.570 | 0.000 |
+| residual/rms helpers | 0.279 | 0.298 | +0.019 |
+| current kv writer plus attention merge | 0.073 | 0.184 | +0.111 |
+
+the 2k window spans 1.800 s, contains 1.723 s of summed gpu work, and leaves about
+0.64 ms/token outside kernels. the 128k window spans 2.322 s, contains 2.244 s of gpu
+work, and leaves about 0.65 ms/token outside kernels. both are about 96.6-96.7% gpu-busy.
+
+the 8k prefill window spans 840.7 ms and contains 827.5 ms of gpu work (98.4% busy).
+nvfp4 gemm, wide attention, deltanet prep/scan, and the three activation quantizers alone
+own 90.3%; the next residual, norm, convolution, and gated-norm kernels take attribution
+well above the 95% gate. batch-server scheduling still needs its own stage-4 trace; it is
+not inferred from these single-client windows.
 
 ## stage 1 — cluster-reduced nvfp4 decode projection
 
@@ -161,6 +235,45 @@ nvfp4 weight tiles -> fp4 mma -> cluster-local reduction -> fused epilogue -> ou
 reject the rung if cluster occupancy loss causes another kernel to recover the saved time,
 if a global atomic changes greedy output, or if the win exists only before graph capture.
 
+### measured decision — standalone rung rejected
+
+`tools/microbench_cluster_reduce.cu` isolates the exact sm120 mechanism with deterministic
+fp32 partials, eager and cuda-graph controls, actual model output widths, register/smem
+reporting, and bitwise output comparison.
+
+- ~~owner-pull dsm reduction~~ failed: peer reads faulted at remote shared offset `0x500`
+  under both dynamic and static allocation;
+- producer-push into rank 0's dsm mailbox passed bitwise (`max_abs=0`) and removed the
+  global partial round trip plus one launch;
+- `ks=2`, `n=1`: every tested width passed, 2.04-2.10x eager and 1.12-2.00x graph,
+  with a 1,024-byte mailbox per cta;
+- `ks=4`, `n=1`: useful only for narrower outputs; neutral by width 17,408 and
+  graph-shape-dependent;
+- `ks=8`, `n=1`: useful only for small outputs, loses from width 5,120 upward, and width
+  17,408 is repeated-launch unstable;
+- wider `n=2/4` cases become neutral or slower and include launch-unstable shapes.
+
+weighted over the actual 352 reducer-bearing projections per token, the synthetic saving is
+about 0.408 ms/token eager and 0.274 ms/token under graph replay. the independent real-kernel
+measurement is consistent: reducers consume 0.259 ms/token and the ideal partial-workspace
+traffic floor adds only about 0.023 ms/token.
+
+the second control forced the real engine to one split policy across every projection:
+
+| policy | ms/token | tok/s | versus per-weight autotune |
+|---:|---:|---:|---:|
+| per-weight autotune | about 14.97 | about 66.8 | reference |
+| `ks=1` | 17.497 | 57.15 | -14.4% |
+| `ks=2` | 15.590 | 64.14 | -3.9% |
+| `ks=4` | 15.314 | 65.30 | -2.2% |
+| `ks=8` | 15.074 | 66.34 | -0.7% |
+
+`results/profiles/current-plain-2k-ks1-verified.sqlite` contains 288 reducer launches during
+load-time autotuning and **zero** after load, proving the override removed the decode-time
+fold. therefore ~~ship cluster reduction as a standalone decode rewrite~~ and ~~replace
+split-k with a vendor-style full-k owner~~ are both **rejected**. producer-push dsm remains
+a valid primitive only if a future gemm producer can use it without losing split occupancy.
+
 ## stage 2 — projection epilogue and next-consumer publication
 
 ### target chains
@@ -196,62 +309,94 @@ if a global atomic changes greedy output, or if the win exists only before graph
 - at least 0.5 ms/token removed after stage 1, or at least 8% at 8k prefill;
 - 32k x4 improves rather than trading throughput for a prettier n=1 number.
 
+### measured decision — post-projection fusion rejected
+
+`tools/microbench_resid_quant.cu` reproduces the exact 5,120-wide residual/rms factor and
+native nvfp4 tile contract. both the no-add and residual-add variants produced zero
+residual or packed-word mismatches. under graph replay the current two-kernel controls took
+8.20 us; the one-cta fused variants took 18.44 us. one block serialized 80 independent
+k64 quant tiles and allowed only one active block per sm.
+
+`tools/microbench_dn_epilogue.cu` then tested the larger four-cta alternative over a real
+64-token, 48-head, 128-wide deltanet wave. producer-push dsm preserved every fp32 result and
+packed word while removing a modeled 6 mib, but took 25.50 us versus 13.45 us for the
+three-kernel graph control.
+
+therefore ~~collapse the post-projection chain in a standalone mega-epilogue~~ is rejected.
+an accumulator-owned epilogue remains admissible only if the gemm already owns complete
+output tiles and retains existing tile parallelism; it is not an active rung without a
+full producer microkernel that clears the stage gate.
+
 ## stage 3 — current-row attention integration
 
 ### hypothesis
 
 q normalization, rope, current k/v quantization, paged publication, and q preparation can
-share a prologue or at least one owned preparation kernel. the history scan then consumes
-the prepared row without another full global round trip.
+share an existing producer boundary. the history scan must not pay another global
+round trip for a separately prepared q slab.
 
-### work
+### measured decision — standalone preparation rejected
 
-- map every current-row read/write in the 16 full-attention layers;
-- fuse q/k normalization and rope where the exact reduction order can be kept;
-- publish q4 k, scales, e4m3 v, and v scale once;
-- make the v2 attention kernel consume the prepared q representation directly;
-- preserve page-table and apc tail ownership;
-- keep the spec chain and plain decode contracts separate where their q grouping differs.
+`tools/microbench_qprep.cu` copies the exact q norm -> rope -> hadamard arithmetic and
+compares repeated in-cta work against one global prepared-q producer. every tested split
+count was bit-identical. the producer/reload path was slower:
 
-### acceptance
+| split count | eager control / staged | graph control / staged |
+|---:|---:|---:|
+| 4 | 4.96 / 5.84 us | 6.14 / 7.79 us |
+| 16 | 5.01 / 5.86 us | 6.15 / 8.19 us |
+| 64 | 5.73 / 6.20 us | 6.15 / 8.19 us |
+| 85 | 10.32 / 10.75 us | 12.28 / 12.28 us |
 
-- kv bytes are identical to the existing writer;
-- paged parity and short/2k/32k gates pass;
-- at least 0.3 ms/token saved at 2k or a measured context-scan improvement at 128k;
-- no new allocation in the decode loop.
+the current writer plus merge are only 0.073 ms/token at 2k and 0.184 ms/token at 128k.
+~~publish a standalone prepared-q tensor~~ is rejected, and this stage is removed as a
+plain-parity priority. q/k preparation may still be fused into the already-mandatory
+current-row writer if a later attention rewrite needs it, but that work must keep kv bytes,
+page/apc ownership, and short/2k/32k outputs unchanged.
 
 ## stage 4 — scheduler and graph overlap
 
-this is a cleanup rung, not the main bet. full graph replay measured about 1% because the
-work inside the graph stayed the same. after stages 1-3 remove kernels and buffers, revisit
-its value.
+this is now an accepted bounded implementation experiment, not cleanup. full graph replay
+previously moved only about 1% because it removed dispatch without changing the synchronous
+host boundary. the current traces leave 0.64-0.65 ms/token outside kernels at both 2k and
+128k. that is the maximum single-stream gain, not a promise.
 
-- stable input and state-index buffers per batch bucket;
-- launch batch t while the host processes completed metadata for t-1;
+- keep stable input, state-index, sample, and publication buffers per batch bucket;
+- launch batch t while the same host thread processes completed metadata for t-1;
+- relay the next token through device-resident storage; do not wait for its d2h copy before
+  launching the next forward;
 - no speculative assumption in the plain scheduler;
-- preserve cancellation, sampling, and error publication order;
-- measure host gaps directly rather than inferring them from wall time.
+- preserve cancellation, sampling, slot reuse, and error publication order;
+- measure host gaps directly, plus staggered-client ttft and starvation.
 
-accept only an end-to-end win with unchanged ttft and no request-starvation regression.
+accept only an end-to-end win with unchanged outputs, unchanged maximum ttft, and no
+request-starvation regression. reject it if the overlap merely moves delay into response
+publication or lets a new step overwrite buffers still owned by the copy stream.
 
 ## stage 5 — deltanet and prefill dataflow
 
-our chunk-64 wy/ut transform is already structurally close to the reference algorithm.
-the failed serial/parallel split proved that fp32 state checkpoint traffic can erase a
-faster serial kernel. do not retry bf16 checkpoints: they produced early divergence and
-an empty 8k output in the measured stack.
+the fresh 8k profile assigns 65.1 ms to prep and 116.3 ms to the tf32 scan: 21.9% of
+gpu-busy prefill time. two tempting transport/finalization rewrites have now failed:
 
-research directions:
+- `tools/microbench_dn_prep_flow.cu` models all 32 chunks and 48 heads. global publication
+  plus the four stripe readers took 1.341 ms under graph replay; exact producer-push dsm
+  streaming took 1.579 ms, 15.1% slower, despite removing the 226 mib prep write;
+- the exact four-cta norm/quant epilogue took 25.50 us versus 13.45 us, 1.90x slower.
 
-- fuse the third reconstruction phase into the following projection consumer;
-- retain incoming state in a persistent cta without emitting the full s-pre image;
-- checkpoint only a compact algebraic intermediate if the consumer can reconstruct from
-  it without another state-sized read;
-- co-schedule independent value-head stripes without reducing live-state occupancy;
-- compare tf32 and fp32 at the existing teacher-forced gate, not a live source corpus.
+therefore ~~broadcast prep through dsm~~ and ~~cluster-fuse the raw-core epilogue~~ are
+rejected. the flashinfer source supplies one remaining structural idea: one 384-thread cta
+owns a full head, carries the 128x128 fp32 state in registers across all chunk-64 blocks,
+and publishes it once. its arithmetic is not a drop-in:
 
-acceptance is an 8k and 32k prefill win with the existing quality band and no state-sized
-scratch explosion.
+- flashinfer uses fp16/bf16 mma operands and a fixed fp16 triangular inverse;
+- knivesysl keeps prep, solve, and recurrent state fp32 and rounds only scan mma operands
+  to tf32;
+- the prior bf16 checkpoint experiment diverged at 2k/32k and emitted an empty 8k output.
+
+the stage is **revised and retained** as a dedicated tf32/fp32 single-owner prototype. it
+must compare final recurrent state, packed pre-`linear_out` codes/scales, ragged 129-token
+handling, and 2k/32k greedy output. acceptance requires at least 8% faster 8k prefill, no
+32k regression, no state-sized checkpoint image, and no bf16/fp16 boundary substitution.
 
 ## stage 6 — plain acceptance matrix
 
@@ -291,6 +436,91 @@ observed kernel delta:
 observed server delta:
 accepted or rejected:
 reason:
+```
+
+### experiment 1 — dsm split-k reduction
+
+```text
+hypothesis: remove global split-k partials and the standalone reducer
+changed symbols: tools/microbench_cluster_reduce.cu only
+control env: sm120 global partial kernel plus global reducer
+probe env: compile-time k-cluster, producer-push dsm mailbox, owner-local fold
+correctness gates: bitwise float output identity for every completed case
+profile artifact: results/profiles/current-plain-2k-n1-full.sqlite
+benchmark artifact: results/microbench/level_up_experiments.json
+expected bytes/launches removed: (2 * ks) fp32 partial bytes per output, one launch
+observed kernel delta: weighted 0.408 ms/token eager; 0.274 ms/token graph estimate
+observed server delta: not run; production source was intentionally unchanged
+accepted or rejected: rejected as a standalone rung; primitive retained only inside a future gemm producer
+reason: measured payoff misses the gate; full-k loses 14.4%, and wide/multi-request cluster cases are neutral or unstable
+```
+
+### experiment 2 — post-projection residual/rms/nvfp4
+
+```text
+hypothesis: one row owner can commit residual, compute exact rms, and publish nvfp4 once
+changed symbols: tools/microbench_resid_quant.cu only
+control env: exact factor kernel plus 80 independent k64 quant blocks
+probe env: one 1024-thread cta, 5120-value shared row, direct packed publication
+correctness gates: zero residual and packed-word mismatches
+profile artifact: results/profiles/current-plain-2k-n1-full.sqlite
+benchmark artifact: results/microbench/level_up_experiments.json
+expected bytes/launches removed: 40960 read bytes and one launch per row
+observed kernel delta: graph 8.20 us -> 18.44 us
+observed server delta: not run; standalone failed
+accepted or rejected: rejected
+reason: quant tile parallelism collapsed and occupancy fell to one block/sm
+```
+
+### experiment 3 — deltanet output cluster epilogue
+
+```text
+hypothesis: four scan stripes can normalize and quantize without a raw-core round trip
+changed symbols: tools/microbench_dn_epilogue.cu only
+control env: publish, exact gated rmsnorm, native nvfp4 quant
+probe env: four-cta producer-push dsm cluster
+correctness gates: zero fp32 and packed-word mismatches
+profile artifact: results/profiles/current-plain-prefill-8k-n1.sqlite
+benchmark artifact: results/microbench/level_up_experiments.json
+expected bytes/launches removed: 6291456 bytes and two launches per 64-token wave
+observed kernel delta: graph 13.45 us -> 25.50 us
+observed server delta: not run; standalone failed
+accepted or rejected: rejected
+reason: dsm copies and cluster synchronization cost more than removed traffic
+```
+
+### experiment 4 — prepared-q staging
+
+```text
+hypothesis: compute q norm/rope/hadamard once instead of once per attention split
+changed symbols: tools/microbench_qprep.cu only
+control env: repeated exact per-split prologue
+probe env: one producer, 24576-byte global staging slab, lightweight consumers
+correctness gates: bitwise identity at split counts 4, 16, 64, and 85
+profile artifact: results/profiles/current-plain-128k-n1.sqlite
+benchmark artifact: results/microbench/level_up_experiments.json
+expected bytes/launches removed: repeated q arithmetic; adds one launch and staging round trip
+observed kernel delta: never faster; equal only at split 85 under graph replay
+observed server delta: not run; standalone failed
+accepted or rejected: rejected
+reason: parallel q transforms are cheaper than publication and reload
+```
+
+### experiment 5 — deltanet prep transport
+
+```text
+hypothesis: stream prep through producer-push dsm into four state-stripe owners
+changed symbols: tools/microbench_dn_prep_flow.cu only
+control env: 226 mib global publication plus 755 mib stripe reads
+probe env: 705 mib producer-push dsm stores, 256 cluster barriers per head
+correctness gates: identical 48x4 output checksums
+profile artifact: results/profiles/current-plain-prefill-8k-n1.sqlite
+benchmark artifact: results/microbench/level_up_experiments.json
+expected bytes/launches removed: 226492416 global write bytes and one launch
+observed kernel delta: graph 1.341 ms -> 1.579 ms
+observed server delta: not run; standalone failed
+accepted or rejected: rejected
+reason: dsm fan-out, barriers, and 72 registers outweigh global traffic removal
 ```
 
 ## optional increment a — paged mtp
