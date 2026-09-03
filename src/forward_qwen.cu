@@ -11760,7 +11760,8 @@ __global__ void k_tq_nvf4_reduce(float *out, const float *part, int n, int ks) {
 // (ue4m3 spans 2^-6..2^8, so centring costs no dynamic range and avoids clipping).
 __global__ void k_tq_nvf4_global_from_e2m3(float *wglobal, const uint32_t *src,
                                            int M, int K, int Kt, int scale_cols,
-                                           const float *scale_old, int nrb) {
+                                           const float *scale_old, int nrb,
+                                           const uint16_t *fold_nw) {
     int rb = blockIdx.x;
     if (rb >= nrb) return;
     __shared__ float red[256];
@@ -11770,7 +11771,8 @@ __global__ void k_tq_nvf4_global_from_e2m3(float *wglobal, const uint32_t *src,
         if (r < M && k < K) {
             int scol = (scale_cols == (K + 31) / 32) ? (k >> 5) : (k >> 7);
             float so = scale_old[(r >> 7) * scale_cols + scol];
-            mx = fmaxf(mx, fabsf(tq_e2m3_decode(tq_e2m3_code_at(src, Kt, r, k)) * so));
+            float fw = fold_nw ? (1.0f + tq_bf16_to_float(fold_nw[k])) : 1.0f;
+            mx = fmaxf(mx, fabsf(tq_e2m3_decode(tq_e2m3_code_at(src, Kt, r, k)) * so * fw));
         }
     }
     red[threadIdx.x] = mx;
@@ -11786,7 +11788,7 @@ __global__ void k_tq_nvf4_global_from_e2m3(float *wglobal, const uint32_t *src,
 __global__ void k_tq_nvf4_pack_w_from_e2m3(uint32_t *a, const float *wglobal,
                                            const uint32_t *src, int M, int K, int Kt,
                                            int scale_cols, const float *scale_old,
-                                           int Mt, int Kt64) {
+                                           int Mt, int Kt64, const uint16_t *fold_nw) {
     long tile = (long)blockIdx.x;                      // (mt * Kt64 + kt)
     if (tile >= (long)Mt * Kt64) return;
     int mt = (int)(tile / Kt64), kt = (int)(tile % Kt64);
@@ -11794,12 +11796,14 @@ __global__ void k_tq_nvf4_pack_w_from_e2m3(uint32_t *a, const float *wglobal,
     uint32_t *dst = a + tile * TQ_NVF4_AW;
     float gs = wglobal[mt >> 3];
 
-    // dequantized source value at logical (row, k)
+    // dequantized source value at logical (row, k); stage-7 e2 optionally folds the
+    // consumer rmsnorm's per-channel (1 + nw[k]) into the requantized weight.
     auto srcval = [&](int row, int k) -> float {
         if (row >= M || k >= K) return 0.f;
         int scol = (scale_cols == (K + 31) / 32) ? (k >> 5) : (k >> 7);
         float so = scale_old[(row >> 7) * scale_cols + scol];
-        return tq_e2m3_decode(tq_e2m3_code_at(src, Kt, row, k)) * so;
+        float fw = fold_nw ? (1.0f + tq_bf16_to_float(fold_nw[k])) : 1.0f;
+        return tq_e2m3_decode(tq_e2m3_code_at(src, Kt, row, k)) * so * fw;
     };
 
     // 1. per-(row, 16-k-group) ue4m3 scale. 16 rows x 4 groups; lanes 0..15 own a row.
@@ -13584,7 +13588,20 @@ static int g_nvf4_any = 0;
 //                      what unsloth's mixed W8A8+W4A4 checkpoint does.
 // Unlike TQ_W_E2M1 (4-bit codes embedded in the k32 mxf8f6f4 MMA = memory win, ZERO
 // compute win) this tier reaches the k64 mxf4nvf4 instruction, so it wins both.
-static int nvf4_convert_weight(tq_qmma_weight_t *w, const char *what) {
+// Stage-7 e2 (TQ_NORM_FOLD=1): fold_nw != NULL folds the consumer rmsnorm's per-channel
+// (1 + nw[k]) into the requantized weight so the runtime can quantize raw activations
+// and apply the rms scalar after the GEMM. NULL keeps today's byte-identical behavior.
+static int norm_fold_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("TQ_NORM_FOLD");
+        cached = env ? atoi(env) : 0;
+    }
+    return cached;
+}
+
+static int nvf4_convert_weight(tq_qmma_weight_t *w, const char *what,
+                               const uint16_t *fold_nw = NULL) {
     if (!w->d_A || !w->e2m3 || w->e2m1 || w->e2m3_byte || w->row_major || w->word_major)
         return 0;
     if (w->nvf4) return 0;
@@ -13604,10 +13621,11 @@ static int nvf4_convert_weight(tq_qmma_weight_t *w, const char *what) {
         cudaFree(d_a); fprintf(stderr, "TQ_W_NVFP4: OOM on %s globals\n", what); return 0;
     }
     k_tq_nvf4_global_from_e2m3<<<nrb, 256, 0, g_qwen.stream>>>(
-        d_g, (const uint32_t *)w->d_A, M, K, Kt, w->scale_cols, w->d_block_scale_inv, nrb);
+        d_g, (const uint32_t *)w->d_A, M, K, Kt, w->scale_cols, w->d_block_scale_inv, nrb,
+        fold_nw);
     k_tq_nvf4_pack_w_from_e2m3<<<(unsigned)((size_t)Mt * Kt64), 32, 0, g_qwen.stream>>>(
         d_a, d_g, (const uint32_t *)w->d_A, M, K, Kt, w->scale_cols, w->d_block_scale_inv,
-        Mt, Kt64);
+        Mt, Kt64, fold_nw);
     if (cudaStreamSynchronize(g_qwen.stream) != cudaSuccess) {
         fprintf(stderr, "TQ_W_NVFP4: repack failed on %s: %s\n", what,
                 cudaGetErrorString(cudaGetLastError()));
@@ -13671,21 +13689,26 @@ static void maybe_nvf4_convert_all(void) {
     int n = 0;
     for (int i = 0; i < g_qwen.L; i++) {
         tq_layer_t *l = &g_qwen.layers[i];
-        if (gate) n += nvf4_convert_weight(&l->mlp_gate, "mlp_gate");
-        if (up)   n += nvf4_convert_weight(&l->mlp_up, "mlp_up");
-        if (down) n += nvf4_convert_weight(&l->mlp_down, "mlp_down");
+        // Stage-7 e2 (TQ_NORM_FOLD): fold the consumer rmsnorm's (1 + nw[k]) into the
+        // requantized NVFP4 weights of every norm-fed projection. Offline sim on the
+        // real norm vectors measured zero requant damage (relrms ratio 0.999-1.000).
+        const uint16_t *in_nw = norm_fold_enabled() ? l->d_input_ln : NULL;
+        const uint16_t *pn_nw = norm_fold_enabled() ? l->d_post_ln : NULL;
+        if (gate) n += nvf4_convert_weight(&l->mlp_gate, "mlp_gate", pn_nw);
+        if (up)   n += nvf4_convert_weight(&l->mlp_up, "mlp_up", pn_nw);
+        if (down) n += nvf4_convert_weight(&l->mlp_down, "mlp_down", NULL);
         if (delta) {
-            n += nvf4_convert_weight(&l->linear_in_qkv, "linear_in_qkv");
-            n += nvf4_convert_weight(&l->linear_in_z, "linear_in_z");
-            n += nvf4_convert_weight(&l->linear_in_b, "linear_in_b");
-            n += nvf4_convert_weight(&l->linear_in_a, "linear_in_a");
-            n += nvf4_convert_weight(&l->linear_out, "linear_out");
+            n += nvf4_convert_weight(&l->linear_in_qkv, "linear_in_qkv", in_nw);
+            n += nvf4_convert_weight(&l->linear_in_z, "linear_in_z", in_nw);
+            n += nvf4_convert_weight(&l->linear_in_b, "linear_in_b", in_nw);
+            n += nvf4_convert_weight(&l->linear_in_a, "linear_in_a", in_nw);
+            n += nvf4_convert_weight(&l->linear_out, "linear_out", NULL);
         }
         if (attn) {
-            n += nvf4_convert_weight(&l->q_proj, "q_proj");
-            n += nvf4_convert_weight(&l->k_proj, "k_proj");
-            n += nvf4_convert_weight(&l->v_proj, "v_proj");
-            n += nvf4_convert_weight(&l->o_proj, "o_proj");
+            n += nvf4_convert_weight(&l->q_proj, "q_proj", in_nw);
+            n += nvf4_convert_weight(&l->k_proj, "k_proj", in_nw);
+            n += nvf4_convert_weight(&l->v_proj, "v_proj", in_nw);
+            n += nvf4_convert_weight(&l->o_proj, "o_proj", NULL);
         }
     }
     g_nvf4_any = (n > 0);
