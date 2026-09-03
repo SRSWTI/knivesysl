@@ -423,15 +423,38 @@ one-wave split heuristic gave each sequence only s=22 splits at n=4.
   the remaining attention inefficiency (~2.8-3.6x above the kv traffic floor) is a
   memory-path property, promoted to its own rung below.
 
-### remaining rung — attention v3 memory path
+### ~~remaining rung — attention v3 memory path~~ — refuted 2026-09-03
 
-decode attention reads ~55 mb per layer-step at 32k n=1 in 87 us (~635 gb/s effective,
-2.8x the traffic floor); at n=4 efficiency drops further (~3.6x). the arithmetic order is
-frozen (byte-exact contract), so v3 is a staging/layout rewrite only: wider per-thread
-loads, scale-layout locality, multi-pool interleave. potential: ~1 ms/step at 32k n=1,
-~3-4 ms at 128k n=1 and at deep batch. this is the only kernel lever left with >5%
-reach across every cell.
+the thesis said decode attention was memory-inefficient (~640 gb/s effective versus the
+gemm's 1.56 tb/s). `tools/microbench_attn_bw.cu` (experiment 10) replicated the exact
+pool layout, grid, smem budget, and pipeline against synthetic pools and toggled one
+mechanism at a time. the staging path alone sustains **1.6-3.6 tb/s** — the memory path
+was never the limiter. the kernel is **compute/latency-bound in its score phase** (~60%
+of kernel time; bisect at 32k n=1: dequant ~13 us, shfl trees ~15 us, dots/smem ~32 us
+per layer — diffuse, no dominant sub-part). block-table hoisting and two-row interleave
+are neutral-to-negative; deeper pipelines are irrelevant. production additionally runs
+~25% slower than the isolated probe at n=4, consistent with gemm-phase power/clock
+interaction rather than anything kernel-addressable.
 
+**v2 is held at its structural floor.** every parallelism-increasing dot restructure
+(multi-warp splits, tensor-core scores) changes the frozen reduction association and
+breaks the byte-exact greedy law this repo enforces. remaining in-law headroom is
+~10-15% of attention time (~1-2% of a step) via dequant micro-optimization — below the
+rung gate.
+
+### decision fork — where the next 10% has to come from
+
+plain decode is now at the architecture's frontier on all four owners: gemm (roofline),
+projection boundary (six rejected fusions), scheduler (policy sweep optimal), attention
+(this probe). the two remaining paths to more plain speed are policy decisions, not
+engineering ones:
+
+1. **association re-baseline**: authorize a one-time re-reference of the greedy gates
+   (tf-top1 parity + fresh stored completions) so a multi-warp or tensor-core score path
+   can chase the ~135 us/layer staging floor at deep batch (+10-12% on the batch cells).
+   costs byte-continuity with every stored v1/v2 reference.
+2. **accept the plain frontier** and take the overtake on the differentiator matrix
+   (n-gram, paged mtp, apc) where the engine already wins by construction.
 
 ## stage 5 — deltanet and prefill dataflow
 
@@ -653,6 +676,24 @@ observed server delta: every variant loses 2.3-6.7 aggregate tok/s
 accepted or rejected: rejected; default policy retained
 reason: 2048-col waves win 11-12% prefill throughput per depth; idle-gated decode steps
   burn full weight passes at low occupancy; co-scheduling already exists and is optimal
+```
+
+### experiment 10 — attention v2 bandwidth probe
+
+```text
+hypothesis: decode attention is memory-inefficient; a staging/layout rewrite recovers 2-3x
+changed symbols: tools/microbench_attn_bw.cu only
+control env: exact v2 replica (clone) against synthetic production-layout pools
+probe env: variants: noprep / nocompute / scoresonly / foldonly / hoistbt / direct / ilv2 / nodeq / noshfl
+correctness gates: n/a; time-faithful replica, numerics synthetic
+profile artifact: results/microbench/level_up_experiments.json (attn_v2_bandwidth_probe)
+benchmark artifact: same
+expected bytes/launches removed: n/a
+observed kernel delta: staging alone 1.6-3.6 tb/s; score phase ~60% of time and diffuse
+observed server delta: n/a
+accepted or rejected: rejected; v2 held at structural floor under the association law
+reason: the memory-path thesis is false; compute restructures that would help change the
+  frozen reduction association and break the byte-exact greedy gates
 ```
 
 ## optional increment a — paged mtp
