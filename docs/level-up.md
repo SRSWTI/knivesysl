@@ -359,7 +359,7 @@ plain-parity priority. q/k preparation may still be fused into the already-manda
 current-row writer if a later attention rewrite needs it, but that work must keep kv bytes,
 page/apc ownership, and short/2k/32k outputs unchanged.
 
-## stage 4 — batch scheduler: chunked prefill co-scheduling
+## stage 4 — batch scheduler
 
 stage-4 traces exist now (`results/profiles/server-32k4.nsys-rep`, `server-8k4.nsys-rep`,
 experiment 7). they overturn the old framing: the batch deficit is not host overlap and
@@ -371,29 +371,44 @@ loop, stalling every active decode:
 | 32k x4 | 24.3% of a 38.45 s span | 3.0% (0.66 ms/step) | 370 ms | 4.71 s |
 | 8k x4 | 6.6% of a 19.87 s span | 4.1% (0.65 ms/step) | 17.4 ms | 0.91 s |
 
-the 32k x4 aggregate deficit versus vllm is 22.3%; prefill-in-window alone is 24.3%.
-64k x4 and 128k x2 sit near parity because those windows contain fewer admissions, not
-because anything else differs. this is the primary remaining rung.
+the 32k x4 aggregate deficit versus vllm was 22.3%; prefill-in-window alone is 24.3%.
+64k x4 and 128k x2 sat near parity because those windows contain fewer admissions, not
+because anything else differs. the sections below record where this rung actually went.
 
-### primary rung — chunked prefill interleaved with decode
+### measured outcome — 2026-09-03
 
-- split every admission prefill into budget-bounded column chunks (the ragged batched
-  prefill abi already carries per-segment `seg_final`, so partial segments exist);
-- between chunks, run one decode step for all active slots;
-- deepest-first or fair chunk ordering, measured, not assumed;
-- no wave-composition change inside the engine for the first rung: policy lives in the
-  server loop;
-- gates: byte-exact greedy 2k/32k, itl p99 collapse at 32k x4 (370 ms -> under 60 ms),
-  aggregate 32k x4 at or above vllm's 103.2, ttft regression bounded and reported.
+the trace led somewhere unexpected. following the contended windows into per-client
+timelines showed both engines run the same schedule shape (mean decode concurrency 2.77
+vllm vs 2.87 ours); the whole 32k x4 gap was contended itl: 23.4 ms versus 17.9 ms p50,
+ratio 1.31, matching the 1.285 aggregate ratio. splitting the steady n=4 step by kernel
+found paged attention at 8.08 ms versus 1.40 ms solo — x5.8 for x4 slots — because the
+one-wave split heuristic gave each sequence only s=22 splits at n=4.
 
-### secondary rung — host overlap
+- ~~chunked prefill interleaved with decode~~: measured and rejected. budget 1024 -> 82.3,
+  budget 1024 + idle 60 ms -> 81.0, budget 512 + idle 60 ms -> 77.9, default -> 84.6.
+  smaller chunks lose more prefill throughput than the stalls they recover; the existing
+  ride+idle policy is aggregate-optimal (chunking would only buy itl fairness).
+- ~~two-iteration host overlap~~: parked. host idle is 3-4% (0.65 ms/step); it cannot
+  close any cell and carries buffer-ownership risk. revisit only as acceptance polish.
+- **flow-split batched decode: accepted and shipped** (`00f6e85`). `paged_split_S_gqa_v2`
+  now targets ~384 rows per split cta at n>=2 (cap 192), n=1 untouched. isolated steps:
+  4x32k 23.2 -> 21.0, 4x64k 31.3 -> 26.5, 2x128k 31.0 -> 26.4 ms. server cells:
+  32k x4 80.3 -> 84.6, 65k x4 38.9 -> 42.3 (now +3.2% over vllm), 128k x2 20.1 -> 21.4
+  (now +2.9% over vllm). greedy 2k/32k n=1 byte-exact; n=4 concurrent outputs vary within
+  pre-existing admission-timing nondeterminism (same-build run-to-run differs equally).
+- pav2 chunk/stage knobs at batch: flat (21.07-21.09 ms across ch 24/32/48 x nst 2/3).
+  the remaining attention inefficiency (~2.8-3.6x above the kv traffic floor) is a
+  memory-path property, promoted to its own rung below.
 
-host idle is 3-4% (0.65 ms/step): prepare step t+1 while the gpu runs t, relay the next
-token through device-resident storage, keep sampling/cancellation order. worth its 3-4%,
-but it cannot close the batch cells alone. graph replay previously moved about 1% at n=1
-for the same reason.
+### remaining rung — attention v3 memory path
 
-accept only an end-to-end win with unchanged outputs and no request-starvation regression.
+decode attention reads ~55 mb per layer-step at 32k n=1 in 87 us (~635 gb/s effective,
+2.8x the traffic floor); at n=4 efficiency drops further (~3.6x). the arithmetic order is
+frozen (byte-exact contract), so v3 is a staging/layout rewrite only: wider per-thread
+loads, scale-layout locality, multi-pool interleave. potential: ~1 ms/step at 32k n=1,
+~3-4 ms at 128k n=1 and at deep batch. this is the only kernel lever left with >5%
+reach across every cell.
+
 
 ## stage 5 — deltanet and prefill dataflow
 
@@ -580,6 +595,41 @@ observed server delta: prefill occupies 24.3% (32k x4) / 6.6% (8k x4) of decode 
   host idle 3.0-4.1%; step max 4.71 s during a single serialized admission
 accepted or rejected: accepted; chunked prefill co-scheduling becomes the primary rung
 reason: prefill-in-window fraction alone matches the 22.3% aggregate deficit at 32k x4
+```
+
+### experiment 8 — flow-split batched decode
+
+```text
+hypothesis: batched decode attention under-splits; more splits per sequence recover it
+changed symbols: src/forward_qwen.cu paged_split_S_gqa_v2 (n>=2 branch only)
+control env: auto heuristic (one 2-cta/sm wave; s=22 at 4x32k)
+probe env: TQ_PAGED_SPLIT forced sweep, then s = max(s_occ, total/384) cap 192
+correctness gates: greedy 2k/32k n=1 byte-exact vs pre-change build; n=1 formula untouched
+profile artifact: results/profiles/server-32k4.sqlite (steady-window attribution)
+benchmark artifact: specmatrix_core-nvfp4-off-v2-split384{,-b2100,-n2}.json
+expected bytes/launches removed: none; same traffic, more concurrent streams
+observed kernel delta: 4x32k 23.16 -> 21.05 ms; 4x64k 31.29 -> 26.50; 2x128k 31.03 -> 26.38
+observed server delta: 32k x4 +5.4%; 65k x4 +8.7% and 128k x2 +6.5% now lead vllm
+accepted or rejected: accepted (commit 00f6e85)
+reason: first accepted rung; measured plateau s~88-288 confirms ~384 rows/cta is robust
+```
+
+### experiment 9 — contention scheduling policy sweep
+
+```text
+hypothesis: smaller prefill chunks plus forced decode cadence lift 32k x4 aggregate
+changed symbols: none; serve_batched.py cli knobs only
+control env: default budget 2048, decode idle gate 250 ms -> 84.6 agg
+probe env: budget 1024 -> 82.3; budget 1024 + idle 60 -> 81.0; budget 512 + idle 60 -> 77.9
+correctness gates: n/a (policy only)
+profile artifact: n/a
+benchmark artifact: results/microbench/level_up_experiments.json
+expected bytes/launches removed: n/a
+observed kernel delta: n/a
+observed server delta: every variant loses 2.3-6.7 aggregate tok/s
+accepted or rejected: rejected; default policy retained
+reason: 2048-col waves win 11-12% prefill throughput per depth; idle-gated decode steps
+  burn full weight passes at low occupancy; co-scheduling already exists and is optimal
 ```
 
 ## optional increment a — paged mtp
