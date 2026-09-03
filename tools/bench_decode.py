@@ -15,6 +15,7 @@ Emits:  DEC N=<n> P=<p> ms_step=<f> tok_s=<f> pf_tok_s=<f>
 """
 from __future__ import annotations
 import argparse, ctypes, glob, os, time
+import nvtx
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("TQ_WIDE_PREFILL", "1")
@@ -43,6 +44,7 @@ ap.add_argument("--cases", default="1:2048,4:2048,8:2048,16:2048,32:2048",
                 help="comma-separated <concurrency>:<context> cases")
 ap.add_argument("--wave", type=int, default=256, help="prefill columns per wave")
 ap.add_argument("--profile", action="store_true")
+ap.add_argument("--nvtx", action="store_true", help="bracket timed decode as the NVTX range 'decode'")
 ap.add_argument("--slots", type=int, default=0, help="force pool slots (0 = size to the case)")
 ap.add_argument("--blocks", type=int, default=0, help="force pool blocks (0 = size to the case)")
 args = ap.parse_args()
@@ -125,6 +127,7 @@ for (N, P) in cases:
             sd[c] = out[c]; spos[c] = spos[c] + 1
     rt = ctypes.CDLL("libcudart.so") if args.profile else None
     if rt: rt.cudaProfilerStart()
+    if args.nvtx: nvtx.push_range("decode")
     t0 = time.time()
     for _ in range(args.steps):
         ck(L.qwn_paged_decode_step(sd, ssl, spos, N, out), "step")
@@ -132,6 +135,7 @@ for (N, P) in cases:
             sd[c] = out[c]; spos[c] = spos[c] + 1
     dt = (time.time() - t0) / args.steps
     if rt: rt.cudaProfilerStop()
+    if args.nvtx: nvtx.pop_range()
     L.qwn_paged_stats(ctypes.byref(fb), ctypes.byref(tb), ctypes.byref(pg), ctypes.byref(mb))
     print(f"{N:4d} {P:7d} {pf:10.2f} {N*P/pf:9.0f} {dt * 1e3:9.2f} {N / dt:9.1f} "
           f"{tb.value - fb.value:5d}/{tb.value:5d}", flush=True)
