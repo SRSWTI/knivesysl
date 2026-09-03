@@ -502,6 +502,107 @@ repeats. do not count n-gram, mtp, or apc hits.
 one matrix is not enough to claim robustness. repeat the winner after a clean server boot
 and retain min/median/max plus raw samples.
 
+## stage 7 — own-math campaign
+
+the twelve-experiment ladder closed every lane that respected the frozen byte-exact
+association law. this stage is the authorized continuation: redesign the arithmetic and
+dataflow itself, flashattention-style — decide what never needs to exist in dram, what
+statistics can be carried incrementally, and which units should own which math — then
+re-baseline the correctness references under an explicit quality gate.
+
+### new correctness law for this stage
+
+- byte-continuity with the v1/v2 stored references is *not* required for accepted rungs;
+- every rung must pass: tf-top1 within 0.1 of the format's recorded score (nvfp4 85.78,
+  fp6 91.30), greedy 2k/32k outputs manually inspected and coherent, and a fresh stored
+  reference minted at acceptance (the new law's anchor);
+- rejected rungs leave the engine byte-identical (env-gated, default off until accepted).
+
+### the atomic decode budget (2k n=1, 15.35 ms/token, measured)
+
+| part | ms/token | verdict from stages 0-6 |
+|---|---:|---|
+| nvfp4 projection gemms (496) | 9.75 | 87% dram roofline; closed at n=1 |
+| activation quantizers (256) | 1.70 | latency-bound two-pass, serialized behind rms |
+| paged attention v2 (16) | 1.40 | compute-bound score phase; memory path proven fast |
+| deltanet decode (48 x 3 kernels) | ~0.55 | 290 mb/token fp32 state round trip |
+| split reducers (352) | 0.26 | execution floor |
+| rms/residual family (128+64) | 0.36 | execution floor |
+| fp6 lm head (1) | 0.57 | roofline |
+| host + dispatch | 0.64 | graph exists; python residual parked |
+
+### e1 — tensor-core attention decode (flagship)
+
+flashattention's move was to never materialize the score matrix and carry softmax
+statistics incrementally. our analogue: never run score/fold arithmetic on scalar fma
+lanes at all. the mxf8f6f4 tensor cores that already execute every projection gemm can
+execute the attention chunk too:
+
+- store k in the nvfp4 row format (e2m1 codes + ue4m3 g16 scales) instead of int4-asym
+  g32; per 24-row chunk the 6-head score block becomes a short m16n8k64 mma chain
+  (~5 instructions) instead of ~500 scalar fma per warp;
+- v is already e4m3: the fold becomes probability-vector x v8 mma with per-chunk
+  quantized probabilities;
+- online softmax statistics (m_run, l_run, alpha rescale) stay fp32 in smem, carried
+  incrementally exactly as today — the fa invariant is preserved, only the inner
+  products change owner;
+- asymmetric-zp folding is unnecessary once k is e2m1 (symmetric grid); hadamard
+  rotation is orthogonal and stays;
+- probe first on synthetic pools against the stage-6 clone (score phase 3.1 us -> target
+  ~0.4 us/chunk); then a dual-format kv writer experiment; then TQ_PAGED_ATTN_V3.
+
+expected reach: attention 8.08 -> ~2.5-3.5 ms at 4x32k (+10-14% on the three losing
+deep-batch cells), 1.40 -> ~0.7 ms at 32k n=1. quality: k requantization e2m1-g16 vs
+int4-g32 measured by tf-top1 before any engine work.
+
+### e2 — norm-folded quantization algebra
+
+rmsnorm is `x * fac * (1 + nw[k])` with fac a per-row scalar. fold the static
+per-channel `(1 + nw[k])` into the nvfp4 weight tiles offline (`W'[k,:] = W[k,:] *
+(1 + nw[k])`), and apply the scalar fac *after* the gemm instead of before
+quantization:
+
+- nvfp4 group scales absorb a scalar exactly up to e4m3 scale rounding, so activation
+  codes are chosen on unnormalized x;
+- the rms reduction leaves the critical path entirely — it runs concurrent with the
+  gemm that consumes the same activation;
+- the quantizer loses its fac dependency, which removes the barrier that killed every
+  stage-2 epilogue fusion: quant can now fuse into the split-k reduce where the values
+  already sit in registers, with no global synchronization at all;
+- kills: rms_fac/add_rms_fac launches (0.21 ms), the reduce->rms->quant serialization,
+  and most of the quantizer reread (target 0.8-1.5 ms/token at n=1).
+
+rungs: (a) offline W' converter + tf-top1 gate (weight-group distortion from per-k
+scaling is the risk to measure first); (b) code-drift probe on unnormalized-x
+quantization; (c) engine gate TQ_NORM_FOLD with the fused reduce+quant epilogue.
+
+### e3 — l2 weight prestream (in-law, first)
+
+attention + deltanet phases leave dram ~60% idle for ~2.2 ms/token while they compute.
+a low-priority side-stream toucher (or `cp.async.bulk.prefetch`) walks the next
+layer-group's weight bytes during those windows so the following gemms hit l2-warm
+lines; 128 mb l2 holds more than one full attention-layer group. read-only, byte-exact
+by construction, no new law needed. expected +2-5% at n=1; rungs: standalone probe
+(gemv stream timed with and without a concurrent prefetcher), then an engine side
+stream behind TQ_L2_PRESTREAM.
+
+### e4 — deltanet decode three-kernel fuse
+
+conv update -> recurrent core -> gated norm run as three launches per gdn layer with
+tiny n=1 intermediates. unlike the rejected projection fusions there is no cross-tile
+reduction barrier here; the honest prior is still cautious after seven fusion
+rejections. target 0.15-0.3 ms/token; reject fast if the probe disagrees.
+
+### e5 — host overlap (parked)
+
+0.65 ms/step; revisit only after e1-e4 settle.
+
+### order and stop rule
+
+e3 -> e2 -> e1 -> e4 -> e5. each rung keeps the experiment-record header, ships
+env-gated, and is struck through here with its numbers if it loses. the stage ends when
+either every losing cell is at >=1.00x vllm plain, or every rung has a recorded verdict.
+
 ## experiment record
 
 use this header for every rung:
