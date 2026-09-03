@@ -25673,6 +25673,17 @@ static int paged_split_S_gqa_v2(int N, int max_pos) {
     if (blocks0 < 1) blocks0 = 1;
     if (total < 1024) return 1;
     int s_occ = (2 * sm + blocks0 - 1) / blocks0;        // one wave at 2 CTAs/SM
+    if (N >= 2) {
+        // Batched decode: one 2-CTA/SM wave under-splits badly (4x32k measured
+        // 23.2 -> 21.0 ms/step, 4x64k 31.3 -> 26.5, 2x128k 31.0 -> 26.4 by
+        // forcing more splits; plateau S~88..288). ~384 rows per split CTA
+        // recovers it; n=1 keeps the wave-aligned heuristic below unchanged.
+        int s_flow = (total + 383) / 384;
+        int S = s_occ > s_flow ? s_occ : s_flow;
+        if (S < 1) S = 1;
+        if (S > 192) S = 192;
+        return S;
+    }
     int s_work = total / 512;
     int S = s_occ < s_work ? s_occ : s_work;
     if (S < 1) S = 1;
