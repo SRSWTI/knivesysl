@@ -10,7 +10,7 @@ proof that the plain target-model path is fast.
 
 ## the line we are trying to cross
 
-current nvfp4-all plain performance, no prefix cache, gen 512, three-repeat medians:
+baseline at campaign start (2026-09-02), no prefix cache, gen 512, three-repeat medians:
 
 | context | vllm plain | knivesysl plain | plain gap |
 |---:|---:|---:|---:|
@@ -23,6 +23,29 @@ current nvfp4-all plain performance, no prefix cache, gen 512, three-repeat medi
 | 32k x4 | 103.2 aggregate | 80.2 aggregate | -22.3% |
 | 64k x4 | 41.0 aggregate | 38.9 aggregate | -5.1% |
 | 128k x2 | 20.8 aggregate | 20.1 aggregate | -3.4% |
+
+### current standing — 2026-09-03, after the flow-split rung (00f6e85)
+
+| cell | vllm plain | knivesysl plain | ratio |
+|---:|---:|---:|---:|
+| 2k x1 | 71.7 | 66.0 | 0.92 |
+| 8k x1 | 72.1 | 64.7 | 0.90 |
+| 32k x1 | 69.8 | 63.8 | 0.91 |
+| 64k x1 | 65.9 | 58.7 | 0.89 |
+| 128k x1 | 57.8 | 50.9 | 0.88 |
+| 2k x2 | 130.3 | **133.4** | **1.02 — we lead** |
+| 8k x2 | 123.2 | 116.4 | 0.94 |
+| 32k x2 | 87.3 | 74.4 | 0.85 |
+| 64k x2 | 50.8 | 45.8 | 0.90 |
+| 128k x2 | 20.8 | **21.4** | **1.03 — we lead** |
+| 2k x4 | 246.0 | 234.9 | 0.95 |
+| 8k x4 | 204.8 | 180.7 | 0.88 |
+| 32k x4 | 103.2 | 84.6 | 0.82 |
+| 64k x4 | 41.0 | **42.3** | **1.03 — we lead** |
+
+three cells lead, median ratio 0.90. the largest remaining deficits (32k x2/x4, 8k x4)
+are owned by decode-attention memory efficiency (stage 4's remaining rung), not by
+scheduling and not by the projection boundary.
 
 single-stream parity requires roughly 1.25-2.66 ms less work per token. prefill is the
 larger gap: about 24-25% at 2k/8k, 20% at 32k, 16% at 64k, and 10% near 128k.
