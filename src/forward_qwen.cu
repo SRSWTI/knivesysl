@@ -26733,7 +26733,12 @@ static size_t paged_ckpt_row_bytes(void) {
 
 static size_t paged_ckpt_host_budget(void) {
     const char *e = getenv("TQ_CKPT_HOST_GB");
-    double g = e ? atof(e) : 8.0;
+    // Default 0 (opt-in): demote/promote run cudaHostAlloc + full-image copies
+    // SYNCHRONOUSLY inside the engine loop (via _ck_evict_one / _admit). 2026-09-03:
+    // twice wedged production at ~120K-token sessions (churn then engine freeze at
+    // 0% GPU). Revisit under Track D with validated async transfer + off-loop
+    // scheduling before re-enabling anywhere user-facing.
+    double g = e ? atof(e) : 0.0;
     if (g < 0) g = 0;
     return (size_t)(g * 1073741824.0);
 }

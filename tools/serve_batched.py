@@ -24,7 +24,7 @@ Run (GPU7, prod Q4):
   CUDA_VISIBLE_DEVICES=7 TQ_CTX=131072 TQ_KV_Q4=1 python3 -u tools/serve_batched.py --port 8100
 """
 from __future__ import annotations
-import argparse, ctypes, json, os, threading, time, queue, uuid
+import argparse, ctypes, faulthandler, json, os, signal, threading, time, queue, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -939,13 +939,18 @@ def make_handler(eng, tok, args):
                                     "allow_search_indices": False, "allow_view": True,
                                     "allow_fine_tuning": False, "organization": "*",
                                     "group": None, "is_blocking": False}]}]})
-            elif self.path.startswith("/health"):
+            elif self.path.startswith("/health") or self.path.startswith("/v1/healthz"):
                 fb, tb, _, _ = eng._stats()
+                last_wave_age_s = None
+                if eng.wavelog:
+                    last_wave_age_s = max(0.0, time.monotonic() - eng.wavelog[-1][0])
                 self._json(200, {"status": "ok", "free_blocks": fb, "total_blocks": tb,
                                  "active": len(eng.active), "prefilling": len(eng.pref),
                                  "queued": len(eng.q), "steps": eng.steps,
                                  "decoded_tokens": eng.decoded_tokens,
                                  "prefilled_tokens": eng.prefilled_tokens,
+                                 "engine_thread_alive": eng.thread.is_alive(),
+                                 "last_wave_age_s": last_wave_age_s,
                                  "prefix_cache": {"enabled": eng.pc_enabled,
                                                   "prefix_tokens": sum(c["pos"] for c in eng.cks),
                                                   "checkpoints": len(eng.cks),
@@ -1232,6 +1237,10 @@ def make_handler(eng, tok, args):
 
 
 def serve(args):
+    try:
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+    except Exception:
+        pass
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
     L = load_lib(args.lib)          # this also publishes the engine's wave cap
