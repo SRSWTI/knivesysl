@@ -555,26 +555,32 @@ expected reach: attention 8.08 -> ~2.5-3.5 ms at 4x32k (+10-14% on the three los
 deep-batch cells), 1.40 -> ~0.7 ms at 32k n=1. quality: k requantization e2m1-g16 vs
 int4-g32 measured by tf-top1 before any engine work.
 
-### e2 — norm-folded quantization algebra
+### ~~e2 — norm-folded quantization algebra~~ — closed 2026-09-03, one survivor
 
-rmsnorm is `x * fac * (1 + nw[k])` with fac a per-row scalar. fold the static
-per-channel `(1 + nw[k])` into the nvfp4 weight tiles offline (`W'[k,:] = W[k,:] *
-(1 + nw[k])`), and apply the scalar fac *after* the gemm instead of before
-quantization:
+the full teacher-forced ladder (paged-path tf gate, p=2048, s=1024, chunk-width control
+band: agreement 91.3%, top1 drift -0.19):
 
-- nvfp4 group scales absorb a scalar exactly up to e4m3 scale rounding, so activation
-  codes are chosen on unnormalized x;
-- the rms reduction leaves the critical path entirely — it runs concurrent with the
-  gemm that consumes the same activation;
-- the quantizer loses its fac dependency, which removes the barrier that killed every
-  stage-2 epilogue fusion: quant can now fuse into the split-k reduce where the values
-  already sit in registers, with no global synchronization at all;
-- kills: rms_fac/add_rms_fac launches (0.21 ms), the reduce->rms->quant serialization,
-  and most of the quantizer reread (target 0.8-1.5 ms/token at n=1).
+| variant | tf-top1 | verdict |
+|---|---:|---|
+| reference | 77.46 | — |
+| weights folded + raw-x quant (e2) | 69.26 | rejected: group absmax reallocates precision away from the channels nw amplifies — the offline group-rms sim (ratio 1.000) measured the wrong thing |
+| fac deferred, both sites (e2') | 68.39 | rejected |
+| fac deferred, mlp site only (two independent implementations) | 72.39 / 72.39 | rejected: implementation-independent — the post_ln boundary squares the deferred scalar through silu(fac·g)·(fac·u) with no downstream re-normalization |
+| **fac deferred, input_ln site only** | **77.46** | **accepted: exactly reference; q/k head norms and gdn core norms re-normalize the scalar away** |
 
-rungs: (a) offline W' converter + tf-top1 gate (weight-group distortion from per-k
-scaling is the risk to measure first); (b) code-drift probe on unnormalized-x
-quantization; (c) engine gate TQ_NORM_FOLD with the fused reduce+quant epilogue.
+a real dispatch bug was found en route (`nvf4_quant_ensure` dropped `(1+nw)` whenever
+fac was NULL — 0% top1) and fixed.
+
+the payoff probe then made history in this codebase: the **barrier-free** fused boundary
+(dsm fold + residual add + register-resident quant with only the static `(1+nw)` + a
+per-tile sumsq partial, zero spins) is the FIRST fusion to beat the launched chain —
+graph 105.3 -> 102.9 us at ks=4, residual bitwise-exact. the fac barrier was the entire
+cost of the seven earlier fusion rejections.
+
+the honest close: only the 64 down-proj boundaries/step qualify (the o-proj residual
+feeds the rejected post_ln site), so the model is ~0.14 ms/token (+0.9%) — below the
+0.5 ms/token integration gate. `TQ_NORM_FOLD` bit 1 ships default-off; the nobar
+contract is the recorded primitive for any future boundary rework.
 
 ### ~~e3 — l2 weight prestream~~ — probe accepted, integration refuted 2026-09-03
 

@@ -418,6 +418,111 @@ k_fused_epi(const uint32_t *codes, const uint32_t *scales,
     }
 }
 
+// Stage-7 e2 bit-1 payoff shape: with the rms scalar deferred (quant needs only the
+// static (1+nw)), the boundary fuses with NO synchronization at all: DSM fold +
+// residual add + register-resident quant + a per-tile sumsq partial. A trailing
+// one-thread kernel folds the 40 partials into fac for the NEXT gemm's scalar.
+template <int KS>
+__global__ void __launch_bounds__(256, 2)
+k_fused_nobar(const uint32_t *codes, const uint32_t *scales,
+              const float *__restrict__ x, int K,
+              const float *__restrict__ resid_in, const uint16_t *__restrict__ nw,
+              float *__restrict__ resid_out, uint32_t *__restrict__ qout,
+              float *__restrict__ sumsq_part) {
+    __shared__ float p_half[2 * TILE_ROWS];
+    __shared__ float p_out[TILE_ROWS];
+    __shared__ float mailbox[KS > 1 ? (KS - 1) * TILE_ROWS : 1];
+    __shared__ float tile_vals[TILE_ROWS];
+    cg::cluster_group cluster = cg::this_cluster();
+    const int rank = (int)cluster.block_rank();
+    const int tile = blockIdx.x / KS;
+    const int tid  = threadIdx.x;
+    WeightBuf w{codes, scales};
+    producer_partial<KS>(w, x, K, tile, rank, p_half, p_out);
+    if (KS > 1) {
+        if (rank != 0) {
+            float *dst = cluster.map_shared_rank(mailbox, 0);
+            if (tid < TILE_ROWS) dst[(rank - 1) * TILE_ROWS + tid] = p_out[tid];
+        }
+        cluster.sync();
+        if (rank != 0) return;
+    }
+    if (tid < TILE_ROWS) {
+        float acc = p_out[tid];
+        for (int s = 1; s < KS; s++) acc += mailbox[(s - 1) * TILE_ROWS + tid];
+        int gi = tile * TILE_ROWS + tid;
+        float v = resid_in[gi] + acc;
+        resid_out[gi] = v;
+        tile_vals[tid] = v;
+    }
+    __syncthreads();
+    // per-tile sumsq partial (order-free for the deferred scalar's tolerance class)
+    float ss = (tid < TILE_ROWS) ? tile_vals[tid] * tile_vals[tid] : 0.f;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, off);
+    if ((tid & 31) == 0) p_half[tid >> 5] = ss;
+    __syncthreads();
+    if (tid == 0) {
+        float t = 0.f;
+        for (int i = 0; i < 8; i++) t += p_half[i];
+        sumsq_part[tile] = t;
+    }
+    // quantize with (1+nw) only: no factor wait, values already in smem
+    if (tid < 64) {
+        int kt_local = tid >> 5;
+        int lane = tid & 31;
+        int kt = tile * 2 + kt_local;
+        uint32_t *dst = qout + (size_t)kt * NVF4_BW;
+        __shared__ float sc_sh[2][8][4];
+        if (lane < 8) {
+            uint32_t wword = 0;
+            for (int g = 0; g < 4; g++) {
+                float mx = 0.f;
+                if (lane == 0) {
+                    for (int t = 0; t < 16; t++) {
+                        int k = kt * 64 + g * 16 + t;
+                        int local = k - tile * TILE_ROWS;
+                        float v = tile_vals[local] * (1.0f + bf16_to_float(nw[k]));
+                        mx = fmaxf(mx, fabsf(v));
+                    }
+                }
+                uint8_t sb = f2ue4m3(mx / 6.0f);
+                if (sb == 0) sb = 1;
+                wword |= (uint32_t)sb << (8 * g);
+                sc_sh[kt_local][lane][g] = ue4m3_to_f(sb);
+            }
+            dst[64 + lane] = wword;
+        }
+        __syncwarp();
+        uint32_t words[2] = {0, 0};
+        int col = lane >> 2;
+        for (int reg = 0; reg < 2; reg++) {
+            for (int j = 0; j < 8; j++) {
+                int k = nvf4_b_k(lane, reg, j);
+                int gk = kt * 64 + k;
+                float v = 0.f;
+                if (col == 0) {
+                    int local = gk - tile * TILE_ROWS;
+                    v = tile_vals[local] * (1.0f + bf16_to_float(nw[gk]));
+                }
+                float s = sc_sh[kt_local][lane >> 2][k >> 4];
+                words[reg] |= quant_e2m1_code(s > 0.f ? v / s : 0.f) << (4 * j);
+            }
+        }
+        dst[lane * 2 + 0] = words[0];
+        dst[lane * 2 + 1] = words[1];
+    }
+}
+
+__global__ void k_fac_combine(const float *__restrict__ sumsq_part, float *__restrict__ fac,
+                              int ntiles, int N) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        float t = 0.f;
+        for (int i = 0; i < ntiles; i++) t += sumsq_part[i];
+        fac[0] = rsqrtf(t / (float)N + RMS_EPS);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Host harness.
 // ---------------------------------------------------------------------------
@@ -524,6 +629,27 @@ static void run_case(int K, int iters, int warmup) {
                                    d_resid_in, d_nw, ctl, pass));
     };
 
+    float *d_resid_nb = NULL, *d_fac_nb = NULL, *d_sumsq = NULL;
+    uint32_t *d_q_nb = NULL;
+    CUDA_OK(cudaMalloc(&d_resid_nb, M_DIM * 4));
+    CUDA_OK(cudaMalloc(&d_fac_nb, 4));
+    CUDA_OK(cudaMalloc(&d_sumsq, N_TILES * 4));
+    CUDA_OK(cudaMalloc(&d_q_nb, (size_t)KT64_OUT * NVF4_BW * 4));
+    CUDA_OK(cudaMemset(d_q_nb, 0, (size_t)KT64_OUT * NVF4_BW * 4));
+    auto launch_nobar = [&](cudaStream_t st) {
+        cudaLaunchConfig_t cfg{};
+        cfg.gridDim = dim3(N_TILES * KS, 1, 1);
+        cfg.blockDim = dim3(256, 1, 1);
+        cfg.stream = st;
+        cudaLaunchAttribute attr[1];
+        attr[0].id = cudaLaunchAttributeClusterDimension;
+        attr[0].val.clusterDim.x = KS; attr[0].val.clusterDim.y = 1; attr[0].val.clusterDim.z = 1;
+        cfg.attrs = attr; cfg.numAttrs = 1;
+        CUDA_OK(cudaLaunchKernelEx(&cfg, k_fused_nobar<KS>, d_codes, d_scales, d_x, K,
+                                   d_resid_in, d_nw, d_resid_nb, d_q_nb, d_sumsq));
+        k_fac_combine<<<1, 32, 0, st>>>(d_sumsq, d_fac_nb, N_TILES, M_DIM);
+    };
+
     // Correctness pass.
     launch_control(stream);
     pass_no += 1;
@@ -603,14 +729,50 @@ static void run_case(int K, int iters, int warmup) {
         CUDA_OK(cudaGraphExecDestroy(ge));
         CUDA_OK(cudaGraphDestroy(g));
     }
+    float nobar_eager_us = -1.f, nobar_graph_us = -1.f;
+    long resid_nb_mm = -1;
+    float fac_nb_h = 0.f;
+    {
+        launch_nobar(stream);
+        CUDA_OK(cudaStreamSynchronize(stream));
+        std::vector<float> r_nb(M_DIM);
+        CUDA_OK(cudaMemcpy(r_nb.data(), d_resid_nb, M_DIM * 4, cudaMemcpyDeviceToHost));
+        CUDA_OK(cudaMemcpy(&fac_nb_h, d_fac_nb, 4, cudaMemcpyDeviceToHost));
+        resid_nb_mm = 0;
+        for (int i = 0; i < M_DIM; i++)
+            if (memcmp(&r_ctl[i], &r_nb[i], 4)) resid_nb_mm++;
+        for (int i = 0; i < warmup; i++) launch_nobar(stream);
+        CUDA_OK(cudaEventRecord(ev_a, stream));
+        for (int i = 0; i < iters; i++) launch_nobar(stream);
+        CUDA_OK(cudaEventRecord(ev_b, stream));
+        CUDA_OK(cudaStreamSynchronize(stream));
+        nobar_eager_us = elapsed_ms(ev_a, ev_b, iters) * 1000.f;
+        cudaGraph_t g; cudaGraphExec_t ge;
+        CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        launch_nobar(stream);
+        CUDA_OK(cudaStreamEndCapture(stream, &g));
+        CUDA_OK(cudaGraphInstantiate(&ge, g, nullptr, nullptr, 0));
+        for (int i = 0; i < warmup; i++) CUDA_OK(cudaGraphLaunch(ge, stream));
+        CUDA_OK(cudaEventRecord(ev_a, stream));
+        for (int i = 0; i < iters; i++) CUDA_OK(cudaGraphLaunch(ge, stream));
+        CUDA_OK(cudaEventRecord(ev_b, stream));
+        CUDA_OK(cudaStreamSynchronize(stream));
+        nobar_graph_us = elapsed_ms(ev_a, ev_b, iters) * 1000.f;
+        CUDA_OK(cudaGraphExecDestroy(ge));
+        CUDA_OK(cudaGraphDestroy(g));
+    }
+    const float fac_rel = fabsf(fac_nb_h - fac_ctl_h) / (fabsf(fac_ctl_h) + 1e-30f);
 
     std::printf("{\"K\":%d,\"ks\":%d,\"resident\":%s,\"per_sm\":%d,"
                 "\"resid_mismatches\":%ld,\"fac_exact\":%s,\"code_mismatches\":%ld,"
                 "\"control_eager_us\":%.3f,\"fused_eager_us\":%.3f,"
-                "\"control_graph_us\":%.3f,\"fused_graph_us\":%.3f}\n",
+                "\"control_graph_us\":%.3f,\"fused_graph_us\":%.3f,"
+                "\"nobar_resid_mismatches\":%ld,\"nobar_fac_rel\":%.2e,"
+                "\"nobar_eager_us\":%.3f,\"nobar_graph_us\":%.3f}\n",
                 K, KS, resident ? "true" : "false", per_sm,
                 resid_mm, fac_exact ? "true" : "false", code_mm,
-                ctl_eager_us, fused_eager_us, ctl_graph_us, fused_graph_us);
+                ctl_eager_us, fused_eager_us, ctl_graph_us, fused_graph_us,
+                resid_nb_mm, fac_rel, nobar_eager_us, nobar_graph_us);
 
     CUDA_OK(cudaFree(d_codes)); CUDA_OK(cudaFree(d_scales)); CUDA_OK(cudaFree(d_x));
     CUDA_OK(cudaFree(d_resid_in)); CUDA_OK(cudaFree(d_resid_ctl)); CUDA_OK(cudaFree(d_resid_fused));
@@ -618,6 +780,8 @@ static void run_case(int K, int iters, int warmup) {
     CUDA_OK(cudaFree(d_fac_ctl)); CUDA_OK(cudaFree(d_fac_fused));
     CUDA_OK(cudaFree(d_q_ctl)); CUDA_OK(cudaFree(d_q_fused)); CUDA_OK(cudaFree(d_nw));
     CUDA_OK(cudaFree(d_arrive)); CUDA_OK(cudaFree(d_epoch)); CUDA_OK(cudaFree(d_facready));
+    CUDA_OK(cudaFree(d_resid_nb)); CUDA_OK(cudaFree(d_fac_nb));
+    CUDA_OK(cudaFree(d_sumsq)); CUDA_OK(cudaFree(d_q_nb));
     CUDA_OK(cudaStreamDestroy(stream));
 }
 
