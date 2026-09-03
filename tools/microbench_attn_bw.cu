@@ -31,6 +31,7 @@
 #include <cstring>
 #include <cstdint>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cmath>
 #include <vector>
 #include <string>
@@ -84,6 +85,14 @@ static __device__ __forceinline__ float bf16f(uint16_t h) {
     uint32_t u = (uint32_t)h << 16; float f; memcpy(&f, &u, 4); return f;
 }
 __device__ __constant__ float c_e4m3_lut[256];
+// Branchless e4m3 decode (production uses bit math, not a gather; a constant-mem
+// LUT serializes 32-way under divergent byte indices and is unfaithful).
+static __device__ __forceinline__ float e4m3f(uint8_t b) {
+    int s = (b >> 7) & 1, e = (b >> 3) & 0xF, m = b & 7;
+    float v = e ? ldexpf(1.0f + (float)m * 0.125f, e - 7)
+                : ldexpf((float)m * 0.125f, -6);
+    return s ? -v : v;
+}
 
 // 8-stage in-place FWHT over 256 floats (time-equivalent to production helper).
 static __device__ __forceinline__ void fwht256(float *b, int tid) {
@@ -249,7 +258,7 @@ void k_probe_v2(const float *q_proj_base, const uint16_t *q_norm_w,
             const uint8_t *vb5 = (const uint8_t *)(sm + OFF_SV + buf * SVB);
             const float *vsb5 = (const float *)(sm + OFF_VS + buf * (CH * 4));
             for (int j = 0; j < clen; j++) {
-                float vcode = c_e4m3_lut[vb5[j * 256 + tid]];
+                float vcode = e4m3f(vb5[j * 256 + tid]);
                 float vscl = vsb5[j];
                 #pragma unroll
                 for (int g = 0; g < GQA; g++) acc[g] += 0.001f * vcode * vscl;
@@ -376,7 +385,7 @@ void k_probe_v2(const float *q_proj_base, const uint16_t *q_norm_w,
         const uint8_t *vb = (const uint8_t *)(sm + OFF_SV + buf * SVB);
         const float *vsb = (const float *)(sm + OFF_VS + buf * (CH * 4));
         for (int j = 0; j < clen; j++) {
-            float vcode = c_e4m3_lut[vb[j * 256 + tid]];
+            float vcode = e4m3f(vb[j * 256 + tid]);
             float vscl = vsb[j];
             #pragma unroll
             for (int g = 0; g < GQA; g++) acc[g] += sch[g * CH + j] * vcode * vscl;
@@ -384,6 +393,208 @@ void k_probe_v2(const float *q_proj_base, const uint16_t *q_norm_w,
         __syncthreads();
     }
     if (MODE == 2 || MODE == 4) { if (sink) sink[(blockIdx.z * gridDim.x + blockIdx.x) * 256 + tid] = sink_acc; return; }
+    #pragma unroll
+    for (int g = 0; g < GQA; g++) {
+        int head = kv_head * GQA + g;
+        size_t pidx = ((size_t)(head * gridDim.y + col) * S + split);
+        part_acc[pidx * HD + tid] = acc[g];
+        if (tid == 0) { part_ml[pidx * 2 + 0] = m_run[g]; part_ml[pidx * 2 + 1] = l_run[g]; }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// e1 probe: tensor-core scores. Same staging pipeline at CH=32 (two m16 tiles),
+// warps 0-1 build bf16 A fragments straight from the staged K4 codes and run
+// 16 mma.sync.m16n8k16 k-steps against q fragments (6 heads + 2 pad columns).
+// fp32 accumulators land in the same sch[] the unchanged fp32 online softmax
+// and j-ascending V fold consume. Output diff vs the clone validates both the
+// fragment maps and the bf16 drift class.
+// ---------------------------------------------------------------------------
+#define MM_CH   32
+#define MM_NST  2
+#define MM_SKB  (MM_CH * 128)
+#define MM_SCB  (MM_CH * 32)
+#define MM_SVB  (MM_CH * 256)
+#define MM_OFF_QB   0                                   // bf16 q: GQA x 256 halfs
+#define MM_OFF_SK   (GQA * 256 * 2)
+#define MM_OFF_SC   (MM_OFF_SK + MM_NST * MM_SKB)
+#define MM_OFF_SV   (MM_OFF_SC + MM_NST * MM_SCB)
+#define MM_OFF_VS   (MM_OFF_SV + MM_NST * MM_SVB)
+#define MM_OFF_SCH  (MM_OFF_VS + MM_NST * MM_CH * 4)
+#define MM_OFF_CTL  (MM_OFF_SCH + GQA * MM_CH * 4)
+#define MM_OFF_KB   (MM_OFF_CTL + 256)                  // bf16 K chunk: 32 x 256 halfs
+#define MM_SMEM     (MM_OFF_KB + MM_CH * HD * 2)
+
+static __device__ __forceinline__ uint32_t bf16pack(float lo, float hi) {
+    __nv_bfloat162 p = __floats2bfloat162_rn(lo, hi);
+    uint32_t u;
+    memcpy(&u, &p, 4);
+    return u;
+}
+
+__global__ __launch_bounds__(256, 2)
+void k_probe_mma(const float *q_proj_base, const uint16_t *q_norm_w,
+                 const uint8_t *k4_pool, const uint16_t *kq4s_pool,
+                 const uint8_t *v8_pool, const float *vscale_pool,
+                 const int *positions, const int *slot_ids,
+                 const int *block_table, int max_blocks,
+                 int S, float *part_acc, float *part_ml) {
+    extern __shared__ uint32_t sm_u32[];
+    char *sm = (char *)sm_u32;
+    __nv_bfloat16 *qb = (__nv_bfloat16 *)(sm + MM_OFF_QB);
+    __nv_bfloat16 *kb = (__nv_bfloat16 *)(sm + MM_OFF_KB);
+    float *sch = (float *)(sm + MM_OFF_SCH);
+    float *ctl = (float *)(sm + MM_OFF_CTL);
+    float *m_run = ctl, *l_run = ctl + GQA, *m_new_s = ctl + 2 * GQA,
+          *alpha_s = ctl + 3 * GQA, *l_chunk_s = ctl + 4 * GQA;
+    const int kv_head = blockIdx.x, col = blockIdx.y, split = blockIdx.z, tid = threadIdx.x;
+    const int pos = positions[col];
+    const int slot = slot_ids[col];
+    for (int g = tid; g < GQA * 256; g += 256) qb[g] = __float2bfloat16_rn(0.001f * (g & 255));
+    if (tid < GQA) { m_run[tid] = -3.402823466e38f; l_run[tid] = 0.0f; }
+    __syncthreads();
+    const size_t bt_base = (size_t)slot * max_blocks;
+    const size_t k4_pp = (size_t)(NKV * HD) >> 1, kq4s_pp = (size_t)NKV * 16, v8_pp = (size_t)NKV * HD;
+    const int warp = tid >> 5, lane = tid & 31;
+    const float scale = rsqrtf((float)HD);
+    float acc[GQA];
+    #pragma unroll
+    for (int g = 0; g < GQA; g++) acc[g] = 0.0f;
+    const int total = pos + 1;
+    const int per = (total + S - 1) / S;
+    const int lo = split * per;
+    int hi = lo + per; if (hi > total) hi = total;
+    if (lo >= hi) return;
+
+    auto issue = [&](int c0i) {
+        int clen = hi - c0i; if (clen > MM_CH) clen = MM_CH;
+        int buf = ((c0i - lo) / MM_CH) % MM_NST;
+        for (int id = tid; id < (clen << 3); id += 256) {
+            int j = id >> 3, seg = id & 7, t = c0i + j;
+            int phys = block_table[bt_base + (t >> PAGE_LOG)];
+            size_t pr = (size_t)phys * PAGE + (t & (PAGE - 1));
+            cp16((uint32_t)__cvta_generic_to_shared(sm + MM_OFF_SK + buf * MM_SKB + j * 128 + seg * 16),
+                 k4_pool + pr * k4_pp + (size_t)kv_head * (HD >> 1) + seg * 16);
+        }
+        for (int id = tid; id < (clen << 1); id += 256) {
+            int j = id >> 1, seg = id & 1, t = c0i + j;
+            int phys = block_table[bt_base + (t >> PAGE_LOG)];
+            size_t pr = (size_t)phys * PAGE + (t & (PAGE - 1));
+            cp16((uint32_t)__cvta_generic_to_shared(sm + MM_OFF_SC + buf * MM_SCB + j * 32 + seg * 16),
+                 (const char *)(kq4s_pool + pr * kq4s_pp + (size_t)kv_head * 16) + seg * 16);
+        }
+        for (int id = tid; id < (clen << 4); id += 256) {
+            int j = id >> 4, seg = id & 15, t = c0i + j;
+            int phys = block_table[bt_base + (t >> PAGE_LOG)];
+            size_t pr = (size_t)phys * PAGE + (t & (PAGE - 1));
+            cp16((uint32_t)__cvta_generic_to_shared(sm + MM_OFF_SV + buf * MM_SVB + j * 256 + seg * 16),
+                 v8_pool + pr * v8_pp + (size_t)kv_head * HD + seg * 16);
+        }
+        for (int j = tid; j < clen; j += 256) {
+            int t = c0i + j;
+            int phys = block_table[bt_base + (t >> PAGE_LOG)];
+            size_t pr = (size_t)phys * PAGE + (t & (PAGE - 1));
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                :: "r"((uint32_t)__cvta_generic_to_shared(sm + MM_OFF_VS + buf * (MM_CH * 4) + j * 4)),
+                   "l"(vscale_pool + pr * NKV + kv_head));
+        }
+        asm volatile("cp.async.commit_group;\n");
+    };
+
+    issue(lo);
+    for (int c0 = lo; c0 < hi; c0 += MM_CH) {
+        int clen = hi - c0; if (clen > MM_CH) clen = MM_CH;
+        const int buf = ((c0 - lo) / MM_CH) % MM_NST;
+        if (c0 + MM_CH < hi) issue(c0 + MM_CH);
+        else asm volatile("cp.async.commit_group;\n");
+        asm volatile("cp.async.wait_group 1;\n");
+        __syncthreads();
+        const uint8_t *skb = (const uint8_t *)(sm + MM_OFF_SK + buf * MM_SKB);
+        const uint16_t *scb = (const uint16_t *)(sm + MM_OFF_SC + buf * MM_SCB);
+        // ---- cooperative bf16 dequant of the whole chunk (all 8 warps) ----
+        for (int idx = tid; idx < MM_CH * HD; idx += 256) {
+            int j = idx >> 8, d = idx & 255;
+            float v = 0.f;
+            if (c0 + j < hi) {
+                uint8_t byte = skb[j * 128 + (d >> 1)];
+                float code = (float)((d & 1) ? (byte >> 4) : (byte & 15));
+                const uint16_t *ksz = scb + j * 16 + ((d >> 5) << 1);
+                float sc = __half2float(((const __half *)ksz)[0]);
+                float zp = __half2float(((const __half *)ksz)[1]);
+                v = (code - zp) * sc;
+            }
+            kb[j * HD + d] = __float2bfloat16_rn(v);
+        }
+        __syncthreads();
+        // ---- tensor-core scores: warps 0-1, one m16 tile each, ldmatrix A ----
+        if (warp < 2) {
+            const int row0 = warp * 16;
+            const int gid = lane >> 2, tig = lane & 3;
+            float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+            const uint32_t *qw = (const uint32_t *)qb;
+            for (int ks = 0; ks < HD / 16; ks++) {
+                const int dbase = ks * 16;
+                uint32_t a0, a1, a2, a3;
+                // x4 ldmatrix: lanes 0-15 -> rows 0..15 (col group 0), 16-31 -> rows 0..15 (col group 1)
+                uint32_t addr = (uint32_t)__cvta_generic_to_shared(
+                    kb + (size_t)(row0 + (lane & 15)) * HD + dbase + ((lane >> 4) << 3));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(addr));
+                uint32_t b0 = 0, b1 = 0;
+                if (gid < GQA) {
+                    b0 = qw[(gid * 256 + dbase + tig * 2) >> 1];
+                    b1 = qw[(gid * 256 + dbase + tig * 2 + 8) >> 1];
+                }
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                    : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+            }
+            // D fragment map (m16n8 f32): {d0,d1} -> (gid, tig*2 / +1), {d2,d3} -> (gid+8, ...)
+            const int jr0 = row0 + gid, jr1 = row0 + gid + 8;
+            const int gc0 = tig * 2, gc1 = tig * 2 + 1;
+            if (gc0 < GQA) {
+                if (jr0 < clen) sch[gc0 * MM_CH + jr0] = d0 * scale;
+                if (jr1 < clen) sch[gc0 * MM_CH + jr1] = d2 * scale;
+            }
+            if (gc1 < GQA) {
+                if (jr0 < clen) sch[gc1 * MM_CH + jr0] = d1 * scale;
+                if (jr1 < clen) sch[gc1 * MM_CH + jr1] = d3 * scale;
+            }
+        }
+        __syncthreads();
+        if (warp < GQA) {
+            const int g = warp;
+            float v0 = (lane < clen) ? sch[g * MM_CH + lane] : -3.402823466e38f;
+            float m = v0;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+            float m_old = m_run[g], m_new = fmaxf(m_old, m);
+            float p0 = (lane < clen) ? expf(v0 - m_new) : 0.0f;
+            if (lane < clen) sch[g * MM_CH + lane] = p0;
+            float ls = p0;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) ls += __shfl_xor_sync(0xffffffffu, ls, off);
+            if (lane == 0) {
+                float alpha = expf(m_old - m_new);
+                m_new_s[g] = m_new; alpha_s[g] = alpha; l_chunk_s[g] = ls;
+                l_run[g] = l_run[g] * alpha + ls; m_run[g] = m_new;
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int g = 0; g < GQA; g++) acc[g] *= alpha_s[g];
+        const uint8_t *vb = (const uint8_t *)(sm + MM_OFF_SV + buf * MM_SVB);
+        const float *vsb = (const float *)(sm + MM_OFF_VS + buf * (MM_CH * 4));
+        for (int j = 0; j < clen; j++) {
+            float vcode = e4m3f(vb[j * 256 + tid]);
+            float vscl = vsb[j];
+            #pragma unroll
+            for (int g = 0; g < GQA; g++) acc[g] += sch[g * MM_CH + j] * vcode * vscl;
+        }
+        __syncthreads();
+    }
     #pragma unroll
     for (int g = 0; g < GQA; g++) {
         int head = kv_head * GQA + g;
@@ -472,7 +683,7 @@ void k_probe_direct(const float *q_proj_base, const uint16_t *q_norm_w,
             int t = c0 + j;
             int phys = block_table[bt_base + (t >> PAGE_LOG)];
             size_t pr = (size_t)phys * PAGE + (t & (PAGE - 1));
-            float vcode = c_e4m3_lut[__ldg(v8_pool + pr * v8_pp + (size_t)kv_head * HD + tid)];
+            float vcode = e4m3f(__ldg(v8_pool + pr * v8_pp + (size_t)kv_head * HD + tid));
             float vscl = __ldg(vscale_pool + pr * NKV + kv_head);
             #pragma unroll
             for (int g = 0; g < GQA; g++) acc[g] += sch[g * CH + j] * vcode * vscl;
@@ -524,12 +735,23 @@ int main(int argc, char **argv) {
     CUDA_OK(cudaMalloc(&kq4s, pool_rows * NKV * 16 * 2));
     CUDA_OK(cudaMalloc(&v8, pool_rows * NKV * HD));
     CUDA_OK(cudaMalloc(&vs, pool_rows * NKV * 4));
-    CUDA_OK(cudaMemset(k4, 0x53, pool_rows * NKV * HD / 2));
-    CUDA_OK(cudaMemset(v8, 0x41, pool_rows * NKV * HD));
-    {   // sane fp16 scales + fp32 vscales
-        std::vector<uint16_t> hs(pool_rows * NKV * 16, 0x3C00);   // 1.0h
+    {   // randomized fixture: rows must differ so score drift is observable
+        uint64_t rng = 0xC0FFEEULL;
+        auto next = [&]() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; };
+        std::vector<uint8_t> hk(pool_rows * NKV * HD / 2);
+        for (auto &b : hk) b = (uint8_t)next();
+        CUDA_OK(cudaMemcpy(k4, hk.data(), hk.size(), cudaMemcpyHostToDevice));
+        std::vector<uint8_t> hv8(pool_rows * NKV * HD);
+        for (auto &b : hv8) b = (uint8_t)(next() & 0x7F);
+        CUDA_OK(cudaMemcpy(v8, hv8.data(), hv8.size(), cudaMemcpyHostToDevice));
+        std::vector<uint16_t> hs(pool_rows * NKV * 16);
+        for (size_t i = 0; i < hs.size(); i += 2) {
+            hs[i] = (uint16_t)(0x2C00 + (next() & 0x3FF));        // scale ~[0.06, 0.25)
+            hs[i + 1] = (uint16_t)(0x4700 + (next() & 0xFF));     // zp ~[7, 9)
+        }
         CUDA_OK(cudaMemcpy(kq4s, hs.data(), hs.size() * 2, cudaMemcpyHostToDevice));
-        std::vector<float> hv(pool_rows * NKV, 0.01f);
+        std::vector<float> hv(pool_rows * NKV);
+        for (auto &v : hv) v = 0.005f + (float)(next() & 0xFF) / 25600.0f;
         CUDA_OK(cudaMemcpy(vs, hv.data(), hv.size() * 4, cudaMemcpyHostToDevice));
     }
     std::vector<int> h_bt(N * max_blocks), h_pos(N), h_slot(N);
@@ -597,5 +819,27 @@ int main(int argc, char **argv) {
         k_probe_v2<3><<<grid, blk, SMEM_SZ, st>>>(q_proj, qnw, k4, kq4s, v8, vs, pos, slot, bt, max_blocks, S, pacc, pml, nullptr); });
     bench("direct", [&]{ for (int l = 0; l < LAYERS; l++)
         k_probe_direct<<<grid, blk, SMEM_SZ, st>>>(q_proj, qnw, k4, kq4s, v8, vs, pos, slot, bt, max_blocks, S, pacc, pml); });
+    bench("mma", [&]{ for (int l = 0; l < LAYERS; l++)
+        k_probe_mma<<<grid, blk, MM_SMEM, st>>>(q_proj, qnw, k4, kq4s, v8, vs, pos, slot, bt, max_blocks, S, pacc, pml); });
+    if (only.empty() || only == "mmacheck") {
+        // numeric gate: mma output vs the fp32 scalar clone (same synthetic qn)
+        const size_t n_acc = (size_t)24 * N * S * HD;
+        std::vector<float> ref_acc(n_acc), mma_acc(n_acc);
+        k_probe_v2<1><<<grid, blk, SMEM_SZ, st>>>(q_proj, qnw, k4, kq4s, v8, vs, pos, slot, bt, max_blocks, S, pacc, pml, nullptr);
+        CUDA_OK(cudaStreamSynchronize(st));
+        CUDA_OK(cudaMemcpy(ref_acc.data(), pacc, n_acc * 4, cudaMemcpyDeviceToHost));
+        k_probe_mma<<<grid, blk, MM_SMEM, st>>>(q_proj, qnw, k4, kq4s, v8, vs, pos, slot, bt, max_blocks, S, pacc, pml);
+        CUDA_OK(cudaStreamSynchronize(st));
+        CUDA_OK(cudaMemcpy(mma_acc.data(), pacc, n_acc * 4, cudaMemcpyDeviceToHost));
+        double num = 0.0, den = 0.0, mx = 0.0;
+        for (size_t i = 0; i < n_acc; i++) {
+            double d = (double)mma_acc[i] - (double)ref_acc[i];
+            num += d * d; den += (double)ref_acc[i] * (double)ref_acc[i];
+            double r = fabs(d) / (fabs((double)ref_acc[i]) + 1e-6);
+            if (r > mx) mx = r;
+        }
+        std::printf("{\"variant\":\"mmacheck\",\"rows\":%d,\"N\":%d,\"rel_l2\":%.3e,\"max_rel\":%.3e}\n",
+                    rows, N, sqrt(num / (den + 1e-30)), mx);
+    }
     return 0;
 }
