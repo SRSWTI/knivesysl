@@ -5,6 +5,10 @@
 cd "$(dirname "$0")/.."
 ulimit -c unlimited
 export CUDA_VISIBLE_DEVICES=0 TQ_KV_Q4=1 TQ_CTX=262144 TQ_EMBED_FP8=2 TQ_W_NVFP4=all
+# n-gram verify archive: the agentic/coding workload is its measured win zone
+# (+37-60% single-stream through 32k, cost-gated at depth). 8-node archive
+# (~1.2 GB); TQ_PAGED_ATTN_V3 rides its in-code auto default.
+export TQ_PAGED_SPEC=1 TQ_PG_SPEC_NODES=8
 while true; do
   .venv/bin/python -u tools/serve_batched.py \
     --tqf /home/shooting-brake007/models/knivesysl/qwen3_8-27b-e2m3-mtp.tqf \

@@ -1025,7 +1025,25 @@ def make_handler(eng, tok, args):
             else:
                 ids = tok(body.get("prompt", ""), add_special_tokens=False).input_ids
             ctx_max = int(os.environ.get("TQ_CTX", "262144"))
-            max_new = int(mt_raw) if mt_raw else max(16, min(16384, ctx_max - len(ids) - 8))
+            win = ctx_max - len(ids) - 8
+            # Interactive floor (TQ_MIN_OUT, default 8192): coding CLIs compute
+            # max_tokens from THEIR configured window with THEIR tokenizer and
+            # routinely send tiny caps (observed: 36 on a 26K prompt) that cut
+            # replies mid-word with finish_reason=length. Lift explicit caps to
+            # the floor unless the client pinned length for benchmarking
+            # (ignore_eos + max_tokens) -- EOS still ends generation naturally,
+            # so the floor only removes artificial truncation. No field at all
+            # -> vLLM semantics: generate into the remaining window
+            # (TQ_DEF_OUT cap, default 16384; the old default of 128 truncated
+            # every agent reply).
+            ignore = bool(body.get("ignore_eos", False))
+            if mt_raw:
+                max_new = int(mt_raw)
+                if not ignore:
+                    max_new = max(max_new, int(os.environ.get("TQ_MIN_OUT", "8192")))
+            else:
+                max_new = int(os.environ.get("TQ_DEF_OUT", "16384"))
+            max_new = max(16, min(max_new, win))
             # stop strings, vLLM semantics: applied to the RAW generation (thinking
             # included), earliest match truncates and finishes with "stop".
             stop_raw = body.get("stop")
@@ -1033,7 +1051,7 @@ def make_handler(eng, tok, args):
                      else [s0 for s0 in (stop_raw or []) if isinstance(s0, str) and s0])
             # ignore_eos: benchmark/eval harnesses (guidellm) pin the output length by
             # sending max_tokens + ignore_eos, so every request does equal work.
-            req_eos = [] if bool(body.get("ignore_eos", False)) else eos
+            req_eos = [] if ignore else eos
             want_usage = bool((body.get("stream_options") or {}).get("include_usage"))
             # Sampling: an omitted temperature keeps the engine's greedy default
             # (agentic clients here want determinism + APC-friendly replays);
