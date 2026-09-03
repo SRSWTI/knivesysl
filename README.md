@@ -63,12 +63,16 @@ lengths, or event counts. raw schema-3 artifacts retain every repetition.
   fp8 kv, `--no-enable-prefix-caching`, and a harness warmup before measurement;
 - vllm's prefix-cache query, hit, and external-hit counters remained exactly zero
   after the full campaign;
-- knivesysl plain is nvfp4-all with the staged v2 paged-attention kernel and the
-  flow-split batched decode heuristic (commit `00f6e85`);
+- knivesysl plain is nvfp4-all with the staged v2 paged-attention kernel, the
+  flow-split batched decode heuristic (commit `00f6e85`), and the tensor-core score
+  path `TQ_PAGED_ATTN_V3` on its measured auto dispatch (commit `9f95428`; deep-queue /
+  long-walk cells only, byte-exact cells stay on v2);
 - knivesysl boosted is the same target path plus a 16-node n-gram verify archive;
 - knivesysl arms re-measured 2026-09-03 on clean boots; sglang/vllm reference arms are
   the frozen 2026-09-02 clean-cache campaign (same gpu, driver, and contract). boosted
   n=1 rows come from the matched pre-split run - the n=1 kernel path is byte-identical.
+  plain 128k x1 re-measured after `9f95428` (v3 routes on at that shape: +8.8%); other
+  plain v3-routed cells (32k x4, 65k x4, 128k x2) re-measured flat, prior rows kept.
 
 `128k*` is the only non-identical prompt length: sglang and knivesysl use 131,072
 prompt tokens; vllm uses 130,496 so its 512-token completion stays inside
@@ -92,7 +96,7 @@ each cell is `aggregate decode / per-request decode / end-to-end aggregate`, in 
 | 64k | 1 | 63.0 / 63.0 / 26.6 | 65.9 / 65.9 / **29.0** | 58.7 / 58.7 / 25.0 | **66.0 / 66.0 / 25.8** | boosted +0.2% over vllm decode |
 | 64k | 2 | 49.1 / 38.7 / 32.1 | **50.8 / 39.1 / 32.8** | 45.8 / 36.3 / 30.1 | 40.8 / 30.7 / 27.9 | vllm; plain -9.8% |
 | 64k | 4 | — | 41.0 / 32.7 / 33.6 | **42.3 / 21.1 / 34.1** | — | **knivesysl plain, +3.2%** |
-| 128k* | 1 | **58.0 / 58.0 / 11.6** | 57.8 / 57.8 / **12.6** | 50.9 / 50.9 / 11.3 | 46.3 / 46.3 / 11.0 | sglang decode; vllm e2e |
+| 128k* | 1 | **58.0 / 58.0 / 11.6** | 57.8 / 57.8 / **12.6** | 54.5 / 54.5 / 11.7 | 46.3 / 46.3 / 11.0 | sglang decode; vllm e2e |
 | 128k* | 2 | — | 20.8 / 57.9 / 12.7 | **21.4 / 25.2 / 12.5** | — | **knivesysl plain, +2.9%** |
 
 ### aggregate decode versus vllm
@@ -111,7 +115,7 @@ each cell is `aggregate decode / per-request decode / end-to-end aggregate`, in 
 | 64k | 1 | 0.96x | 0.89x | **1.00x** |
 | 64k | 2 | 0.97x | 0.90x | 0.80x |
 | 64k | 4 | — | **1.03x** | — |
-| 128k* | 1 | 1.00x | 0.88x | 0.80x |
+| 128k* | 1 | 1.00x | 0.94x | 0.80x |
 | 128k* | 2 | — | **1.03x** | — |
 
 ### time to first token
@@ -132,7 +136,7 @@ each cell is `maximum / median` client ttft in seconds.
 | 64k | 1 | 11.14 / 11.14 | **9.87 / 9.87** | 11.70 / 11.70 | 12.05 / 12.05 |
 | 64k | 2 | 22.21 / 16.64 | **21.40 / 16.25** | 23.56 / 17.60 | 23.38 / 17.46 |
 | 64k | 4 | — | 51.06 / 30.75 | **46.73 / 29.38** | — |
-| 128k* | 1 | 35.14 / 35.14 | **32.11 / 32.11** | 35.28 / 35.28 | 35.55 / 35.55 |
+| 128k* | 1 | 35.14 / 35.14 | **32.11 / 32.11** | 34.33 / 34.33 | 35.55 / 35.55 |
 | 128k* | 2 | — | 71.56 / 51.52 | **68.72 / 51.37** | — |
 
 ### inter-token latency
@@ -154,7 +158,7 @@ scheduling gaps; they are not one kernel's execution time.
 | 64k | 1 | 15.5 / 33.1 | **14.9 / 16.8** | 17.0 / 18.6 | 18.7 / 53.2 |
 | 64k | 2 | 18.9 / **20.5** | **18.4** / 985.0 | 20.5 / 833.0 | 62.3 / 953.6 |
 | 64k | 4 | — | **19.4** / 1042.1 | 26.7 / **999.5** | — |
-| 128k* | 1 | 17.2 / **18.9** | **16.9** / 19.7 | 19.5 / 21.9 | 21.5 / 83.3 |
+| 128k* | 1 | 17.2 / **18.9** | **16.9** / 19.7 | 18.3 / 19.2 | 21.5 / 83.3 |
 | 128k* | 2 | — | **17.5 / 20.0** | 26.3 / 1530.9 | — |
 
 ### prefill throughput and total wall time
@@ -175,7 +179,7 @@ each cell is `estimated prefill tok/s / total wall seconds`.
 | 64k | 1 | 5,882 / 19.26 | **6,638 / 17.64** | 5,599 / 20.51 | 5,438 / 19.82 |
 | 64k | 2 | 5,900 / 31.91 | **6,126 / 31.20** | 5,563 / 33.97 | 5,607 / 36.66 |
 | 64k | 4 | — | 5,134 / **60.87** | **5,609** / 60.01 | — |
-| 128k* | 1 | 3,730 / 43.97 | **4,064 / 40.67** | 3,715 / 45.35 | 3,687 / 46.47 |
+| 128k* | 1 | 3,730 / 43.97 | **4,064 / 40.67** | 3,818 / 43.73 | 3,687 / 46.47 |
 | 128k* | 2 | — | 3,647 / **80.44** | **3,814** / 81.75 | — |
 
 ### n-gram behavior
@@ -199,8 +203,9 @@ the engine now wins eight of fourteen matched cells outright: the boosted arm ta
 shallow batched and repetitive single-agent cells (up to 2.03x vllm at 8k x1, 1.48x at
 32k x1, 1.18x at 2k x2), and the plain arm takes the capacity edge (64k x4 +3.2%,
 128k x2 +2.9%, 2k x2 +2.4%). vllm still leads six: unique single-stream decode by
-8-12%, unique prefill by 10-25%, and the deep multi-request cells (8k x4 -11.8%,
-32k x2 -14.8%, 32k x4 -18.0%). the deep-batch gap is contended-step compute, pinned by
+6-11% (128k x1 closed from 0.88x to 0.94x by the tensor-core score path), unique
+prefill by 10-25%, and the deep multi-request cells (8k x4 -11.8%, 32k x2 -14.8%,
+32k x4 -18.0%). the deep-batch gap is contended-step scheduling, pinned by
 the twelve-experiment campaign in [`docs/level-up.md`](docs/level-up.md); the flow-split
 heuristic (`00f6e85`) closed 32k x4 from -22.3% and flipped the three winning plain
 cells. the n-gram path stays a workload-specific accelerator, not a blanket claim: it

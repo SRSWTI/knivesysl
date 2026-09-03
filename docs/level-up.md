@@ -531,29 +531,46 @@ re-baseline the correctness references under an explicit quality gate.
 | fp6 lm head (1) | 0.57 | roofline |
 | host + dispatch | 0.64 | graph exists; python residual parked |
 
-### e1 — tensor-core attention decode (flagship)
+### e1 — tensor-core attention decode (flagship) — SHIPPED 2026-09-03 (`TQ_PAGED_ATTN_V3`, default auto)
 
-flashattention's move was to never materialize the score matrix and carry softmax
-statistics incrementally. our analogue: never run score/fold arithmetic on scalar fma
-lanes at all. the mxf8f6f4 tensor cores that already execute every projection gemm can
-execute the attention chunk too:
+flashattention's move was to never materialize the score matrix; our analogue: never run
+score arithmetic on scalar fma lanes. the shipped shape differs from the original sketch —
+no k-format change at all (the e2m1 requant probe became unnecessary): keep int4-asym
+g32 + hadamard exactly as stored, and **dequant each staged 32-row chunk to bf16 in
+shared cooperatively (all 8 warps), then run the 6-head score block as 16
+`ldmatrix.x4` + `mma.sync.m16n8k16.bf16` k-steps on warps 0-1** with fp32 accumulators
+fed through the fragment map into the unchanged fp32 online softmax and j-ascending
+v fold. de-risked by the flashmla sm120 recipe (register-resident dequant + mma.sync,
+no clusters/tmem).
 
-- store k in the nvfp4 row format (e2m1 codes + ue4m3 g16 scales) instead of int4-asym
-  g32; per 24-row chunk the 6-head score block becomes a short m16n8k64 mma chain
-  (~5 instructions) instead of ~500 scalar fma per warp;
-- v is already e4m3: the fold becomes probability-vector x v8 mma with per-chunk
-  quantized probabilities;
-- online softmax statistics (m_run, l_run, alpha rescale) stay fp32 in smem, carried
-  incrementally exactly as today — the fa invariant is preserved, only the inner
-  products change owner;
-- asymmetric-zp folding is unnecessary once k is e2m1 (symmetric grid); hadamard
-  rotation is orthogonal and stays;
-- probe first on synthetic pools against the stage-6 clone (score phase 3.1 us -> target
-  ~0.4 us/chunk); then a dual-format kv writer experiment; then TQ_PAGED_ATTN_V3.
+the road (all recorded in `results/microbench/level_up_experiments.json`):
 
-expected reach: attention 8.08 -> ~2.5-3.5 ms at 4x32k (+10-14% on the three losing
-deep-batch cells), 1.40 -> ~0.7 ms at 32k n=1. quality: k requantization e2m1-g16 vs
-int4-g32 measured by tf-top1 before any engine work.
+- bf16 drift sim: scores perturbed 0.07-0.11% of spread, chunk-argmax flips 0.12% —
+  noise class next to the k int4 error;
+- probe iteration 1 (per-lane fragment fill, 2 warps): **neutral** — operand prep was
+  the bottleneck, the mma itself is free. the fa4 lesson holds on gb202: feeding tensor
+  cores is the problem;
+- probe iteration 2 (cooperative dequant + ldmatrix): **-21.6/-21.8/-21.8% kernel time**
+  at 32k n1 / 32k n4 / 131k n1, rel_l2 2.2e-4 vs the fp32 clone (two probe-fixture bugs
+  found and fixed en route: a blind uniform-pool fixture, and a constant-mem e4m3 lut
+  that serialized 32-way under random bytes);
+- engine kernel `k_tq_paged_attn_q4_split_gqa_v3`: v2's staging/softmax/fold/partials
+  contract verbatim, CH=32/NST=2, 48.25 kb smem (fp32 q-prep scratch aliased into the
+  bf16-k buffer), still 2 ctas/sm;
+- quality gate (teacher-forced, n=1025, v3 forced everywhere): top1 77.17 vs ref 77.46,
+  agreement 91.71, asymmetry **15:18 — balanced**, i.e. the bf16 eps class (control band
+  -0.19 at 17:15). contrast e2' rejected at -9.0, 118:25;
+- isolated decode is shape-split: wins with deep cta queues or long walks
+  (abba drift-cancelled: 4x32k -4.2%, 2x65k -5.4%, 1x131k -8.4%) but loses 2-8% in the
+  exactly-one-wave short-walk regime (1:32k +7.6%) where the 2-deep pipeline's copy
+  stalls have no co-resident work to hide behind. shipped as a **measured dispatch
+  rule** (ctas >= 1024 or rows/cta >= 1200 -> v3, else v2), which also keeps every
+  byte-exact-gated greedy shape on the v2 path — stored references stay valid;
+- server-level (gen 512, r3, cache off): **131k x1 50.1 -> 54.5 agg (+8.8%, 0.94x
+  vllm's 57.8)** — the uncontended cell shows the full kernel win. 32k x4 / 65k x4 /
+  131k x2 flat (84.2/42.3/21.3 vs 84.6/42.3/21.4): the contended cells are
+  scheduler-bound (stage-4's 24.3% prefill-in-window), not kernel-bound. the batch
+  frontier now belongs to the chunked-prefill rung, not to more attention work.
 
 ### ~~e2 — norm-folded quantization algebra~~ — closed 2026-09-03, one survivor
 
