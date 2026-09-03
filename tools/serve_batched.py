@@ -1103,7 +1103,13 @@ def make_handler(eng, tok, args):
                     while True:
                         done = req.done.is_set()
                         n_out = len(req.out)
-                        if n_out > sent_tok:
+                        # Process on new tokens AND on done-with-no-new-tokens: the
+                        # last progress wake can land between the final token append
+                        # and done.set(), leaving that pass's holdback (up to
+                        # len(TOOL_OPEN)-1 chars for tool-sending clients) unflushed.
+                        # The old `elif done: break` skipped the tail flush entirely
+                        # and cut replies mid-word.
+                        if n_out > sent_tok or done:
                             full = tok.decode(req.out[:n_out], skip_special_tokens=True)
                             for st0 in stops:
                                 i2 = full.find(st0)
@@ -1150,10 +1156,8 @@ def make_handler(eng, tok, args):
                                     _sse({**base, "choices": [ch]})
                                     up = safe
                             sent_txt, sent_tok = full, n_out
-                            if stopped:
+                            if done or stopped:
                                 break
-                        elif done:
-                            break
                         else:
                             if time.time() > deadline:
                                 break
