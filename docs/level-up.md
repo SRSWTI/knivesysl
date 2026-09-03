@@ -576,15 +576,24 @@ rungs: (a) offline W' converter + tf-top1 gate (weight-group distortion from per
 scaling is the risk to measure first); (b) code-drift probe on unnormalized-x
 quantization; (c) engine gate TQ_NORM_FOLD with the fused reduce+quant epilogue.
 
-### e3 — l2 weight prestream (in-law, first)
+### ~~e3 — l2 weight prestream~~ — probe accepted, integration refuted 2026-09-03
 
-attention + deltanet phases leave dram ~60% idle for ~2.2 ms/token while they compute.
-a low-priority side-stream toucher (or `cp.async.bulk.prefetch`) walks the next
-layer-group's weight bytes during those windows so the following gemms hit l2-warm
-lines; 128 mb l2 holds more than one full attention-layer group. read-only, byte-exact
-by construction, no new law needed. expected +2-5% at n=1; rungs: standalone probe
-(gemv stream timed with and without a concurrent prefetcher), then an engine side
-stream behind TQ_L2_PRESTREAM.
+the probe (`tools/microbench_l2_prestream.cu`) proved the raw physics: the 5090's l2 is
+**96 mb** (not the 128 mb die figure) and streams at **5.4 tb/s, 3.3x dram**; an 80 mb
+prestream made a following cold 160 mb gemv 1.60x faster, and warmth survived until
+consumption. two engine integrations then failed:
+
+- equal-priority reuse of the spec pf helper: 2k 15.0 -> 24.7 ms/step (prefetch ctas
+  displaced main waves; and under nvfp4-all it prefetched the wrong buffer, `d_A`
+  instead of `d_nvf4_a` — also true of the spec path it copied);
+- least-priority stream + pos-scaled budget + skip-if-busy: 2k -1%, 32k -5%,
+  131k -9.8%, 4x32k -4.8% — the loss *grows with the window*.
+
+the growth is the proof: the probe's alu-only window does not exist in this engine.
+every compute-bound decode window streams its own working set through l2 — attention
+scans up to 2.2 gb of kv at 131k, deltanet scans 290 mb of state — evicting the
+prestreamed weights before their gemms run. there is no window that both has idle dram
+and is not itself an l2 flush. integration reverted; probe and record retained.
 
 ### e4 — deltanet decode three-kernel fuse
 
