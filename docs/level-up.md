@@ -323,9 +323,14 @@ packed word while removing a modeled 6 mib, but took 25.50 us versus 13.45 us fo
 three-kernel graph control.
 
 therefore ~~collapse the post-projection chain in a standalone mega-epilogue~~ is rejected.
-an accumulator-owned epilogue remains admissible only if the gemm already owns complete
-output tiles and retains existing tile parallelism; it is not an active rung without a
-full producer microkernel that clears the stage gate.
+
+the follow-up demanded above — a full producer microkernel that owns complete output
+tiles and keeps tile parallelism — has now been built and measured
+(`tools/microbench_downproj_epi.cu`, experiment 6). it is bit-exact on residual, rms
+factor, and packed codes, and still 0.5-2.2 us slower per boundary than the four-launch
+chain. ~~producer-owned projection epilogue~~ is rejected and **the projection lane is
+closed**: every remaining flat-boundary cost is execution latency the reorganization
+cannot remove, not launch or round-trip overhead.
 
 ## stage 3 — current-row attention integration
 
@@ -354,24 +359,41 @@ plain-parity priority. q/k preparation may still be fused into the already-manda
 current-row writer if a later attention rewrite needs it, but that work must keep kv bytes,
 page/apc ownership, and short/2k/32k outputs unchanged.
 
-## stage 4 — scheduler and graph overlap
+## stage 4 — batch scheduler: chunked prefill co-scheduling
 
-this is now an accepted bounded implementation experiment, not cleanup. full graph replay
-previously moved only about 1% because it removed dispatch without changing the synchronous
-host boundary. the current traces leave 0.64-0.65 ms/token outside kernels at both 2k and
-128k. that is the maximum single-stream gain, not a promise.
+stage-4 traces exist now (`results/profiles/server-32k4.nsys-rep`, `server-8k4.nsys-rep`,
+experiment 7). they overturn the old framing: the batch deficit is not host overlap and
+not kernels. admission runs each new client's whole prefill serially inside the engine
+loop, stalling every active decode:
 
-- keep stable input, state-index, sample, and publication buffers per batch bucket;
-- launch batch t while the same host thread processes completed metadata for t-1;
-- relay the next token through device-resident storage; do not wait for its d2h copy before
-  launching the next forward;
-- no speculative assumption in the plain scheduler;
-- preserve cancellation, sampling, slot reuse, and error publication order;
-- measure host gaps directly, plus staggered-client ttft and starvation.
+| cell | prefill inside decode windows | host idle | step p99 | step max |
+|---|---:|---:|---:|---:|
+| 32k x4 | 24.3% of a 38.45 s span | 3.0% (0.66 ms/step) | 370 ms | 4.71 s |
+| 8k x4 | 6.6% of a 19.87 s span | 4.1% (0.65 ms/step) | 17.4 ms | 0.91 s |
 
-accept only an end-to-end win with unchanged outputs, unchanged maximum ttft, and no
-request-starvation regression. reject it if the overlap merely moves delay into response
-publication or lets a new step overwrite buffers still owned by the copy stream.
+the 32k x4 aggregate deficit versus vllm is 22.3%; prefill-in-window alone is 24.3%.
+64k x4 and 128k x2 sit near parity because those windows contain fewer admissions, not
+because anything else differs. this is the primary remaining rung.
+
+### primary rung — chunked prefill interleaved with decode
+
+- split every admission prefill into budget-bounded column chunks (the ragged batched
+  prefill abi already carries per-segment `seg_final`, so partial segments exist);
+- between chunks, run one decode step for all active slots;
+- deepest-first or fair chunk ordering, measured, not assumed;
+- no wave-composition change inside the engine for the first rung: policy lives in the
+  server loop;
+- gates: byte-exact greedy 2k/32k, itl p99 collapse at 32k x4 (370 ms -> under 60 ms),
+  aggregate 32k x4 at or above vllm's 103.2, ttft regression bounded and reported.
+
+### secondary rung — host overlap
+
+host idle is 3-4% (0.65 ms/step): prepare step t+1 while the gpu runs t, relay the next
+token through device-resident storage, keep sampling/cancellation order. worth its 3-4%,
+but it cannot close the batch cells alone. graph replay previously moved about 1% at n=1
+for the same reason.
+
+accept only an end-to-end win with unchanged outputs and no request-starvation regression.
 
 ## stage 5 — deltanet and prefill dataflow
 
@@ -521,6 +543,43 @@ observed kernel delta: graph 1.341 ms -> 1.579 ms
 observed server delta: not run; standalone failed
 accepted or rejected: rejected
 reason: dsm fan-out, barriers, and 72 registers outweigh global traffic removal
+```
+
+### experiment 6 — persistent down-projection epilogue
+
+```text
+hypothesis: a tile-parallel producer-owned epilogue (dsm fold + residual add + exact-order
+  rms + register-resident quant) beats the 4-launch boundary chain
+changed symbols: tools/microbench_downproj_epi.cu only
+control env: producer -> reduce -> add_rms_fac_b -> quant_x_nw (production clones)
+probe env: one launch, ks-cta clusters, resident sense barrier, owner-0 exact rms tree
+correctness gates: 0 residual mismatches, factor bit-exact, 0 packed-word mismatches
+profile artifact: results/profiles/current-plain-2k-n1-full.sqlite
+benchmark artifact: results/microbench/level_up_experiments.json
+expected bytes/launches removed: 3 launches and the split-partial round trip per boundary
+observed kernel delta: graph 105.2 -> 107.5 us (K=17408 ks=4); slower at every K/ks
+observed server delta: not run; standalone failed
+accepted or rejected: rejected; projection lane declared exhausted, no retuning
+reason: barrier spins, owner-0 rms serialization, and critical-path extension repay every
+  saved launch; the >=0.8 ms/token gate fails with a negative delta
+```
+
+### experiment 7 — stage-4 batch server trace
+
+```text
+hypothesis: the 8k/32k x4 deficit is host scheduling, not kernel time
+changed symbols: none; nsys around tools/serve_batched.py, one traced 512-gen window each
+control env: untraced confirm run (32k x4 aggregate 80.3 tok/s)
+probe env: traced run (79.1 tok/s, 1.5% overhead)
+correctness gates: none required; measurement only
+profile artifact: results/profiles/server-32k4.sqlite, server-8k4.sqlite
+benchmark artifact: results/microbench/level_up_experiments.json
+expected bytes/launches removed: n/a
+observed kernel delta: n/a
+observed server delta: prefill occupies 24.3% (32k x4) / 6.6% (8k x4) of decode windows;
+  host idle 3.0-4.1%; step max 4.71 s during a single serialized admission
+accepted or rejected: accepted; chunked prefill co-scheduling becomes the primary rung
+reason: prefill-in-window fraction alone matches the 22.3% aggregate deficit at 32k x4
 ```
 
 ## optional increment a — paged mtp
