@@ -4636,9 +4636,16 @@ k_tq_qwen_rmsnorm_b(float *out, const float *x, const uint16_t *weight, int N, f
     int end = begin + stripe;
     if (end > N) end = N;
     for (int i = begin + tid; i < end; i += blockDim.x) {
-        float w = 1.0f + tq_bf16_to_float(weight[i]);
+        float w = weight ? (1.0f + tq_bf16_to_float(weight[i])) : 1.0f;   // NULL: stage-7 e2 fold
         outn[i] = xn[i] * rms_inv * w;
     }
+}
+
+// Stage-7 e2 (TQ_NORM_FOLD): the rms scalar applied AFTER a folded-weight GEMM.
+// x is [N][M] column-major (the wide GEMM output convention); fac is per column.
+__global__ void k_tq_scale_cols(float *x, const float *__restrict__ fac, int M, int N) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < (long)M * N) x[i] *= fac[i / M];
 }
 
 // gridDim.x for the batched norms. The .x split exists so a SINGLE row still
@@ -11900,7 +11907,7 @@ __global__ void k_tq_nvf4_quant_x_nw(uint32_t *b, const float *X, const float *f
     __shared__ float sc[8][4];
     if (lane < 8) {
         int col = g8 * 8 + lane;
-        float f = (col < nvar) ? fac[col] : 0.f;
+        float f = (col < nvar) ? (fac ? fac[col] : 1.0f) : 0.f;   // NULL fac: stage-7 e2' defers the rms scalar
         uint32_t w = 0;
         for (int g = 0; g < 4; g++) {
             float mx = 0.f;
@@ -11920,7 +11927,7 @@ __global__ void k_tq_nvf4_quant_x_nw(uint32_t *b, const float *X, const float *f
     __syncthreads();
     uint32_t words[2] = {0, 0};
     int col = g8 * 8 + (lane >> 2);
-    float f = (col < nvar) ? fac[col] : 0.f;
+    float f = (col < nvar) ? (fac ? fac[col] : 1.0f) : 0.f;       // NULL fac: stage-7 e2' defers the rms scalar
     for (int reg = 0; reg < 2; reg++) {
         for (int j = 0; j < 8; j++) {
             int k = tq_nvf4_b_k(lane, reg, j);
@@ -13692,8 +13699,11 @@ static void maybe_nvf4_convert_all(void) {
         // Stage-7 e2 (TQ_NORM_FOLD): fold the consumer rmsnorm's (1 + nw[k]) into the
         // requantized NVFP4 weights of every norm-fed projection. Offline sim on the
         // real norm vectors measured zero requant damage (relrms ratio 0.999-1.000).
-        const uint16_t *in_nw = norm_fold_enabled() ? l->d_input_ln : NULL;
-        const uint16_t *pn_nw = norm_fold_enabled() ? l->d_post_ln : NULL;
+        // e2' pivot: weight folding REJECTED on measured quality (tf-top1 -7.0: raw-x
+        // group absmax under-resolves the channels nw amplifies). Only the rms SCALAR
+        // is deferred now; weights stay unfolded, quant keeps (1+nw).
+        const uint16_t *in_nw = NULL;
+        const uint16_t *pn_nw = NULL;
         if (gate) n += nvf4_convert_weight(&l->mlp_gate, "mlp_gate", pn_nw);
         if (up)   n += nvf4_convert_weight(&l->mlp_up, "mlp_up", pn_nw);
         if (down) n += nvf4_convert_weight(&l->mlp_down, "mlp_down", NULL);
@@ -13972,7 +13982,7 @@ static int nvf4_quant_ensure(const float *d_x, int K, int N, cudaStream_t st,
     if (gate)
         k_tq_nvf4_quant_silu<<<(unsigned)((size_t)ng8 * Kt64), 32, 0, st>>>(
             g_nvf4_b, gate, up, N, K, ng8, Kt64);
-    else if (fac)
+    else if (fac || nw)
         k_tq_nvf4_quant_x_nw<<<(unsigned)((size_t)ng8 * Kt64), 32, 0, st>>>(
             g_nvf4_b, d_x, fac, nw, N, K, ng8, Kt64);
     else
@@ -23066,9 +23076,8 @@ static int ensure_wide_prefill_buffers(int N) {
     g_wide_cap = N;
     return 0;
 }
-
-static int wide_quant_input(const float *d_x, int K, int N);
 static int wide_quant_silu(const float *gate, const float *up, int K, int N);
+static int wide_quant_input(const float *d_x, int K, int N);
 static int wide_quant_norm(const float *x, const float *fac, const uint16_t *nw, int K, int N);
 static int wide_proj(const tq_qmma_weight_t *w, float *out, int N);
 // Q4(K)+E4M3(V) batched/wide attention (defined in the roadmap-E section below). With
@@ -23107,12 +23116,22 @@ static int tq_fuse_norm(void) {
 // NVFP4 (nvf4_ok), else the plain rmsnorm_b into `tmp` + wide_quant_input pair.
 // Both paths produce bit-identical B-frags (see k_tq_nvf4_quant_x_nw).
 static int wide_norm_quant(float *tmp, const float *x, const uint16_t *w_ln, int K, int N, int nvf4_ok) {
+    // Stage-7 e2 (TQ_NORM_FOLD): consumers carry (1+nw) folded into their weights, so
+    // quantize the RAW activation; the rms scalar is applied to each GEMM output by
+    // k_tq_scale_cols at the call site. The factor kernel still runs here (same
+    // stream, consumed post-GEMM), so no ordering hazard exists.
+    if ((norm_fold_enabled() & 1) && nvf4_ok && tq_fuse_norm()) {
+        if (ensure_wide_fac(N) != 0) return -8;
+        k_tq_rms_fac_b<<<dim3(1, N), 1024, 0, g_qwen.stream>>>(g_wide_fac, x, K, g_qwen.eps);
+        return wide_quant_norm(x, NULL, w_ln, K, N);   // (1+nw) kept; fac deferred post-GEMM
+    }
     if (tq_fuse_norm() && nvf4_ok) {
         if (ensure_wide_fac(N) != 0) return -8;
         k_tq_rms_fac_b<<<dim3(1, N), 1024, 0, g_qwen.stream>>>(g_wide_fac, x, K, g_qwen.eps);
         return wide_quant_norm(x, g_wide_fac, w_ln, K, N);
     }
-    k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(N), N), 1024, 0, g_qwen.stream>>>(tmp, x, w_ln, K, g_qwen.eps);
+    k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(N), N), 1024, 0, g_qwen.stream>>>(
+        tmp, x, (norm_fold_enabled() && nvf4_ok) ? NULL : w_ln, K, g_qwen.eps);
     return wide_quant_input(tmp, K, N);
 }
 
@@ -23132,7 +23151,13 @@ static int wide_mlp_x(tq_layer_t *l, const float *add_a, const float *add_b,
     // factor kernel emits per-row rms_inv and the quantizer applies
     // fac * (1 + w) inline, bit-identically. FP6/mixed tiers keep the old path
     // (the FP6 quantizer needs the fp32 normed buffer).
+    // Stage-7 e2: the post_ln (MLP) fac deferral was measured and REJECTED on quality
+    // (tf-top1 77.46 -> 72.39 over 1025 teacher-forced steps, via both in-place scaling
+    // and silu-inline fac); only the input_ln deferral (bit 1) survives. This site
+    // intentionally keeps today's exact fused-norm quant.
     int ret;
+    static int fuse_silu = -1;
+    if (fuse_silu < 0) { const char *e = getenv("TQ_NVF4_FUSE_SILU"); fuse_silu = (e && e[0]) ? !!atoi(e) : 1; }
     if (tq_fuse_norm() && l->mlp_gate.nvf4 && l->mlp_up.nvf4 && l->mlp_down.nvf4) {
         if (ensure_wide_fac(n) != 0) return -8;
         const float *xsrc;
@@ -23154,8 +23179,6 @@ static int wide_mlp_x(tq_layer_t *l, const float *add_a, const float *add_b,
     if (ret != 0) return ret;
     if ((ret = wide_proj(&l->mlp_gate, g_wide_gate, n)) != 0) return ret;
     if ((ret = wide_proj(&l->mlp_up, g_wide_up, n)) != 0) return ret;
-    static int fuse_silu = -1;
-    if (fuse_silu < 0) { const char *e = getenv("TQ_NVF4_FUSE_SILU"); fuse_silu = (e && e[0]) ? !!atoi(e) : 1; }
     if (fuse_silu && l->mlp_down.nvf4) {
         // down-proj is the ONLY consumer of the silu product; quantize it fused
         // (the [n x I] fp32 intermediate is never written or re-read: ~20 -> 8
@@ -26599,11 +26622,18 @@ static int run_paged_decode_step_core(int N, int any_samp) {
         if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION) {
             if (!(tq_wide_fmt_ok(&l->q_proj) && tq_wide_fmt_ok(&l->o_proj) &&
                   tq_wide_fmt_ok(&l->mlp_gate) && tq_wide_fmt_ok(&l->mlp_down))) return -63;
+            int nfold_a = (norm_fold_enabled() & 1) && tq_fuse_norm() &&
+                          l->q_proj.nvf4 && l->k_proj.nvf4 && l->v_proj.nvf4;
             if ((ret = wide_norm_quant(g_wide_norm, g_wide_h, l->d_input_ln, H, N,
                                        l->q_proj.nvf4 && l->k_proj.nvf4 && l->v_proj.nvf4)) != 0) return -64;
             if ((ret = wide_proj(&l->q_proj, g_wide_q, N)) != 0) return -64;
             if ((ret = wide_proj(&l->k_proj, g_wide_k, N)) != 0) return -65;
             if ((ret = wide_proj(&l->v_proj, g_wide_v, N)) != 0) return -66;
+            if (nfold_a) {
+                k_tq_scale_cols<<<(unsigned)(((long)l->q_proj.M * N + 255) / 256), 256, 0, g_qwen.stream>>>(g_wide_q, g_wide_fac, l->q_proj.M, N);
+                k_tq_scale_cols<<<(unsigned)(((long)l->k_proj.M * N + 255) / 256), 256, 0, g_qwen.stream>>>(g_wide_k, g_wide_fac, l->k_proj.M, N);
+                k_tq_scale_cols<<<(unsigned)(((long)l->v_proj.M * N + 255) / 256), 256, 0, g_qwen.stream>>>(g_wide_v, g_wide_fac, l->v_proj.M, N);
+            }
             if (launch_paged_attn_q4(g_wide_core, g_wide_q, l->d_q_norm, g_wide_k, g_wide_v, l->d_k_norm,
                                      g_pool_k4[L], g_pool_kq4s[L], g_pool_v8[L], g_pool_vscale[L],
                                      g_wide_pos, g_slot_ids, g_block_table, g_pg_maxblk, g_pg_page, g_pg_plog,
@@ -26616,6 +26646,9 @@ static int run_paged_decode_step_core(int N, int any_samp) {
                   tq_wide_fmt_ok(&l->linear_in_b) && tq_wide_fmt_ok(&l->linear_in_a) &&
                   tq_wide_fmt_ok(&l->linear_out) && tq_wide_fmt_ok(&l->mlp_gate) &&
                   tq_wide_fmt_ok(&l->mlp_down))) return -70;
+            int nfold_d = (norm_fold_enabled() & 1) && tq_fuse_norm() &&
+                          l->linear_in_qkv.nvf4 && l->linear_in_z.nvf4 &&
+                          l->linear_in_b.nvf4 && l->linear_in_a.nvf4;
             if ((ret = wide_norm_quant(g_wide_norm, g_wide_h, l->d_input_ln, H, N,
                                        l->linear_in_qkv.nvf4 && l->linear_in_z.nvf4 &&
                                        l->linear_in_b.nvf4 && l->linear_in_a.nvf4)) != 0) return -71;
@@ -26623,6 +26656,12 @@ static int run_paged_decode_step_core(int N, int any_samp) {
             if ((ret = wide_proj(&l->linear_in_z, g_wide_z, N)) != 0) return -72;
             if ((ret = wide_proj(&l->linear_in_b, g_wide_b, N)) != 0) return -73;
             if ((ret = wide_proj(&l->linear_in_a, g_wide_a, N)) != 0) return -74;
+            if (nfold_d) {
+                k_tq_scale_cols<<<(unsigned)(((long)l->linear_in_qkv.M * N + 255) / 256), 256, 0, g_qwen.stream>>>(g_wide_qkv, g_wide_fac, l->linear_in_qkv.M, N);
+                k_tq_scale_cols<<<(unsigned)(((long)l->linear_in_z.M * N + 255) / 256), 256, 0, g_qwen.stream>>>(g_wide_z, g_wide_fac, l->linear_in_z.M, N);
+                k_tq_scale_cols<<<(unsigned)(((long)l->linear_in_b.M * N + 255) / 256), 256, 0, g_qwen.stream>>>(g_wide_b, g_wide_fac, l->linear_in_b.M, N);
+                k_tq_scale_cols<<<(unsigned)(((long)l->linear_in_a.M * N + 255) / 256), 256, 0, g_qwen.stream>>>(g_wide_a, g_wide_fac, l->linear_in_a.M, N);
+            }
             k_tq_linear_conv_update_paged<<<dim3((conv_dim + 255) / 256, N), 256, 0, g_qwen.stream>>>(
                 g_wide_qkv, g_pg_conv[L], g_wide_qkv, l->d_linear_conv1d, conv_dim,
                 g_qwen.linear_conv_kernel_dim, g_slot_ids, conv_f);
@@ -26835,7 +26874,8 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
         if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION) {
             if (!(tq_wide_fmt_ok(&l->q_proj) && tq_wide_fmt_ok(&l->o_proj) &&
                   tq_wide_fmt_ok(&l->mlp_gate) && tq_wide_fmt_ok(&l->mlp_down))) return -92;
-            k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(T), T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
+            k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(T), T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h,
+                l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, T)) != 0) return -93;
             if ((ret = wide_proj(&l->q_proj, g_wide_q, T)) != 0) return -93;
             if ((ret = wide_proj(&l->k_proj, g_wide_k, T)) != 0) return -93;
@@ -26877,7 +26917,8 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
                   tq_wide_fmt_ok(&l->linear_in_b) && tq_wide_fmt_ok(&l->linear_in_a) &&
                   tq_wide_fmt_ok(&l->linear_out) && tq_wide_fmt_ok(&l->mlp_gate) &&
                   tq_wide_fmt_ok(&l->mlp_down))) return -97;
-            k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(T), T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
+            k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(T), T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h,
+                l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, T)) != 0) return -98;
             if ((ret = wide_proj(&l->linear_in_qkv, g_wide_qkv, T)) != 0) return -98;
             if ((ret = wide_proj(&l->linear_in_z, g_wide_z, T)) != 0) return -98;
@@ -27189,7 +27230,8 @@ static int run_paged_spec_verify_core(const int *tokens, const int *col_slot, co
         if (g_qwen.layer_types[L] == TQ_LAYER_FULL_ATTENTION) {
             if (!(tq_wide_fmt_ok(&l->q_proj) && tq_wide_fmt_ok(&l->o_proj) &&
                   tq_wide_fmt_ok(&l->mlp_gate) && tq_wide_fmt_ok(&l->mlp_down))) return -92;
-            k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(T), T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
+            k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(T), T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h,
+                l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, T)) != 0) return -93;
             if ((ret = wide_proj(&l->q_proj, g_wide_q, T)) != 0) return -93;
             if ((ret = wide_proj(&l->k_proj, g_wide_k, T)) != 0) return -93;
@@ -27220,7 +27262,8 @@ static int run_paged_spec_verify_core(const int *tokens, const int *col_slot, co
                   tq_wide_fmt_ok(&l->linear_in_b) && tq_wide_fmt_ok(&l->linear_in_a) &&
                   tq_wide_fmt_ok(&l->linear_out) && tq_wide_fmt_ok(&l->mlp_gate) &&
                   tq_wide_fmt_ok(&l->mlp_down))) return -97;
-            k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(T), T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h, l->d_input_ln, H, g_qwen.eps);
+            k_tq_qwen_rmsnorm_b<<<dim3(tq_norm_stripes(T), T), 1024, 0, g_qwen.stream>>>(g_wide_norm, g_wide_h,
+                l->d_input_ln, H, g_qwen.eps);
             if ((ret = wide_quant_input(g_wide_norm, H, T)) != 0) return -98;
             if ((ret = wide_proj(&l->linear_in_qkv, g_wide_qkv, T)) != 0) return -98;
             if ((ret = wide_proj(&l->linear_in_z, g_wide_z, T)) != 0) return -98;
