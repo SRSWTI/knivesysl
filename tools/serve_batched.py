@@ -629,6 +629,14 @@ class BatchedEngine:
         _t1 = time.perf_counter()
         rc = self.L.qwn_paged_spec_round(sl, seeds, pos, dr, dl, n, maxd, out, om)
         _t2 = time.perf_counter()
+        if rc in (-111, -3):
+            # Archive/pool unavailable (VRAM): the round fails BEFORE touching
+            # any slot state, so plain decode is safe. Degrade permanently
+            # instead of erroring requests (vLLM semantics: never 500 a request
+            # because an optional accelerator could not allocate).
+            self.spec_maxd = 0
+            print(f"[engine] spec unavailable rc={rc}; permanent plain-decode fallback", flush=True)
+            return self._step()
         if rc != 0:
             # a failed round can leave a partial slot rewound-but-unreplayed:
             # fail the participants (the _loop wave-error contract handles it)

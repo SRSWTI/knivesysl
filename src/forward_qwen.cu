@@ -26365,6 +26365,8 @@ static int paged_ensure_blocks(int slot, int pos) {
 }
 
 // Allocate the shared paged pool: num_blocks blocks of `page` positions (Q4 KV for the 16
+static int paged_spec_pool_init(void);
+static int paged_spec_ensure_archive(int recur_f, int conv_f);
 // full-attn layers) + per-slot DeltaNet state for max_slots. page must be a power of two.
 extern "C" int qwn_paged_init(int max_slots, int num_blocks, int page) {
     if (!g_qwen.initialized) return -1;
@@ -26427,6 +26429,13 @@ extern "C" int qwn_paged_init(int max_slots, int num_blocks, int page) {
     if (ensure_wide_prefill_buffers(max_slots) != 0) { free(hi); paged_free_all(); return -8; }
     cudaStreamSynchronize(g_qwen.stream);
     free(hi);
+    // Eager spec allocations (TQ_PAGED_SPEC): claim the node archive at init
+    // while VRAM is clean. A lazy first-round cudaMalloc lands AFTER the deep
+    // prefill transients, fails, and permanently disables spec (observed with a
+    // 26K-token client: "no VRAM for 1212 MB, paged spec disabled").
+    { const char *se = getenv("TQ_PAGED_SPEC");
+      if (se && atoi(se) != 0 && paged_spec_pool_init() > 0)
+          (void)paged_spec_ensure_archive(batched_recur_floats(), batched_conv_floats()); }
     g_pg_ready = 1;
     return 0;
 }
