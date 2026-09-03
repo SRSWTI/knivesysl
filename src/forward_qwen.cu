@@ -25239,6 +25239,270 @@ void k_tq_paged_attn_q4_split_gqa_v2(
 }
 
 // ===========================================================================
+// E.gqa.v3: tensor-core scores (stage-7 e1). Identical staging, online
+// softmax, j-ascending V fold, and partials/merge contract as v2; only the
+// score phase changes: all 8 warps cooperatively dequant the staged chunk to
+// bf16 in shared, then warps 0-1 run ldmatrix.x4 + mma.sync.m16n8k16 (fp32
+// accumulate) over 16 k-steps. Probe (tools/microbench_attn_bw.cu):
+// -21.6..-21.8% kernel time at 32k n1/n4 and 131k n1, rel_l2 2.2e-4 vs the
+// fp32 clone -- bf16 operand class, dwarfed by the K int4 quantization error.
+// CH=32 (two m16 row tiles), NST=2; 48.25 KB dynamic smem -> needs the >48K
+// opt-in and still holds 2 CTAs/SM under the 99 KB carveout. The fp32 q prep
+// scratch lives in the KB region (dead until the first dequant), then encodes
+// to bf16 qb. Requires hd==256 / GQA==6 (dispatch-gated).
+#define TQ_PAV3_CH  32
+#define TQ_PAV3_NST 2
+#define TQ_PAV3_SKB      (TQ_PAV3_CH * 128)             // K4 codes per buffer
+#define TQ_PAV3_SCB      (TQ_PAV3_CH * 64)              // (scale,zp) bytes per buffer
+#define TQ_PAV3_SVB      (TQ_PAV3_CH * 256)             // V8 bytes per buffer
+#define TQ_PAV3_OFF_QB   0                              // bf16 q: 6*256*2 = 3072
+#define TQ_PAV3_OFF_SK   3072
+#define TQ_PAV3_OFF_SC   (TQ_PAV3_OFF_SK + TQ_PAV3_NST * TQ_PAV3_SKB)
+#define TQ_PAV3_OFF_SV   (TQ_PAV3_OFF_SC + TQ_PAV3_NST * TQ_PAV3_SCB)
+#define TQ_PAV3_OFF_VS   (TQ_PAV3_OFF_SV + TQ_PAV3_NST * TQ_PAV3_SVB)
+#define TQ_PAV3_OFF_SCH  (TQ_PAV3_OFF_VS + TQ_PAV3_NST * TQ_PAV3_CH * 4)
+#define TQ_PAV3_OFF_CTL  (TQ_PAV3_OFF_SCH + 6 * TQ_PAV3_CH * 4)
+#define TQ_PAV3_OFF_KB   (TQ_PAV3_OFF_CTL + 256)        // bf16 K chunk: 32 x 256
+#define TQ_PAV3_SMEM     (TQ_PAV3_OFF_KB + TQ_PAV3_CH * 256 * 2)
+// fp32 -> bf16 round-to-nearest-even; matches __float2bfloat16_rn for finite
+// inputs (scores and q are always finite here) without pulling in cuda_bf16.h.
+static __device__ __forceinline__ uint16_t tq_f2bf16_rne(float f) {
+    uint32_t u = __float_as_uint(f);
+    u += 0x7FFFu + ((u >> 16) & 1u);
+    return (uint16_t)(u >> 16);
+}
+template <int GQA>
+__global__ __launch_bounds__(256, 2)
+void k_tq_paged_attn_q4_split_gqa_v3(
+    const float *q_proj_base, const uint16_t *q_norm_w,
+    const uint8_t *k4_pool, const float *kq4s_pool, const uint8_t *v8_pool, const float *vscale_pool,
+    const int *positions, const int *slot_ids,
+    const int *block_table, int max_blocks, int page, int page_log,
+    int nh, int nkv, int hd, int q_m, int S,
+    float eps, float rope_theta, float *part_acc, float *part_ml) {
+    extern __shared__ uint32_t sm_u32[];               // shared extern symbol (uint32 TU-wide)
+    char *sm = (char *)sm_u32;
+    uint16_t *qb = (uint16_t *)(sm + TQ_PAV3_OFF_QB);              // [GQA][256] bf16
+    uint16_t *kb = (uint16_t *)(sm + TQ_PAV3_OFF_KB);              // [CH][256] bf16
+    float *qn = (float *)(sm + TQ_PAV3_OFF_KB);                    // prep scratch aliases KB
+    float *sch = (float *)(sm + TQ_PAV3_OFF_SCH);                  // [GQA][32]
+    float *ctl = (float *)(sm + TQ_PAV3_OFF_CTL);
+    float *m_run = ctl, *l_run = ctl + GQA, *m_new_s = ctl + 2 * GQA,
+          *alpha_s = ctl + 3 * GQA, *l_chunk_s = ctl + 4 * GQA;
+    float *partial = ctl + 5 * GQA;                                // [8]
+    float *q_sum_shared = partial + 8;
+    const int kv_head = blockIdx.x, col = blockIdx.y, split = blockIdx.z, tid = threadIdx.x;
+    if (kv_head >= nkv || tid >= hd) return;
+    const int group = nh / nkv;                  // == GQA
+    const int pos = positions[col];
+    const int slot = slot_ids[col];
+    const int rotary_dim = 64;
+    const float *q_proj = q_proj_base + (size_t)col * q_m;
+
+    // ---- per-head Q prep (norm -> RoPE -> Hadamard), identical to v2
+    #pragma unroll
+    for (int g = 0; g < GQA; g++) {
+        int head = kv_head * group + g;
+        float qv = q_proj[head * (2 * hd) + tid];
+        float qsum = qv * qv;
+        for (int offset = 16; offset > 0; offset >>= 1) qsum += __shfl_down_sync(0xffffffff, qsum, offset);
+        if ((tid & 31) == 0) partial[tid >> 5] = qsum;
+        __syncthreads();
+        if (tid < 8) {
+            float vtmp = partial[tid];
+            for (int offset = 4; offset > 0; offset >>= 1) vtmp += __shfl_down_sync(0xff, vtmp, offset);
+            if (tid == 0) *q_sum_shared = vtmp;
+        }
+        __syncthreads();
+        float rms = rsqrtf(*q_sum_shared / (float)hd + eps);
+        qv = qv * rms * (1.0f + tq_bf16_to_float(q_norm_w[tid]));
+        if (tid < rotary_dim) {
+            int idx = tid & 31;
+            float freq = powf(rope_theta, -((float)(2 * idx) / (float)rotary_dim));
+            float angle = (float)pos * freq;
+            float c = cosf(angle), s = sinf(angle);
+            int pi = (tid < 32) ? tid + 32 : tid - 32;
+            float q_pair = q_proj[head * (2 * hd) + pi];
+            q_pair = q_pair * rms * (1.0f + tq_bf16_to_float(q_norm_w[pi]));
+            float q_rot = (tid < 32) ? -q_pair : q_pair;
+            qv = qv * c + q_rot * s;
+        }
+        qn[g * 256 + tid] = qv;
+        __syncthreads();
+        tq_fwht256(&qn[g * 256], tid);
+        qb[g * 256 + tid] = tq_f2bf16_rne(qn[g * 256 + tid]);  // fwht tail synced
+    }
+    if (tid < GQA) { m_run[tid] = -3.402823466e38f; l_run[tid] = 0.0f; }
+    __syncthreads();                                    // qb complete; qn region dies here
+
+    const size_t bt_base = (size_t)slot * max_blocks;
+    const size_t k4_pp = (size_t)(nkv * hd) >> 1, kq4s_pp = (size_t)nkv * 16, v8_pp = (size_t)nkv * hd;
+    const int warp = tid >> 5, lane = tid & 31;
+    const float scale = rsqrtf((float)hd);
+    float acc[GQA];
+    #pragma unroll
+    for (int g = 0; g < GQA; g++) acc[g] = 0.0f;
+    const int total = pos + 1;
+    const int per = (total + S - 1) / S;
+    const int lo = split * per;
+    int hi = lo + per; if (hi > total) hi = total;
+    if (lo >= hi) {                                     // empty split: v1-equivalent partials
+        #pragma unroll
+        for (int g = 0; g < GQA; g++) {
+            int head = kv_head * group + g;
+            size_t pidx = ((size_t)(head * gridDim.y + col) * S + split);
+            part_acc[pidx * hd + tid] = 0.0f;
+            if (tid == 0) { part_ml[pidx * 2 + 0] = -3.402823466e38f; part_ml[pidx * 2 + 1] = 0.0f; }
+        }
+        return;
+    }
+
+    // one cp.async group per chunk: K 8 + scales 4/2 + V 16 + vscale segments
+    auto issue = [&](int c0i) {
+        int clen = hi - c0i; if (clen > TQ_PAV3_CH) clen = TQ_PAV3_CH;
+        int buf = ((c0i - lo) / TQ_PAV3_CH) % TQ_PAV3_NST;
+        for (int id = tid; id < (clen << 3); id += 256) {
+            int j = id >> 3, seg = id & 7, t = c0i + j;
+            int phys = block_table[bt_base + (t >> page_log)];
+            size_t pr = (size_t)phys * page + (t & (page - 1));
+            tq_cp_async16((uint32_t)__cvta_generic_to_shared(sm + TQ_PAV3_OFF_SK + buf * TQ_PAV3_SKB + j * 128 + seg * 16),
+                          k4_pool + pr * k4_pp + (size_t)kv_head * (hd >> 1) + seg * 16);
+        }
+        int scseg = gc_kv_q4_fp32s ? 4 : 2;             // 64 B fp32 / 32 B fp16 per row
+        for (int id = tid; id < clen * scseg; id += 256) {
+            int j = id / scseg, seg = id % scseg, t = c0i + j;
+            int phys = block_table[bt_base + (t >> page_log)];
+            size_t pr = (size_t)phys * page + (t & (page - 1));
+            const char *src = (const char *)q4s_adv(kq4s_pool, pr * kq4s_pp + (size_t)kv_head * 16) + seg * 16;
+            tq_cp_async16((uint32_t)__cvta_generic_to_shared(sm + TQ_PAV3_OFF_SC + buf * TQ_PAV3_SCB + j * 64 + seg * 16), src);
+        }
+        for (int id = tid; id < (clen << 4); id += 256) {
+            int j = id >> 4, seg = id & 15, t = c0i + j;
+            int phys = block_table[bt_base + (t >> page_log)];
+            size_t pr = (size_t)phys * page + (t & (page - 1));
+            tq_cp_async16((uint32_t)__cvta_generic_to_shared(sm + TQ_PAV3_OFF_SV + buf * TQ_PAV3_SVB + j * 256 + seg * 16),
+                          v8_pool + pr * v8_pp + (size_t)kv_head * hd + seg * 16);
+        }
+        for (int j = tid; j < clen; j += 256) {
+            int t = c0i + j;
+            int phys = block_table[bt_base + (t >> page_log)];
+            size_t pr = (size_t)phys * page + (t & (page - 1));
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                :: "r"((uint32_t)__cvta_generic_to_shared(sm + TQ_PAV3_OFF_VS + buf * (TQ_PAV3_CH * 4) + j * 4)),
+                   "l"(vscale_pool + pr * nkv + kv_head));
+        }
+        asm volatile("cp.async.commit_group;\n");
+    };
+
+    // 2-deep: prologue commits group 0; iteration ci commits group ci+1 (real
+    // or empty) and waits "<=1 pending", i.e. group ci complete. Buffer
+    // (ci+1)%2 was consumed at iteration ci-1, whose tail __syncthreads fences
+    // the reuse.
+    issue(lo);
+    for (int c0 = lo; c0 < hi; c0 += TQ_PAV3_CH) {
+        int clen = hi - c0; if (clen > TQ_PAV3_CH) clen = TQ_PAV3_CH;
+        const int buf = ((c0 - lo) / TQ_PAV3_CH) % TQ_PAV3_NST;
+        if (c0 + TQ_PAV3_CH < hi) issue(c0 + TQ_PAV3_CH);
+        else asm volatile("cp.async.commit_group;\n");  // keep group index == chunk index
+        asm volatile("cp.async.wait_group 1;\n");
+        __syncthreads();
+        // ---- cooperative bf16 dequant of the whole chunk (all 8 warps) ----
+        const uint8_t *skb = (const uint8_t *)(sm + TQ_PAV3_OFF_SK + buf * TQ_PAV3_SKB);
+        const char *scb = sm + TQ_PAV3_OFF_SC + buf * TQ_PAV3_SCB;
+        for (int idx = tid; idx < TQ_PAV3_CH * 256; idx += 256) {
+            int j = idx >> 8, d = idx & 255;
+            float v = 0.0f;
+            if (j < clen) {
+                uint8_t byte = skb[j * 128 + (d >> 1)];
+                float code = (float)((d & 1) ? (byte >> 4) : (byte & 15));
+                const float *ksz = (const float *)(scb + j * 64);
+                v = (code - q4s_at(ksz, ((d >> 5) << 1) + 1)) * q4s_at(ksz, (d >> 5) << 1);
+            }
+            kb[j * 256 + d] = tq_f2bf16_rne(v);
+        }
+        __syncthreads();
+        // ---- tensor-core scores: warps 0-1, one m16 tile each ----
+        if (warp < 2) {
+            const int row0 = warp * 16;
+            const int gid = lane >> 2, tig = lane & 3;
+            float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+            const uint32_t *qw = (const uint32_t *)qb;
+            #pragma unroll
+            for (int ks = 0; ks < 16; ks++) {           // hd==256 (dispatch-gated)
+                const int dbase = ks * 16;
+                uint32_t a0, a1, a2, a3;
+                // x4 ldmatrix: lanes 0-15 -> rows (col group 0), 16-31 -> rows (col group 1)
+                uint32_t addr = (uint32_t)__cvta_generic_to_shared(
+                    kb + (size_t)(row0 + (lane & 15)) * 256 + dbase + ((lane >> 4) << 3));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(addr));
+                uint32_t b0 = 0, b1 = 0;
+                if (gid < GQA) {
+                    b0 = qw[(gid * 256 + dbase + tig * 2) >> 1];
+                    b1 = qw[(gid * 256 + dbase + tig * 2 + 8) >> 1];
+                }
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                    : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+            }
+            // D map (m16n8 f32): {d0,d1} -> (row gid, head tig*2 / +1), {d2,d3} -> row gid+8
+            const int jr0 = row0 + gid, jr1 = row0 + gid + 8;
+            const int gc0 = tig * 2, gc1 = tig * 2 + 1;
+            if (gc0 < GQA) {
+                if (jr0 < clen) sch[gc0 * TQ_PAV3_CH + jr0] = d0 * scale;
+                if (jr1 < clen) sch[gc0 * TQ_PAV3_CH + jr1] = d2 * scale;
+            }
+            if (gc1 < GQA) {
+                if (jr0 < clen) sch[gc1 * TQ_PAV3_CH + jr0] = d1 * scale;
+                if (jr1 < clen) sch[gc1 * TQ_PAV3_CH + jr1] = d3 * scale;
+            }
+        }
+        __syncthreads();
+        // online softmax: warp g owns head g (32-wide, CH=32)
+        if (warp < GQA) {
+            const int g = warp;
+            float v0 = (lane < clen) ? sch[g * TQ_PAV3_CH + lane] : -3.402823466e38f;
+            float m = v0;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+            float m_old = m_run[g], m_new = fmaxf(m_old, m);
+            float p0 = (lane < clen) ? expf(v0 - m_new) : 0.0f;
+            if (lane < clen) sch[g * TQ_PAV3_CH + lane] = p0;
+            float ls = p0;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) ls += __shfl_xor_sync(0xffffffffu, ls, off);
+            if (lane == 0) {
+                float alpha = expf(m_old - m_new);
+                m_new_s[g] = m_new; alpha_s[g] = alpha; l_chunk_s[g] = ls;
+                l_run[g] = l_run[g] * alpha + ls; m_run[g] = m_new;
+            }
+        }
+        __syncthreads();
+        // V fold from staged bytes: thread owns dim, j ascending, v1 association
+        #pragma unroll
+        for (int g = 0; g < GQA; g++) acc[g] *= alpha_s[g];
+        const uint8_t *vb = (const uint8_t *)(sm + TQ_PAV3_OFF_SV + buf * TQ_PAV3_SVB);
+        const float *vsb = (const float *)(sm + TQ_PAV3_OFF_VS + buf * (TQ_PAV3_CH * 4));
+        for (int j = 0; j < clen; j++) {
+            float vcode = tq_e4m3_dec_fast(vb[j * 256 + tid]);
+            float vscl = vsb[j];
+            #pragma unroll
+            for (int g = 0; g < GQA; g++) acc[g] += sch[g * TQ_PAV3_CH + j] * vcode * vscl;
+        }
+        __syncthreads();                                // buffer + sch + kb reuse fence
+    }
+    #pragma unroll
+    for (int g = 0; g < GQA; g++) {
+        int head = kv_head * group + g;
+        size_t pidx = ((size_t)(head * gridDim.y + col) * S + split);
+        part_acc[pidx * hd + tid] = acc[g];
+        if (tid == 0) { part_ml[pidx * 2 + 0] = m_run[g]; part_ml[pidx * 2 + 1] = l_run[g]; }
+    }
+}
+
+// ===========================================================================
 // E.gqa.chain: CHAIN-SHARED paged verify attention.
 // ---------------------------------------------------------------------------
 // A speculative verify wave sends T chain columns; the per-column kernels walk
@@ -25684,6 +25948,16 @@ static int paged_attn_v2(void) {
     if (en < 0) { const char *e = getenv("TQ_PAGED_ATTN_V2"); en = (e && *e) ? (atoi(e) != 0) : 1; }
     return en;
 }
+// Stage-7 e1: tensor-core score path. 0=off, 1=auto (measured dispatch map;
+// default), 2=force. Auto routes OFF at every byte-exact-gated greedy shape
+// (2k/32k n=1 single-wave cells), so stored greedy references stay valid; the
+// tf gate (n=1025, force-all) measured -0.29 top1 at 15:18 asymmetry = the
+// bf16 eps class (control band -0.19 at 17:15).
+static int paged_attn_v3(void) {
+    static int en = -1;
+    if (en < 0) { const char *e = getenv("TQ_PAGED_ATTN_V3"); en = (e && *e) ? atoi(e) : 1; if (en < 0) en = 0; }
+    return en;
+}
 
 // The GQA kernel has nkv (not nh) CTAs per column, i.e. 6x fewer, so the split
 // has to work 6x harder to fill the SMs -- and it can, because the whole point is
@@ -25766,8 +26040,38 @@ static int launch_paged_attn_q4(float *out, const float *q_proj, const uint16_t 
     // through split+merge -- at S=1 the merge is exp(0)=1 * acc / l * sigmoid(gate),
     // i.e. exactly what the single kernel writes.
     if (paged_attn_gqa() && nkv > 0 && (nh % nkv) == 0 && hd == 256 && (nh / nkv) == 6) {
-        int S = paged_attn_v2() ? paged_split_S_gqa_v2(N, max_pos) : paged_split_S_gqa(N, max_pos);
+        int S = (paged_attn_v2() || paged_attn_v3()) ? paged_split_S_gqa_v2(N, max_pos)
+                                                     : paged_split_S_gqa(N, max_pos);
         if (ensure_attn_partials((size_t)nh * N * S) != 0) return -2;
+        // v3 dispatch (measured, 7-point map 2026-09-03): the tensor-core score
+        // path wins with deep CTA queues (>=2 full waves keep the 2-deep
+        // pipeline's copy stalls hidden by co-resident work) or very long
+        // per-CTA walks (steady state amortizes them); it loses 2-8% in the
+        // exactly-one-wave short-walk regime (1:32k +7.6%, 1:65k +2.6%,
+        // 4:8k +3.7% vs wins 4:32k -2.2%, 2:65k -5.2%, 1:131k -5.6%).
+        // TQ_PAGED_ATTN_V3=1 -> auto rule below; =2 -> force everywhere.
+        int v3_mode = paged_attn_v3();
+        int v3_rows = (max_pos + S) / S;                // rows per split CTA
+        int use_v3 = v3_mode == 2 ||
+                     (v3_mode == 1 && (nkv * N * S >= 1024 || v3_rows >= 1200));
+        if (use_v3) {
+            static int v3_attr = 0;                     // >48 KB dynamic smem opt-in, once
+            if (!v3_attr) {
+                if (cudaFuncSetAttribute(k_tq_paged_attn_q4_split_gqa_v3<6>,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         TQ_PAV3_SMEM) != cudaSuccess) v3_attr = -1;
+                else v3_attr = 1;
+            }
+            if (v3_attr > 0) {
+                k_tq_paged_attn_q4_split_gqa_v3<6><<<dim3(nkv, N, S), hd, TQ_PAV3_SMEM, st>>>(
+                    q_proj, q_norm_w, k4_pool, kq4s_pool, v8_pool, vscale_pool, positions, slot_ids,
+                    block_table, max_blocks, page, page_log, nh, nkv, hd, q_m, S, g_qwen.eps, g_qwen.rope_theta,
+                    g_attn_pacc, g_attn_pml);
+                k_tq_paged_attn_q4_merge<<<dim3(nh, N), hd, 0, st>>>(
+                    out, q_proj, positions, nh, hd, q_m, attn_m, S, g_attn_pacc, g_attn_pml);
+                return cudaGetLastError() == cudaSuccess ? 0 : -1;
+            }
+        }
         if (paged_attn_v2()) {
             static int v2_attr = 0;                     // >48 KB dynamic smem opt-in, once
             if (!v2_attr) {
