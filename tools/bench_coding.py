@@ -35,8 +35,9 @@ def sized_doc(target_chars, seed):
 THINK = os.environ.get("TQ_BENCH_THINK", "0") not in ("", "0")
 
 def chat(messages, max_tokens=192):
-    body = json.dumps({"messages": messages, "temperature": 0.0,
-                       "max_tokens": max_tokens, "enable_thinking": THINK}).encode()
+    body = json.dumps({"model": "ksl", "messages": messages,
+                       "temperature": 0.0, "max_tokens": max_tokens,
+                       "enable_thinking": THINK}).encode()
     req = urllib.request.Request(f"http://127.0.0.1:{PORT}/v1/chat/completions",
                                  data=body, headers={"Content-Type": "application/json"})
     t0 = time.time()

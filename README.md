@@ -259,15 +259,22 @@ it does not move the weight-read roofline.
 ![vs vllm](docs/apc/vs_vllm.svg)
 ![the honest loss](docs/apc/divergence_loss.svg)
 
-production uses `tools/serve_prod.sh`, a restart wrapper with core dumps enabled.
-`/v1/healthz` reports queue depths, forward-progress age, the cached free-block
-sample, the engine-thread state, and the last engine error without entering cuda.
-an independent watchdog dumps every python thread and exits after 120 seconds of
-queued/active work without a completed wave, so the wrapper can replace a wedged
-process. the engine also exits after consecutive step failures instead of serving
-through a poisoned cuda context. host-tier checkpoint demotion remains opt-in:
-its current pinned allocation and full-image copies are synchronous and do not
-belong in the scheduler hot path until the asynchronous Track D implementation lands.
+production uses `tools/serve_prod.sh`, a singleton restart supervisor with core
+dumps, signal forwarding, bounded graceful shutdown, and capped exponential
+backoff. `/healthz`, `/readyz`, and `/livez` are CUDA-free: they expose readiness,
+queue/slot ownership, cached block capacity, engine phase, forward-progress age,
+and the last native error without entering a possibly wedged CUDA context.
+`/metrics` exports request outcomes and latency, scheduler/cache/speculation
+counters, engine liveness and phase, and supervisor restart state in Prometheus
+text format. An independent watchdog dumps every Python thread and exits after a
+bounded interval of queued/active work without a completed native wave, allowing
+the supervisor to replace a wedged process. Native failures preserve request/slot
+ownership until cleanup succeeds; repeated failures terminate rather than serving
+through a poisoned CUDA context. HTTP admission, body size, queue age, request age,
+disconnect cancellation, duplicate request IDs, and shutdown are all bounded.
+Host-tier checkpoint demotion remains opt-in: its current pinned allocation and
+full-image copies are synchronous and do not belong in the scheduler hot path
+until the asynchronous Track D implementation lands.
 
 ---
 ## how it works
@@ -418,8 +425,10 @@ turns.
 | `--prefill-budget` | prompt columns per wave, on top of the decode rows |
 | `--prefix-cache` | materialize a shared prompt prefix once (batched server) |
 | `TQ_CKPT_HOST_GB` | pinned-RAM checkpoint tier budget; default 0 because demote/promote is still synchronous |
-| `TQ_HEALTH_STALL_S` | `/v1/healthz` no-progress threshold (production default 60 seconds) |
-| `TQ_ENGINE_WATCHDOG_S` | fatal no-progress threshold before supervisor restart (production default 120 seconds) |
+| `TQ_HEALTH_STALL_S` | `/healthz` readiness threshold for queued/active work without a completed wave (production default 603 seconds) |
+| `TQ_ENGINE_WATCHDOG_S` | fatal no-progress threshold before supervisor restart (production default 1203 seconds) |
+| `--max-queue` / `--max-http-concurrency` | bound queued inference work and simultaneous HTTP handlers |
+| `--queue-timeout` / `--request-timeout` | bound time before admission and total request lifetime |
 
 ## verify
 
@@ -432,6 +441,7 @@ python3 tools/bench_decode.py --cases 1:2048,32:2048,1:131072
 python3 tools/tf_agreement.py --chunk 256          # then diff two runs position by position
 TQ_W_NVFP4=mlp python3 tools/nvfp4_check.py       # nvfp4 vs fp64 decode of the same bytes
 TQ_W_NVFP4=mlp python3 tools/nvfp4_quality.py     # then diff ARGMAX against a TQ_W_NVFP4=0 run
+python3 tools/test_server_reliability.py          # live HTTP lifecycle/concurrency regression
 ```
 
 ## layout

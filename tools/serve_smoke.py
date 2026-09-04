@@ -14,8 +14,9 @@ src = (REPO / "src" / "forward_qwen.cu").read_text(errors="ignore")
 doc = src[:DOC_CHARS]
 
 def chat(messages, max_tokens=48):
-    body = json.dumps({"messages": messages, "temperature": 0.0,
-                       "max_tokens": max_tokens}).encode()
+    body = json.dumps({"model": "ksl", "messages": messages,
+                       "temperature": 0.0, "max_tokens": max_tokens,
+                       "chat_template_kwargs": {"enable_thinking": False}}).encode()
     req = urllib.request.Request(f"http://127.0.0.1:{PORT}/v1/chat/completions",
                                  data=body, headers={"Content-Type": "application/json"})
     t0 = time.time()

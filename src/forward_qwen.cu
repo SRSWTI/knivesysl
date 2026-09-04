@@ -8098,32 +8098,21 @@ __global__ void k_tq_linear_conv_update_b_fork(float *out, float *state, const f
     outn[i] = sum / (1.0f + expf(-sum));
 }
 
-// Chunk-parallel conv update for the WIDE prefill: position p of the chunk
-// reads x[p-3..p] straight from the chunk buffer (positions before the chunk
-// come from the incoming conv state), so all n positions run in ONE launch
-// (grid (channels/256, n)) instead of n serial per-token launches (measured
-// 9.5% of a 64k prefill = 3.1M launches of 1.3 us). blockIdx.y == n writes the
-// NEW state (the last kernel_size-1 x columns + padding from the old state for
-// short chunks); it touches only `state`, no out column, and no other block
-// reads state, so the in-launch order is free. Per-position math is identical
-// to k_tq_linear_conv_update -> bit-exact. out must NOT alias x (the serial
-// kernel overwrote x[p] after use; parallel positions still need it).
-__global__ void k_tq_linear_conv_update_wide(float *out, float *state, const float *x,
+// Chunk-parallel conv for WIDE prefill. Position p reads x[p-K+1..p]
+// straight from the chunk buffer, with positions before the chunk supplied by
+// the incoming conv state, so all n output positions run in one launch.
+//
+// State commit is deliberately a second, same-stream launch. It used to be
+// blockIdx.y == n in this kernel, but the early-position blocks below read the
+// incoming state while that block overwrote it: an unordered inter-CTA
+// read/write race that made short checkpoint suffixes nondeterministic.
+// out must not alias x because parallel positions still need the raw inputs.
+__global__ void k_tq_linear_conv_update_wide(float *out, const float *state, const float *x,
                                              const uint16_t *conv_weight,
-                                             int channels, int kernel_size, int n) {
+                                             int channels, int kernel_size) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= channels) return;
     int pos = blockIdx.y;
-    if (pos == n) {                                // new state = the last K inputs
-        float tail[8];                             // kernel_size <= 8 (host-gated)
-        for (int j = 0; j < kernel_size; j++) {
-            int k = n - kernel_size + j;           // x index feeding new s[j]
-            tail[j] = (k >= 0) ? x[(size_t)k * channels + i]
-                               : state[(size_t)i * kernel_size + (kernel_size + k)];
-        }
-        for (int j = 0; j < kernel_size; j++) state[(size_t)i * kernel_size + j] = tail[j];
-        return;
-    }
     float sum = 0.0f;
     #pragma unroll 4
     for (int j = 0; j < kernel_size; j++) {
@@ -8133,6 +8122,20 @@ __global__ void k_tq_linear_conv_update_wide(float *out, float *state, const flo
         sum += v * tq_bf16_to_float(conv_weight[i * kernel_size + j]);
     }
     out[(size_t)pos * channels + i] = sum / (1.0f + expf(-sum));
+}
+
+__global__ void k_tq_linear_conv_commit_wide(float *state, const float *x,
+                                             int channels, int kernel_size, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= channels) return;
+    float tail[8];                                 // kernel_size <= 8 (host-gated)
+    for (int j = 0; j < kernel_size; j++) {
+        int k = n - kernel_size + j;               // x index feeding new state[j]
+        tail[j] = (k >= 0) ? x[(size_t)k * channels + i]
+                           : state[(size_t)i * kernel_size + (kernel_size + k)];
+    }
+    for (int j = 0; j < kernel_size; j++)
+        state[(size_t)i * kernel_size + j] = tail[j];
 }
 
 // Fused-tree conv update: processes ALL depth groups in a single launch.
@@ -23458,20 +23461,24 @@ static int run_wide_chunk_forward(const int *tokens, int base_pos, int n) {
                 if ((ret = wide_proj(&l->linear_in_z, g_wide_z, n)) != 0) return -60;
                 if ((ret = wide_proj(&l->linear_in_b, g_wide_b, n)) != 0) return -60;
                 if ((ret = wide_proj(&l->linear_in_a, g_wide_a, n)) != 0) return -60;
-                // Chunk-parallel conv (one launch; position taps read the raw chunk buffer,
-                // block y==n refreshes the state) -- bit-exact vs the old n serial per-token
-                // launches, which were 9.5% of a 64k prefill (3.1M launches x 1.3 us) purely
-                // from launch/serialization overhead. kernel_size > 8 falls back to serial.
+                // Chunk-parallel conv: one launch computes the positions from an
+                // immutable incoming state; a second tiny launch commits the new
+                // state after every reader has completed. Bit-exact vs the old
+                // serial per-token launches; kernel_size > 8 falls back to serial.
                 static int wide_conv_on = -1;
                 if (wide_conv_on < 0) {
                     const char *e = getenv("TQ_WIDE_CONV");
                     wide_conv_on = (e && *e) ? (atoi(e) != 0) : 1;
                 }
                 if (wide_conv_on && g_qwen.linear_conv_kernel_dim <= 8) {
-                    k_tq_linear_conv_update_wide<<<dim3((conv_dim + 255) / 256, n + 1), 256, 0,
+                    dim3 conv_grid((conv_dim + 255) / 256, n);
+                    k_tq_linear_conv_update_wide<<<conv_grid, 256, 0, g_qwen.stream>>>(
+                        g_wide_conv, l->d_linear_conv_state, g_wide_qkv,
+                        l->d_linear_conv1d, conv_dim, g_qwen.linear_conv_kernel_dim);
+                    k_tq_linear_conv_commit_wide<<<(conv_dim + 255) / 256, 256, 0,
                                                    g_qwen.stream>>>(
-                        g_wide_conv, l->d_linear_conv_state, g_wide_qkv, l->d_linear_conv1d,
-                        conv_dim, g_qwen.linear_conv_kernel_dim, n);
+                        l->d_linear_conv_state, g_wide_qkv, conv_dim,
+                        g_qwen.linear_conv_kernel_dim, n);
                 } else {
                     for (int i = 0; i < n; i++)
                         k_tq_linear_conv_update<<<(conv_dim + 255) / 256, 256, 0, g_qwen.stream>>>(
@@ -27243,19 +27250,30 @@ static int run_paged_prefill_wave_core(const int *tokens, const int *col_slot, c
             if ((ret = wide_proj(&l->linear_in_b, g_wide_b, T)) != 0) return -98;
             if ((ret = wide_proj(&l->linear_in_a, g_wide_a, T)) != 0) return -98;
             TQ_WV_CK("delta_in_proj");
+            static int wide_conv_on = -1;
+            if (wide_conv_on < 0) {
+                const char *e = getenv("TQ_WIDE_CONV");
+                wide_conv_on = (e && *e) ? (atoi(e) != 0) : 1;
+            }
             for (int k = 0; k < K; k++) {     // per-client conv + chunkwise DeltaNet over the segment
                 int off = seg_off[k], n = seg_len[k], slot = seg_slot[k];
-                // Position-parallel conv (grid y = n+1), the same kernel the contiguous
-                // path uses: the serial-per-channel k_tq_linear_conv_chunk ran 40 blocks
-                // total with a 2048-iteration dependent loop per thread -- 755 ms of a
-                // 5.1 s paged 32k prefill vs 83 ms for this kernel (bit-identical taps,
-                // sum order, and state math; out must not alias x, hence g_wide_conv).
+                // Position-parallel output over n rows, followed by a same-stream
+                // state commit. The serial-per-channel k_tq_linear_conv_chunk ran
+                // 40 blocks with a dependent position loop -- 755 ms of a 5.1 s
+                // paged 32k prefill versus 83 ms for this path (identical taps,
+                // sum order, and state math; out must not alias x).
                 float *cvout = g_wide_conv + (size_t)off * conv_dim;
-                if (g_qwen.linear_conv_kernel_dim <= 8) {
-                    k_tq_linear_conv_update_wide<<<dim3((conv_dim + 255) / 256, n + 1), 256, 0, g_qwen.stream>>>(
+                if (wide_conv_on && g_qwen.linear_conv_kernel_dim <= 8) {
+                    dim3 conv_grid((conv_dim + 255) / 256, n);
+                    k_tq_linear_conv_update_wide<<<conv_grid, 256, 0, g_qwen.stream>>>(
                         cvout, g_pg_conv[L] + (size_t)slot * conv_f,
                         g_wide_qkv + (size_t)off * conv_dim, l->d_linear_conv1d,
-                        conv_dim, g_qwen.linear_conv_kernel_dim, n);
+                        conv_dim, g_qwen.linear_conv_kernel_dim);
+                    k_tq_linear_conv_commit_wide<<<(conv_dim + 255) / 256, 256, 0,
+                                                   g_qwen.stream>>>(
+                        g_pg_conv[L] + (size_t)slot * conv_f,
+                        g_wide_qkv + (size_t)off * conv_dim, conv_dim,
+                        g_qwen.linear_conv_kernel_dim, n);
                 } else {
                     k_tq_linear_conv_chunk<<<(conv_dim + 255) / 256, 256, 0, g_qwen.stream>>>(
                         g_wide_qkv + (size_t)off * conv_dim, g_pg_conv[L] + (size_t)slot * conv_f,

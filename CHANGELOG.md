@@ -27,18 +27,43 @@ host-tier path and a separate admission livelock:
    once without wedging subsequent traffic. A promoted checkpoint that cannot be
    adopted is invalidated and retried as a full prefill.
 
-Operational containment is now explicit: `/v1/healthz` is CUDA-free and exposes
-cached capacity, queue depths, engine-thread liveness, forward-progress age, recovery
-and failure counters, and the last engine error. An independent watchdog dumps all
-Python threads and exits after prolonged queued/active work without a completed wave;
-the production wrapper restarts the process. Repeated engine-step failures also
-terminate instead of continuing on a potentially poisoned CUDA context.
+Operational containment is now explicit. `/healthz`, `/readyz`, and `/livez` are
+CUDA-free and distinguish liveness from readiness using cached capacity, queue/slot
+ownership, engine-thread state, phase, forward-progress age, and the last native
+error. `/metrics` exposes coherent request outcome/latency summaries, scheduler
+events, APC/speculation totals, engine phase, and supervisor restart state. Every
+native call is phase-bracketed; wave failures remain process-fatal, while
+request/slot ownership is retained until reset or prefill-abort cleanup succeeds.
 
-Verified on fresh processes: a 5,000-token impossible request returns HTTP 500 in
-6 ms, health remains live, and the next completion succeeds in 234 ms; two concurrent
-26k-token requests plus a short request completed; forced no-progress returned HTTP
-503 and recovered; a forced 0.1-second watchdog dumped stacks and exited with status
-70. Production was restored on port 8000 and passed a 16-token completion smoke test.
+The HTTP boundary now enforces content framing/size, strict JSON and parameter
+types, API-key authentication, model aliases, unique `X-Request-ID` ownership,
+bounded handlers, queue length, queue age, and total request age. Client
+disconnects cancel both streaming and non-streaming requests without blocking on
+native execution. SSE emits one terminal event, optional usage exactly once, and
+`[DONE]`; cancellation and native completion resolve through one locked terminal
+transition. Shutdown stops admission, cancels owned requests, wakes the scheduler,
+waits a bounded interval for engine cleanup, and closes the HTTP server.
+
+`tools/serve_prod.sh` is now a singleton supervisor. It inherits a host lock into
+the child, forwards INT/TERM/HUP, bounds graceful shutdown before killing a stuck
+child, enables core dumps, records restart count/last exit in `/tmp`, and uses
+capped exponential backoff without relaunching after an operator stop. Independent
+startup and steady-state watchdogs dump every Python thread and exit 70 when native
+initialization or queued/active work makes no forward progress.
+
+Verified on fresh processes and the final production configuration:
+
+- malformed framing/JSON and invalid API requests return structured 400/404/411/413
+  responses without consuming scheduler capacity;
+- four simultaneous requests on two slots reached two owned plus two queued,
+  all returned 200, and identical greedy inputs produced identical output hashes;
+- disconnecting after the first SSE event released its slot and block reservation;
+- impossible admission failed once without wedging the next request;
+- forced no-progress exited 70 with thread stacks; killing the native child was
+  observed by the wrapper as exit 137 and exactly one restart;
+- repeated 2k and 32k cache-hit completions were deterministic after the
+  position-ordered wide-convolution commit fix; the focused live regression is
+  `python3 tools/test_server_reliability.py`.
 
 ### The 3-6% matrix: conv routing, silu fusion, and the GEMM verdict
 

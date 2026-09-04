@@ -24,7 +24,7 @@ Run (GPU7, prod Q4):
   CUDA_VISIBLE_DEVICES=7 TQ_CTX=131072 TQ_KV_Q4=1 python3 -u tools/serve_batched.py --port 8100
 """
 from __future__ import annotations
-import argparse, ctypes, faulthandler, json, os, signal, threading, time, queue, uuid
+import argparse, ctypes, faulthandler, hmac, json, math, os, select, signal, socket, threading, time, traceback, queue, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -126,34 +126,83 @@ def ck(r, what):
     return r
 
 
-class Request:
-    __slots__ = ("ids", "max_new", "eos", "out", "done", "slot", "pos", "next_tok",
-                 "started", "t_admit", "t_first", "t_done", "t_tok", "n_prompt", "err",
-                 "progress", "cancel", "temp", "seed", "ng", "ng_n", "acc_ema", "seq",
-                 "ck_epoch", "ck_hit")
+class RequestError(Exception):
+    """A client-visible OpenAI request error."""
+    def __init__(self, status, message, error_type="invalid_request_error",
+                 code=None, param=None):
+        super().__init__(message)
+        self.status = int(status)
+        self.message = str(message)
+        self.error_type = str(error_type)
+        self.code = code
+        self.param = param
 
-    def __init__(self, ids, max_new, eos, temp=0.0, seed=0):
+
+class EngineFatal(RuntimeError):
+    """Native state ownership is no longer trustworthy; restart the process."""
+
+
+def _error_body(message, error_type="server_error", code=None, param=None):
+    return {"error": {"message": str(message), "type": str(error_type),
+                      "param": param, "code": code}}
+
+
+class Request:
+    __slots__ = ("id", "ids", "max_new", "eos", "out", "done", "slot", "pos",
+                 "next_tok", "started", "t_admit", "t_first", "t_done", "t_tok",
+                 "t_submit_mono", "queue_deadline_mono", "deadline_mono",
+                 "n_prompt", "err", "err_status", "err_type", "err_code",
+                 "progress", "cancel", "cancel_lock", "cancel_reason",
+                 "cancel_status", "cancel_kind", "temp", "seed", "priority",
+                 "ng", "ng_n", "acc_ema", "seq", "ck_epoch", "ck_hit",
+                 "state", "terminal_counted")
+
+    def __init__(self, rid, ids, max_new, eos, temp=0.0, seed=0, priority=0,
+                 request_timeout=300.0, queue_timeout=300.0):
+        self.id = rid
         self.ids = ids; self.max_new = max_new; self.eos = set(eos)
         self.temp = float(temp); self.seed = int(seed) & 0xFFFFFFFFFFFFFFFF
+        self.priority = int(priority)
         self.ng = None; self.ng_n = 0; self.acc_ema = 1.0; self.seq = None
         self.out = []; self.done = threading.Event(); self.slot = -1
         self.pos = 0; self.next_tok = 0; self.started = False
-        self.t_admit = self.t_first = self.t_done = self.t_tok = 0.0; self.n_prompt = len(ids); self.err = None
-        # progress: set by the engine when out grows, so a streaming handler wakes
-        # per committed token instead of only at completion.
-        # cancel: set by the handler when the client is gone -- the engine detaches
+        self.t_admit = self.t_first = self.t_done = self.t_tok = 0.0
+        self.t_submit_mono = time.monotonic()
+        self.queue_deadline_mono = self.t_submit_mono + max(0.001, queue_timeout)
+        self.deadline_mono = self.t_submit_mono + max(0.001, request_timeout)
+        self.n_prompt = len(ids); self.err = None; self.err_status = 500
+        self.err_type = "server_error"; self.err_code = None
         self.ck_epoch = -1; self.ck_hit = None
-        # the slot at the next step instead of decoding into a dead socket.
-        self.progress = threading.Event(); self.cancel = False
+        self.progress = threading.Event()
+        self.cancel_lock = threading.Lock()
+        self.cancel = False; self.cancel_reason = None; self.cancel_status = 499
+        self.cancel_kind = "cancelled"
+        self.state = "queued"; self.terminal_counted = False
 
 
 class BatchedEngine:
     def __init__(self, lib, tqf, max_slots, num_blocks, page, wave_cols=WAVE_MAX,
                  max_prefill=2, fuse=True, fuse_ratio=0.0, fuse_idle_ms=125.0,
                  decode_every=0, prefix_cache=True, prefix_cache_min=256,
-                 decode_min_rows=8, decode_max_idle_ms=250.0, prefill_budget=96):
+                 decode_min_rows=8, decode_max_idle_ms=250.0, prefill_budget=96,
+                 max_queue=128, queue_timeout=300.0):
         self.L = lib
-        ck(self.L.qwn_init(tqf.encode()), "init")
+        self.phase_lock = threading.Lock()
+        self.phase = "startup"
+        self.phase_since_mono = time.monotonic()
+        self.current_request_id = None
+        self.last_progress_mono = None
+        self.busy_since_mono = None
+        self.last_engine_error = None
+        self._metric_lock = threading.Lock()
+        self.metrics = {
+            "requests_total": 0, "requests_completed": 0,
+            "requests_cancelled": 0, "requests_failed": 0,
+            "requests_rejected": 0, "queue_timeouts": 0,
+            "request_timeouts": 0, "admission_recoveries": 0,
+            "admission_failures": 0, "native_failures": 0,
+        }
+        ck(self._native("startup_model", self.L.qwn_init, tqf.encode()), "init")
         self.page = page; self.max_slots = max_slots
         self.wave_cols = max(1, min(WAVE_MAX, wave_cols))
         self.max_prefill = max(1, max_prefill)
@@ -179,21 +228,32 @@ class BatchedEngine:
         self._cached_free_blocks = num_blocks
         self._cached_total_blocks = num_blocks
         self._cached_stats_mono = time.monotonic()
-        ck(self.L.qwn_paged_init(max_slots, num_blocks, page), "paged_init")
+        self.max_queue = max(1, int(max_queue))
+        self.queue_timeout = max(0.001, float(queue_timeout))
+        ck(self._native("startup_pool", self.L.qwn_paged_init,
+                        max_slots, num_blocks, page), "paged_init")
         fb, tb, pg, mb = self._stats()
         self.num_blocks = tb; self.max_blocks_per_seq = mb
         self.free_slots = list(range(max_slots))
         self.active = {}            # slot -> Request
         self.q = []                 # pending Requests (FIFO)
         self.lock = threading.Lock()
+        self._owned_lock = threading.Lock()
+        self._owned = {}            # request id -> Request until terminal outcome
         self.cv = threading.Condition(self.lock)
         self.running = True
         self.steps = 0; self.decoded_tokens = 0
         self.prefill_waves = 0; self.prefilled_tokens = 0
-        self.started_mono = time.monotonic(); self.last_progress_mono = None
-        self.busy_since_mono = None
+        self.started_mono = time.monotonic()
+        self.started_unix = time.time()
+        self.supervisor_restarts = int(os.environ.get("KSL_SUPERVISOR_RESTARTS", "0"))
+        self.supervisor_last_exit_code = int(
+            os.environ.get("KSL_SUPERVISOR_LAST_EXIT_CODE", "0"))
+        self.supervisor_last_exit_unix = int(
+            os.environ.get("KSL_SUPERVISOR_LAST_EXIT_TIME_SECONDS", "0"))
         self.admission_recoveries = 0; self.admission_failures = 0
-        self.last_engine_error = None
+        self.admission_failure_streak = 0
+        self._set_phase("idle")
         # paged speculative decoding (chain verify): CORRECT (greedy bit-exact,
         # APC-safe, NVFP4-native) but not yet PROFITABLE -- the verify wave runs
         # chunk-256 DeltaNet scans + MMA-prefill attention on ~9-column chains,
@@ -214,9 +274,133 @@ class BatchedEngine:
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
+    def _metric(self, name, delta=1):
+        with self._metric_lock:
+            self.metrics[name] = self.metrics.get(name, 0) + delta
+    def metrics_snapshot(self):
+        with self._metric_lock:
+            return dict(self.metrics)
+
+
+    def _set_phase(self, phase, req=None):
+        now = time.monotonic()
+        with self.phase_lock:
+            if phase != self.phase or req != self.current_request_id:
+                self.phase = phase
+                self.current_request_id = req
+                self.phase_since_mono = now
+
+    def _progress(self):
+        self.last_progress_mono = time.monotonic()
+
+    def _native(self, phase, fn, *args, req=None):
+        """Bracket every native call so a watchdog can identify a wedged phase."""
+        previous = (self.phase, self.current_request_id)
+        self._set_phase(phase, req)
+        try:
+            result = fn(*args)
+        except BaseException as exc:
+            self.last_engine_error = f"{phase}: {type(exc).__name__}: {exc}"
+            self._metric("native_failures")
+            raise
+        finally:
+            self._set_phase(*previous)
+        return result
+
+    def _finish(self, req, state, error=None, status=500,
+                error_type="server_error", error_code=None):
+        # Cancellation and native completion race at token boundaries. Serialize
+        # the terminal transition so exactly one outcome and one metric wins.
+        with req.cancel_lock:
+            if req.done.is_set():
+                return
+            if req.cancel:
+                state = req.cancel_kind
+                error = req.cancel_reason
+                status = req.cancel_status
+                error_type = req.err_type
+                error_code = req.err_code
+            req.state = state
+            req.t_done = time.time()
+            if error is not None:
+                req.err = str(error)
+                req.err_status = int(status)
+                req.err_type = str(error_type)
+                req.err_code = error_code
+            if not req.terminal_counted:
+                req.terminal_counted = True
+                duration = max(0.0, time.monotonic() - req.t_submit_mono)
+                terminal_metric = (
+                    "requests_completed" if state == "completed" else
+                    "requests_cancelled" if state == "cancelled" else
+                    "requests_failed")
+                with self._metric_lock:
+                    m = self.metrics
+                    m[terminal_metric] = m.get(terminal_metric, 0) + 1
+                    m["request_duration_seconds"] = (
+                        m.get("request_duration_seconds", 0) + duration)
+                    m["prompt_tokens"] = m.get("prompt_tokens", 0) + req.n_prompt
+                    m["generation_tokens"] = (
+                        m.get("generation_tokens", 0) + len(req.out))
+                    if error_code == "request_timeout":
+                        m["request_timeouts"] = m.get("request_timeouts", 0) + 1
+                    elif error_code == "queue_timeout":
+                        m["queue_timeouts"] = m.get("queue_timeouts", 0) + 1
+                    if req.t_admit:
+                        m["queue_duration_seconds"] = (
+                            m.get("queue_duration_seconds", 0) +
+                            max(0.0, req.t_admit - req.t_submit_mono))
+                        m["queue_duration_count"] = (
+                            m.get("queue_duration_count", 0) + 1)
+                    if req.t_first:
+                        m["time_to_first_token_seconds"] = (
+                            m.get("time_to_first_token_seconds", 0) +
+                            max(0.0, req.t_first - req.t_submit_mono))
+                        m["time_to_first_token_count"] = (
+                            m.get("time_to_first_token_count", 0) + 1)
+            with self._owned_lock:
+                if self._owned.get(req.id) is req:
+                    del self._owned[req.id]
+            req.done.set()
+        req.progress.set()
+
+    def cancel(self, req, reason="client disconnected", status=499,
+               state="cancelled", error_type="request_cancelled",
+               error_code=None):
+        with req.cancel_lock:
+            if req.done.is_set() or req.cancel:
+                return False
+            req.cancel_reason = None if reason is None else str(reason)
+            req.cancel_status = int(status)
+            req.cancel_kind = state
+            req.err_type = error_type
+            req.err_code = error_code
+            if state != "completed" and reason is not None:
+                req.err = str(reason)
+                req.err_status = int(status)
+            req.cancel = True
+        req.progress.set()
+        # The engine owns this lock across native work. Cancellation must never
+        # wait behind a wedged CUDA call; an idle engine is woken when possible.
+        if self.cv.acquire(blocking=False):
+            try:
+                self.cv.notify()
+            finally:
+                self.cv.release()
+        return True
+
+    def _fatal(self, reason):
+        self.last_engine_error = str(reason)
+        self._set_phase("fatal")
+        print(f"[Engine] FATAL: {reason}", flush=True)
+        faulthandler.dump_traceback(all_threads=True)
+        os._exit(70)
+
     def _stats(self):
         fb, tb, pg, mb = (ctypes.c_int(), ctypes.c_int(), ctypes.c_int(), ctypes.c_int())
-        ck(self.L.qwn_paged_stats(ctypes.byref(fb), ctypes.byref(tb), ctypes.byref(pg), ctypes.byref(mb)), "stats")
+        ck(self._native("stats", self.L.qwn_paged_stats,
+                        ctypes.byref(fb), ctypes.byref(tb),
+                        ctypes.byref(pg), ctypes.byref(mb)), "stats")
         # Health handlers must never enter CUDA: if the engine stream is wedged,
         # a native stats call would wedge the watchdog too. Publish the latest
         # engine-thread sample instead.
@@ -225,12 +409,43 @@ class BatchedEngine:
         self._cached_stats_mono = time.monotonic()
         return fb.value, tb.value, pg.value, mb.value
 
-    def submit(self, ids, max_new, eos, temp=0.0, seed=0):
-        req = Request(ids, max_new, eos, temp, seed)
+    def submit(self, ids, max_new, eos, temp=0.0, seed=0, priority=0,
+               request_id=None, request_timeout=300.0, queue_timeout=None):
+        if not ids:
+            raise RequestError(400, "prompt must contain at least one token",
+                               param="prompt")
+        if max_new < 1:
+            raise RequestError(400, "max_tokens must be at least 1",
+                               param="max_tokens")
+        rid = request_id or f"req-{uuid.uuid4().hex}"
+        req = Request(rid, list(ids), int(max_new), eos, temp, seed,
+                      priority=priority, request_timeout=request_timeout,
+                      queue_timeout=self.queue_timeout if queue_timeout is None
+                      else queue_timeout)
         with self.cv:
+            if not self.running or not self.thread.is_alive():
+                self._metric("requests_rejected")
+                raise RequestError(503, "engine is not available", "server_error",
+                                   "engine_unavailable")
+            if request_id is not None:
+                with self._owned_lock:
+                    duplicate = rid in self._owned
+                if duplicate:
+                    self._metric("requests_rejected")
+                    raise RequestError(409, "X-Request-ID is already in flight",
+                                       "invalid_request_error",
+                                       "duplicate_request_id")
+            if len(self.q) >= self.max_queue:
+                self._metric("requests_rejected")
+                raise RequestError(429, "request queue is full",
+                                   "server_overloaded", "queue_full")
             if not self.q and not self.active and not self.pref:
                 self.busy_since_mono = time.monotonic()
             self.q.append(req)
+            with self._owned_lock:
+                self._owned[rid] = req
+            self.q.sort(key=lambda r: (r.priority, r.t_submit_mono))
+            self._metric("requests_total")
             self.cv.notify()
         return req
 
@@ -239,11 +454,13 @@ class BatchedEngine:
 
     def _activate(self, req, slot, seed):
         req.slot = slot; req.pos = req.n_prompt; req.next_tok = seed
-        req.out.append(seed); req.started = True; req.t_admit = time.time(); req.t_first = req.t_admit
-        req.t_tok = req.t_admit
+        req.out.append(seed); req.started = True; req.state = "active"
+        req.t_first = time.monotonic()
+        req.t_tok = time.time()
         self.active[slot] = req
-        if seed in req.eos or len(req.out) >= req.max_new:
-            self._detach(slot)
+        terminal = self._terminal(req, seed)
+        if terminal is not None:
+            self._detach(slot, terminal)
 
     # ------------------- prefix checkpoints: the hybrid's APC (phase 2) -------------------
     # A checkpoint = shared refs to the full KV blocks of [0, pos) + COPIES of the tail
@@ -280,33 +497,46 @@ class BatchedEngine:
         if not cands:
             return False
         mb = ctypes.c_int(0)
-        res = [c for c in cands
-               if self.L.qwn_paged_ckpt_tier(c["id"], ctypes.byref(mb)) == 0]
+        res = []
+        for c in cands:
+            tier = self._native("ckpt_tier", self.L.qwn_paged_ckpt_tier,
+                                c["id"], ctypes.byref(mb))
+            if tier == 0:
+                res.append(c)
+            elif tier != 1:
+                raise EngineFatal(f"checkpoint tier id={c['id']} rc={tier}")
         if res:
             lru = min(res, key=lambda c: c["t_hit"])
-            if self.L.qwn_paged_ckpt_demote(lru["id"]) == 0:
-                self.L.qwn_paged_ckpt_tier(lru["id"], ctypes.byref(mb))
-                print(f"[ckpt] demote id={lru['id']} pos={lru['pos']} host={mb.value}MB", flush=True)
+            drc = self._native("ckpt_demote", self.L.qwn_paged_ckpt_demote,
+                               lru["id"])
+            if drc == 0:
+                self._native("ckpt_tier", self.L.qwn_paged_ckpt_tier,
+                             lru["id"], ctypes.byref(mb))
+                print(f"[ckpt] demote id={lru['id']} pos={lru['pos']} "
+                      f"host={mb.value}MB", flush=True)
                 return True
         else:
             lru = min(cands, key=lambda c: c["t_hit"])
+        rc = self._native("ckpt_free", self.L.qwn_paged_ckpt_free, lru["id"])
+        if rc != 0:
+            raise EngineFatal(f"checkpoint free id={lru['id']} rc={rc}")
         self.cks.remove(lru)
-        rc = self.L.qwn_paged_ckpt_free(lru["id"])
         self.ck_epoch += 1
-        print(f"[ckpt] evict id={lru['id']} pos={lru['pos']} rc={rc}", flush=True)
+        print(f"[ckpt] evict id={lru['id']} pos={lru['pos']} rc=0", flush=True)
         return True
 
     def _ck_flush(self, reason):
-        """Drop every checkpoint. Only called with no active/prefill work."""
+        """Drop every checkpoint or fail closed on an ownership mismatch."""
         entries = list(self.cks)
-        self.cks.clear()
-        self.ck_epoch += 1
-        failed = 0
         for c in entries:
-            if self.L.qwn_paged_ckpt_free(c["id"]) != 0:
-                failed += 1
-        print(f"[ckpt] flush reason={reason} count={len(entries)} failed={failed}", flush=True)
-        return failed == 0
+            rc = self._native("ckpt_free", self.L.qwn_paged_ckpt_free, c["id"])
+            if rc != 0:
+                raise EngineFatal(f"checkpoint flush id={c['id']} rc={rc}")
+            self.cks.remove(c)
+            self.ck_epoch += 1
+        print(f"[ckpt] flush reason={reason} count={len(entries)} failed=0",
+              flush=True)
+        return True
 
     def _ck_targets(self, req, cursor):
         """Checkpoint positions for this prompt's prefill (sorted). Two candidates:
@@ -345,9 +575,11 @@ class BatchedEngine:
         while len(self.cks) >= self.ck_max:
             if not self._ck_evict_one():
                 return
-        cid = self.L.qwn_paged_ckpt_save(slot, pos)
-        if cid < 0 and self._ck_evict_one():     # registry/VRAM pressure: retry once
-            cid = self.L.qwn_paged_ckpt_save(slot, pos)
+        cid = self._native("ckpt_save", self.L.qwn_paged_ckpt_save, slot, pos,
+                           req=req.id)
+        if cid < 0 and self._ck_evict_one():
+            cid = self._native("ckpt_save", self.L.qwn_paged_ckpt_save,
+                               slot, pos, req=req.id)
         if cid < 0:
             print(f"[ckpt] save pos={pos} rc={cid} FAILED", flush=True)
             return                               # optimization only; never fatal
@@ -376,34 +608,68 @@ class BatchedEngine:
             free_blk -= self._remaining_blocks(st[0], st[1])
         return free_blk
 
+    def _reset_slot(self, slot, req=None):
+        rc = self._native("reset_slot", self.L.qwn_paged_reset_slot, slot,
+                          req=req.id if req is not None else None)
+        if rc != 0:
+            raise EngineFatal(f"reset slot={slot} rc={rc}")
+
+    def _expire_queued(self):
+        """Finish cancelled or expired requests before considering capacity."""
+        now = time.monotonic()
+        qi = 0
+        while qi < len(self.q):
+            req = self.q[qi]
+            if req.cancel:
+                self.q.pop(qi)
+                self._finish(req, req.cancel_kind, req.cancel_reason,
+                             req.cancel_status, req.err_type, req.err_code)
+            elif now >= req.deadline_mono:
+                self.q.pop(qi)
+                self._finish(req, "failed", "request deadline exceeded", 504,
+                             "timeout_error", "request_timeout")
+            elif now >= req.queue_deadline_mono:
+                self.q.pop(qi)
+                self._finish(req, "failed", "request timed out in queue", 503,
+                             "server_overloaded", "queue_timeout")
+            else:
+                qi += 1
+
     def _admit(self):
         """Move queued requests into the PREFILLING set (slot + blocks reserved).
         No prefill work happens here: _work() spends a bounded column budget per
         iteration, so an admission never stalls the active slots' decode."""
+        self._expire_queued()
         free_blk = self._admission_free_blocks()
         qi = 0
         while qi < len(self.q) and self.free_slots:
             req = self.q[qi]
-            if req.n_prompt < 1:
-                self.q.pop(qi); req.err = "empty prompt"; req.done.set(); continue
+            # Queue cancellation/deadline handling runs before the capacity loop.
             # Include the whole requested decode budget, not just prompt pages.
             total_need = self._request_blocks(req)
             if total_need > self.max_blocks_per_seq:
-                self.q.pop(qi); req.err = "request exceeds context"; req.done.set(); continue
+                self.q.pop(qi)
+                self._finish(req, "failed", "request exceeds model context", 400,
+                             "invalid_request_error", "context_length_exceeded")
+                continue
             hit = self._ck_match(req)
-            # A resident hit shares every complete prefix block. Only a copied
-            # partial tail plus suffix blocks consume free pool capacity.
-            hit_tier = self.L.qwn_paged_ckpt_tier(hit["id"], None) if hit is not None else -1
+            hit_tier = (self._native("ckpt_tier", self.L.qwn_paged_ckpt_tier,
+                                     hit["id"], None, req=req.id)
+                        if hit is not None else -1)
+            if hit is not None and hit_tier not in (0, 1):
+                raise EngineFatal(f"checkpoint tier id={hit['id']} rc={hit_tier}")
             need = (total_need - hit["pos"] // self.page) if hit_tier == 0 else \
                    (total_need + (1 if hit is not None and hit["pos"] % self.page else 0))
-            # Prefix checkpoints are an optimization, never a reason to deadlock
-            # admission. Reclaim cold non-matching entries until this request fits.
-            while need > free_blk and self._ck_evict_one(hit["id"] if hit is not None else None):
+            # Cache state is expendable. Evict non-selected entries before
+            # declaring capacity unavailable.
+            while need > free_blk and self._ck_evict_one(
+                    hit["id"] if hit is not None else None):
                 free_blk = self._admission_free_blocks()
             if need > free_blk:
-                break                                   # live slots must release capacity
+                qi += 1                              # bounded HOL bypass
+                continue
             if len(self.pref) >= self.max_prefill:
-                break                                   # cap concurrent prefills (TTFT fairness)
+                break
             # Cache-aware admission: if an IN-FLIGHT prefill is about to checkpoint a
             # boundary this request shares, wait the few waves for it instead of
             # re-prefilling the whole shared prefix (the concurrent fan-out race).
@@ -420,20 +686,34 @@ class BatchedEngine:
                     qi += 1
                     continue
             self.q.pop(qi); slot = self.free_slots.pop()
+            req.t_admit = time.monotonic()
+            req.state = "prefilling"
             try:
-                ck(self.L.qwn_paged_reset_slot(slot), "reset_slot")
+                self._reset_slot(slot, req)
                 if req.temp > 0.0:
-                    ck(self.L.qwn_paged_set_sampling(slot, req.temp, req.seed), "set_sampling")
+                    src = self._native("set_sampling",
+                                       self.L.qwn_paged_set_sampling,
+                                       slot, req.temp, req.seed, req=req.id)
+                    if src != 0:
+                        raise EngineFatal(f"set sampling slot={slot} rc={src}")
                 free_blk -= need
                 cursor = 0
                 if hit is not None:
-                    if self.L.qwn_paged_ckpt_tier(hit["id"], None) == 1:
-                        pr = self.L.qwn_paged_ckpt_promote(hit["id"])
-                        if pr == -3 and self._ck_evict_one(hit["id"]):   # freed a slab; retry once
-                            pr = self.L.qwn_paged_ckpt_promote(hit["id"])
-                        if pr != 0:                             # adopt below returns -5
-                            print(f"[ckpt] promote id={hit['id']} rc={pr}", flush=True)
-                    pos = self.L.qwn_paged_ckpt_adopt(slot, hit["id"])
+                    if self._native("ckpt_tier", self.L.qwn_paged_ckpt_tier,
+                                    hit["id"], None, req=req.id) == 1:
+                        pr = self._native("ckpt_promote",
+                                          self.L.qwn_paged_ckpt_promote,
+                                          hit["id"], req=req.id)
+                        if pr == -3 and self._ck_evict_one(hit["id"]):
+                            pr = self._native("ckpt_promote",
+                                              self.L.qwn_paged_ckpt_promote,
+                                              hit["id"], req=req.id)
+                        if pr != 0:
+                            print(f"[ckpt] promote id={hit['id']} rc={pr}",
+                                  flush=True)
+                    pos = self._native("ckpt_adopt",
+                                       self.L.qwn_paged_ckpt_adopt,
+                                       slot, hit["id"], req=req.id)
                     if pos == hit["pos"]:
                         cursor = pos                     # prefill only the suffix
                         hit["t_hit"] = time.time()
@@ -442,12 +722,17 @@ class BatchedEngine:
                         # A stale/corrupt hit must not turn the suffix reservation
                         # into an unaccounted full prefill. Discard it, re-plan the
                         # cold request, and either reserve that plan or wait.
-                        ck(self.L.qwn_paged_reset_slot(slot), "reset_slot")
+                        self._reset_slot(slot, req)
+                        frc = self._native("ckpt_free",
+                                           self.L.qwn_paged_ckpt_free,
+                                           hit["id"], req=req.id)
+                        if frc != 0:
+                            raise EngineFatal(
+                                f"stale checkpoint free id={hit['id']} rc={frc}")
                         self.cks.remove(hit)
-                        frc = self.L.qwn_paged_ckpt_free(hit["id"])
                         self.ck_epoch += 1
                         print(f"[engine] ckpt adopt rc={pos}; evict id={hit['id']} "
-                              f"rc={frc}, full prefill instead", flush=True)
+                              "rc=0, full prefill instead", flush=True)
                         self.pc_misses += 1
                         free_blk = self._admission_free_blocks()
                         while total_need > free_blk and self._ck_evict_one():
@@ -461,13 +746,21 @@ class BatchedEngine:
                     self.pc_misses += 1
                 self.pref[slot] = [req, cursor, self._ck_targets(req, cursor)]
                 self.ck_last = list(req.ids)
+                self._progress()
+            except EngineFatal:
+                raise
             except Exception as e:
-                # a failed admission must cost ONE request, not the slot and not the
-                # server: before this guard a raise here leaked the slot and left the
-                # request neither queued nor prefilling (client hung forever)
+                try:
+                    self._reset_slot(slot, req)
+                except Exception as reset_exc:
+                    raise EngineFatal(
+                        f"admission cleanup slot={slot}: {reset_exc}") from reset_exc
                 self.free_slots.append(slot)
-                req.err = f"admission failed: {e}"
-                req.done.set()
+                self.admission_failures += 1
+                self.admission_failure_streak += 1
+                self._metric("admission_failures")
+                self._finish(req, "failed", f"admission failed: {e}", 500,
+                             "server_error", "admission_failed")
                 print(f"[engine] admit failed, request errored: {e}", flush=True)
 
     def _wave(self, dec_slots, pref_plan, cols_tok, cols_slot, cols_pos,
@@ -484,15 +777,16 @@ class BatchedEngine:
         a_tok, a_slot, a_pos = _ci(cols_tok), _ci(cols_slot), _ci(cols_pos)
         a_ss, a_so, a_sl, a_sf = _ci(seg_slot), _ci(seg_off), _ci(seg_len), _ci(seg_fin)
         t1 = time.perf_counter()
-        rc = self.L.qwn_paged_prefill_batch(a_tok, a_slot, a_pos,
-                                            a_ss, a_so, a_sl, a_sf, K, T, oseed)
+        rc = self._native("prefill_batch", self.L.qwn_paged_prefill_batch,
+                          a_tok, a_slot, a_pos, a_ss, a_so, a_sl, a_sf,
+                          K, T, oseed)
         t2 = time.perf_counter()
         self.t_marshal += t1 - t0
         self.t_engine += t2 - t1
         if len(self.wavelog) < 65536:
             self.wavelog.append((t2, (t2 - t1) * 1e3, T - len(dec_slots), len(dec_slots), K, 0))
         if rc != 0:
-            raise RuntimeError(f"fused wave rc={rc} (K={K} T={T})")
+            raise EngineFatal(f"fused wave rc={rc} (K={K} T={T})")
         self.last_progress_mono = t2
         self.prefill_waves += 1
         self.prefilled_tokens += T - len(dec_slots)
@@ -504,10 +798,11 @@ class BatchedEngine:
             req = self.active[s]; o = oseed[j]
             req.out.append(o); req.pos += 1; req.next_tok = o; req.t_tok = _tnow
             req.progress.set()
-            if req.cancel or o in req.eos or len(req.out) >= req.max_new:
-                finished.append(s)
-        for s in finished:
-            self._detach(s)
+            terminal = self._terminal(req, o)
+            if terminal is not None:
+                finished.append((s, terminal))
+        for s, terminal in finished:
+            self._detach(s, terminal)
         for slot, c, final, k in pref_plan:              # then the prompt segments
             st = self.pref.get(slot)
             if st is None:
@@ -519,6 +814,28 @@ class BatchedEngine:
             if final:
                 del self.pref[slot]
                 self._activate(st[0], slot, oseed[k])
+
+    def _expire_admitted(self):
+        """Cancel/deadline checks for requests that already own a slot.
+
+        HTTP handlers only publish cancellation; the engine thread owns every
+        native reset and slot transition.
+        """
+        for slot in list(self.active):
+            req = self.active.get(slot)
+            if req is None:
+                continue
+            terminal = self._terminal(req)
+            if terminal is not None:
+                self._detach(slot, terminal)
+        for slot in list(self.pref):
+            st = self.pref.get(slot)
+            if st is None:
+                continue
+            req = st[0]
+            terminal = self._terminal(req)
+            if terminal is not None:
+                self._abort_prefill(slot, terminal)
 
     def _work(self):
         """One scheduler iteration.
@@ -538,6 +855,7 @@ class BatchedEngine:
            position. So prompts prefill in fat chunks (small --max-prefill) and
            decode rows only ride along (--fuse) when their depth is comparable --
            fusing pos-0 columns into rows at pos ~700 measured a net loss."""
+        self._expire_admitted()
         if not self.pref:
             self.starve = 0
             if self.active:
@@ -640,14 +958,38 @@ class BatchedEngine:
         self._wave(dec_slots, pref_plan, cols_tok, cols_slot, cols_pos,
                    seg_slot, seg_off, seg_len, seg_fin)
 
-    def _detach(self, slot):
-        req = self.active.pop(slot)
-        ck(self.L.qwn_paged_reset_slot(slot), "reset_slot")
+    def _terminal(self, req, token=None):
+        with req.cancel_lock:
+            if req.cancel:
+                return (req.cancel_kind, req.cancel_reason, req.cancel_status,
+                        req.err_type, req.err_code)
+        if time.monotonic() >= req.deadline_mono:
+            return ("failed", "request deadline exceeded", 504,
+                    "timeout_error", "request_timeout")
+        if token is not None and token in req.eos:
+            return ("completed", None, 200, None, None)
+        if len(req.out) >= req.max_new:
+            return ("completed", None, 200, None, None)
+        return None
+
+    def _detach(self, slot, terminal=None):
+        req = self.active[slot]
+        if terminal is None:
+            terminal = ("completed", None, 200, None, None)
+        # Retain ownership until native cleanup succeeds. On failure the outer
+        # EngineFatal path terminates the process with the request still owned.
+        self._reset_slot(slot, req)
+        del self.active[slot]
         self.free_slots.append(slot)
-        self._stats()
-        req.t_done = time.time()
-        req.done.set()
-        req.progress.set()
+        self._finish(req, *terminal)
+
+    def _abort_prefill(self, slot, terminal):
+        req = self.pref[slot][0]
+        self._reset_slot(slot, req)
+        del self.pref[slot]
+        self.free_slots.append(slot)
+        self._finish(req, *terminal)
+
 
     def _draft(self, req):
         """Recency n-gram draft from the request's OWN history, longest-suffix
@@ -708,7 +1050,8 @@ class BatchedEngine:
         out = (ctypes.c_int * (n * (maxd + 1)))()
         om = (ctypes.c_int * n)()
         _t1 = time.perf_counter()
-        rc = self.L.qwn_paged_spec_round(sl, seeds, pos, dr, dl, n, maxd, out, om)
+        rc = self._native("spec_round", self.L.qwn_paged_spec_round,
+                          sl, seeds, pos, dr, dl, n, maxd, out, om)
         _t2 = time.perf_counter()
         if rc in (-111, -3):
             # Archive/pool unavailable (VRAM): the round fails BEFORE touching
@@ -716,12 +1059,13 @@ class BatchedEngine:
             # instead of erroring requests (vLLM semantics: never 500 a request
             # because an optional accelerator could not allocate).
             self.spec_maxd = 0
+            self._metric("spec_fallbacks")
             print(f"[engine] spec unavailable rc={rc}; permanent plain-decode fallback", flush=True)
             return self._step()
         if rc != 0:
-            # a failed round can leave a partial slot rewound-but-unreplayed:
-            # fail the participants (the _loop wave-error contract handles it)
-            raise RuntimeError(f"paged spec round rc={rc} (N={n} maxd={maxd})")
+            # Other native failures may have partially mutated slots or poisoned
+            # CUDA. Never retry participant state whose atomicity is unknown.
+            raise EngineFatal(f"paged spec round rc={rc} (N={n} maxd={maxd})")
         self.last_progress_mono = _t2
         if len(self.wavelog) < 65536:
             self.wavelog.append((_t2, (_t2 - _t1) * 1e3, 0, n, n, 2))
@@ -736,22 +1080,22 @@ class BatchedEngine:
             self.decoded_tokens += m
             if dl[j] > 0:                          # accept EMA drives the draft gate
                 req.acc_ema = 0.7 * req.acc_ema + 0.3 * ((m - 1) / dl[j])
-            fin = False
+            terminal = None
             for k2 in range(m):
                 o = out[j * (maxd + 1) + k2]
                 req.out.append(o); req.pos += 1; req.next_tok = o
                 if req.seq is not None:
                     req.seq.append(o)
-                if req.cancel or o in req.eos or len(req.out) >= req.max_new:
-                    fin = True
+                terminal = self._terminal(req, o)
+                if terminal is not None:
                     break
             req.t_tok = _tnow
             req.progress.set()
-            if fin or req.cancel:
-                finished.append(s)
+            if terminal is not None:
+                finished.append((s, terminal))
         self.steps += 1
-        for s in finished:
-            self._detach(s)
+        for s, terminal in finished:
+            self._detach(s, terminal)
 
     def _step(self):
         slots = list(self.active.keys())
@@ -761,7 +1105,10 @@ class BatchedEngine:
         pos = (ctypes.c_int * n)(*[self.active[s].pos for s in slots])
         out = (ctypes.c_int * n)()
         _t1 = time.perf_counter()
-        ck(self.L.qwn_paged_decode_step(toks, sid, pos, n, out), "paged_step")
+        rc = self._native("decode_step", self.L.qwn_paged_decode_step,
+                          toks, sid, pos, n, out)
+        if rc != 0:
+            raise EngineFatal(f"paged decode step rc={rc} (N={n})")
         _t2 = time.perf_counter()
         if len(self.wavelog) < 65536:
             self.wavelog.append((_t2, (_t2 - _t1) * 1e3, 0, n, n, 1))
@@ -774,13 +1121,18 @@ class BatchedEngine:
             o = out[j]
             req.out.append(o); req.pos += 1; req.next_tok = o; req.t_tok = _tnow
             req.progress.set()
-            if req.cancel or o in req.eos or len(req.out) >= req.max_new:
-                finished.append(s)
-        for s in finished:
-            self._detach(s)
+            terminal = self._terminal(req, o)
+            if terminal is not None:
+                finished.append((s, terminal))
+        for s, terminal in finished:
+            self._detach(s, terminal)
 
     def _loop(self):
         while True:
+            # The condition protects only queue admission and idle wakeups.
+            # Never hold it across a prefill/decode/verify wave: request-handler
+            # threads must be able to enqueue while the GPU is busy, otherwise a
+            # nominally batched server silently becomes single-request serial.
             with self.cv:
                 while self.running and not self.q and not self.active and not self.pref:
                     self.cv.wait(timeout=0.5)
@@ -788,80 +1140,100 @@ class BatchedEngine:
                     return
                 try:
                     self._admit()
+                except EngineFatal as e:
+                    self._fatal(f"during admission: {e}")
                 except Exception as e:
-                    # Admission exceptions are request-scoped. Never retry the
-                    # same poisoned head forever while the engine appears alive.
+                    # _admit handles failures after taking ownership. An
+                    # exception here still belongs to the current queue head.
                     self.admission_failures += 1
+                    self._metric("admission_failures")
                     print(f"[engine] admit error: {e}", flush=True)
                     if self.q:
                         r = self.q.pop(0)
-                        r.err = f"admission failed: {e}"; r.done.set(); r.progress.set()
+                        self._finish(r, "failed", f"admission failed: {e}", 500,
+                                     "server_error", "admission_failed")
                 have = bool(self.active) or bool(self.pref)
                 if not have and self.q:
                     # No live work can release capacity: waiting is a deadlock,
                     # not backpressure. Drop optional cache state and retry once.
                     self.admission_recoveries += 1
+                    self._metric("admission_recoveries")
                     fb = self._free_blocks()
                     print(f"[engine] admission no-progress: queued={len(self.q)} "
                           f"free={fb}/{self.num_blocks}; flushing prefix cache", flush=True)
-                    self._ck_flush("admission-no-progress")
                     try:
+                        self._ck_flush("admission-no-progress")
                         self._admit()
+                    except EngineFatal as e:
+                        self._fatal(f"during admission recovery: {e}")
                     except Exception as e:
                         self.admission_failures += 1
+                        self._metric("admission_failures")
                         print(f"[engine] admission recovery error: {e}", flush=True)
                     have = bool(self.active) or bool(self.pref)
                     if not have and self.q:
                         r = self.q.pop(0)
                         self.admission_failures += 1
-                        r.err = (f"admission capacity invariant failed: "
-                                 f"prompt={r.n_prompt} free={self._free_blocks()} "
-                                 f"max_blocks={self.max_blocks_per_seq}")
-                        r.done.set(); r.progress.set()
-                        print(f"[engine] {r.err}", flush=True)
-                _t = time.perf_counter()
+                        self._metric("admission_failures")
+                        msg = (f"admission capacity invariant failed: "
+                               f"prompt={r.n_prompt} free={self._cached_free_blocks} "
+                               f"max_blocks={self.max_blocks_per_seq}")
+                        self._finish(r, "failed", msg, 503,
+                                     "server_overloaded", "capacity_unavailable")
+                        print(f"[engine] {msg}", flush=True)
+            _t = time.perf_counter()
+            try:
+                self._work()
+                self.err_streak = 0
+            except EngineFatal as e:
+                # Native ownership or CUDA state is suspect. Continuing can
+                # neither complete requests nor repair the context; let the
+                # restart wrapper replace the process immediately.
+                self._fatal(f"during execution: {e}")
+            except Exception as e:
+                # Pure scheduler faults are recoverable only if every owned
+                # request can be failed and every slot can be reset. A cleanup
+                # failure means native ownership is unknown.
+                print(f"[engine] scheduler error: {e}", flush=True)
+                self.last_engine_error = repr(e)
                 try:
-                    self._work()
-                    self.err_streak = 0
-                except Exception as e:                  # never let the engine thread die
-                    print(f"[engine] step error: {e}", flush=True)
-                    self.last_engine_error = repr(e)
-                    self.err_streak = getattr(self, "err_streak", 0) + 1
-                    if self.err_streak >= 8:
-                        # 8 consecutive failed steps = the CUDA context is gone
-                        # (sticky error): every future wave fails identically.
-                        # Die loudly so a supervisor restart yields a live engine
-                        # instead of a zombie serving 100% errors.
-                        print("[engine] FATAL: 8 consecutive step errors, exiting", flush=True)
-                        os._exit(70)
-                    # _loop already owns self.cv. Re-acquiring its non-reentrant
-                    # Lock here deadlocked the engine on the first failed wave.
-                    for s in list(self.active.keys()):
-                        r = self.active.pop(s)
-                        try:
-                            self.L.qwn_paged_reset_slot(s)
-                        except Exception:
-                            pass
-                        self.free_slots.append(s)
-                        r.err = f"step failed: {e}"; r.done.set(); r.progress.set()
-                    for s in list(self.pref.keys()):
-                        r = self.pref.pop(s)[0]
-                        try:
-                            self.L.qwn_paged_reset_slot(s)
-                        except Exception:
-                            pass
-                        self.free_slots.append(s)
-                        r.err = f"prefill failed: {e}"; r.done.set(); r.progress.set()
+                    for s in list(self.active):
+                        self._detach(
+                            s, ("failed", f"execution failed: {e}", 500,
+                                "server_error", "execution_failed"))
+                    for s in list(self.pref):
+                        self._abort_prefill(
+                            s, ("failed", f"prefill failed: {e}", 500,
+                                "server_error", "prefill_failed"))
+                except BaseException as cleanup_exc:
+                    self._fatal(
+                        f"scheduler recovery after {e!r}: {cleanup_exc!r}")
+            with self.cv:
                 if not self.q and not self.active and not self.pref:
                     self.busy_since_mono = None
-                self.t_loop += time.perf_counter() - _t
+            self.t_loop += time.perf_counter() - _t
 
     def shutdown(self):
+        # Close admission immediately, then wait for any in-flight admission to
+        # leave the condition lock. A checkpoint promote/demote is synchronous
+        # and may legitimately take more than a second; the shutdown watchdog
+        # and production reaper bound a genuine native wedge.
+        self.running = False
         with self.cv:
-            self.running = False
+            # q/pref/active transitions may run outside cv while CUDA executes.
+            # No request leaves _owned until _finish publishes its terminal
+            # outcome, so the registry is the stable shutdown snapshot.
+            with self._owned_lock:
+                owned = list(self._owned.values())
             self.cv.notify_all()
+        for req in owned:
+            self.cancel(req, "server shutting down", 503, "failed",
+                        "server_error", "server_shutdown")
         self.thread.join(timeout=5)
-        self.L.qwn_paged_free(); self.L.qwn_free()
+        if self.thread.is_alive():
+            self._fatal("engine thread did not stop within 5 seconds")
+        self._native("shutdown_pool", self.L.qwn_paged_free)
+        self._native("shutdown_model", self.L.qwn_free)
 
 
 # ----------------------------- self test (milestone 3.2) -----------------------------
@@ -1028,20 +1400,150 @@ def make_handler(eng, tok, args):
 
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        _response_started = False
+        _request_slots = threading.BoundedSemaphore(args.max_http_concurrency)
+
 
         def log_message(self, *a):
             pass
 
-        def _json(self, code, obj):
+        def _json(self, code, obj, headers=None, close=False):
             body = json.dumps(obj).encode()
+            self._response_started = True
+            if close:
+                self.close_connection = True
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            if close:
+                self.send_header("Connection", "close")
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(body)
 
+        def _json_error(self, status, message, error_type="server_error",
+                        code=None, param=None, headers=None, close=False):
+            self._json(status, _error_body(message, error_type, code, param),
+                       headers=headers, close=close)
+        def _text(self, code, body, content_type):
+            payload = body.encode()
+            self._response_started = True
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _prometheus(self):
+            m = eng.metrics_snapshot()
+            terminal = (m.get("requests_completed", 0) +
+                        m.get("requests_cancelled", 0) +
+                        m.get("requests_failed", 0))
+            with eng.phase_lock:
+                phase_now = eng.phase
+            phase = phase_now.replace("\\", "\\\\").replace('"', '\\"')
+            rows = [
+                "# HELP knivesysl_engine_up Whether the inference engine thread is alive.",
+                "# TYPE knivesysl_engine_up gauge",
+                f"knivesysl_engine_up {1 if eng.thread.is_alive() else 0}",
+                "# HELP knivesysl_engine_busy Whether any request is queued or executing.",
+                "# TYPE knivesysl_engine_busy gauge",
+                f"knivesysl_engine_busy {1 if (eng.q or eng.active or eng.pref or phase_now != 'idle') else 0}",
+                "# HELP knivesysl_engine_phase Current engine phase.",
+                "# TYPE knivesysl_engine_phase gauge",
+                f'knivesysl_engine_phase{{phase="{phase}"}} 1',
+                "# TYPE knivesysl_process_start_time_seconds gauge",
+                f"knivesysl_process_start_time_seconds {eng.started_unix:.6f}",
+                "# HELP knivesysl_supervisor_restarts_total Process restarts by the production supervisor.",
+                "# TYPE knivesysl_supervisor_restarts_total counter",
+                f"knivesysl_supervisor_restarts_total {eng.supervisor_restarts}",
+                "# TYPE knivesysl_supervisor_last_exit_code gauge",
+                f"knivesysl_supervisor_last_exit_code {eng.supervisor_last_exit_code}",
+                "# TYPE knivesysl_supervisor_last_exit_time_seconds gauge",
+                f"knivesysl_supervisor_last_exit_time_seconds {eng.supervisor_last_exit_unix}",
+                "# TYPE knivesysl_requests_total counter",
+                f'knivesysl_requests_total{{state="submitted"}} {m.get("requests_total", 0)}',
+                f'knivesysl_requests_total{{state="completed"}} {m.get("requests_completed", 0)}',
+                f'knivesysl_requests_total{{state="cancelled"}} {m.get("requests_cancelled", 0)}',
+                f'knivesysl_requests_total{{state="failed"}} {m.get("requests_failed", 0)}',
+                f'knivesysl_requests_total{{state="rejected"}} {m.get("requests_rejected", 0)}',
+                "# TYPE knivesysl_request_duration_seconds summary",
+                f'knivesysl_request_duration_seconds_sum {m.get("request_duration_seconds", 0.0):.9g}',
+                f"knivesysl_request_duration_seconds_count {terminal}",
+                "# TYPE knivesysl_queue_duration_seconds summary",
+                f'knivesysl_queue_duration_seconds_sum {m.get("queue_duration_seconds", 0.0):.9g}',
+                f'knivesysl_queue_duration_seconds_count {m.get("queue_duration_count", 0)}',
+                "# TYPE knivesysl_time_to_first_token_seconds summary",
+                f'knivesysl_time_to_first_token_seconds_sum {m.get("time_to_first_token_seconds", 0.0):.9g}',
+                f'knivesysl_time_to_first_token_seconds_count {m.get("time_to_first_token_count", 0)}',
+                "# TYPE knivesysl_requests gauge",
+                f'knivesysl_requests{{state="queued"}} {len(eng.q)}',
+                f'knivesysl_requests{{state="prefilling"}} {len(eng.pref)}',
+                f'knivesysl_requests{{state="decoding"}} {len(eng.active)}',
+                "# TYPE knivesysl_kv_blocks gauge",
+                f'knivesysl_kv_blocks{{state="free"}} {eng._cached_free_blocks}',
+                f'knivesysl_kv_blocks{{state="total"}} {eng._cached_total_blocks}',
+                "# TYPE knivesysl_tokens_total counter",
+                f'knivesysl_tokens_total{{kind="prompt"}} {m.get("prompt_tokens", 0)}',
+                f'knivesysl_tokens_total{{kind="generated"}} {m.get("generation_tokens", 0)}',
+                "# TYPE knivesysl_scheduler_events_total counter",
+                f'knivesysl_scheduler_events_total{{kind="queue_timeout"}} {m.get("queue_timeouts", 0)}',
+                f'knivesysl_scheduler_events_total{{kind="request_timeout"}} {m.get("request_timeouts", 0)}',
+                f'knivesysl_scheduler_events_total{{kind="admission_recovery"}} {m.get("admission_recoveries", 0)}',
+                f'knivesysl_scheduler_events_total{{kind="admission_failure"}} {m.get("admission_failures", 0)}',
+                f'knivesysl_scheduler_events_total{{kind="native_failure"}} {m.get("native_failures", 0)}',
+                "# TYPE knivesysl_prefix_cache_events_total counter",
+                f'knivesysl_prefix_cache_events_total{{kind="hit"}} {eng.pc_hits}',
+                f'knivesysl_prefix_cache_events_total{{kind="miss"}} {eng.pc_misses}',
+                f'knivesysl_prefix_cache_events_total{{kind="build"}} {eng.pc_builds}',
+                f'knivesysl_prefix_cache_tokens_saved_total {eng.pc_saved}',
+                "# TYPE knivesysl_speculative_tokens_total counter",
+                f'knivesysl_speculative_tokens_total{{kind="drafted"}} {eng.spec_drafted}',
+                f'knivesysl_speculative_tokens_total{{kind="committed"}} {eng.spec_committed}',
+                f"knivesysl_speculative_rounds_total {eng.spec_rounds}",
+            ]
+            self._text(200, "\n".join(rows) + "\n",
+                       "text/plain; version=0.0.4; charset=utf-8")
+
+
+        def _peer_closed(self):
+            """Non-consuming disconnect probe while no socket write is pending."""
+            try:
+                readable, _, _ = select.select([self.connection], [], [], 0)
+                if not readable:
+                    return False
+                flags = socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0)
+                return self.connection.recv(1, flags) == b""
+            except BlockingIOError:
+                return False
+            except (OSError, ValueError):
+                return True
+
+        def _require_api_key(self):
+            if not args.api_key:
+                return
+            supplied = self.headers.get("Authorization", "")
+            parts = supplied.split()
+            valid = (len(parts) == 2 and parts[0].lower() == "bearer" and
+                     hmac.compare_digest(parts[1].encode("utf-8"),
+                                         args.api_key.encode("utf-8")))
+            if not valid:
+                raise RequestError(401, "invalid API key",
+                                   "authentication_error", "invalid_api_key")
+
         def do_GET(self):
-            if self.path.startswith("/v1/models"):
+            path = self.path.partition("?")[0]
+            if path.startswith("/v1/"):
+                try:
+                    self._require_api_key()
+                except RequestError as e:
+                    self._json_error(
+                        e.status, e.message, e.error_type, e.code, e.param,
+                        headers={"WWW-Authenticate": "Bearer"}
+                        if e.status == 401 else None, close=True)
+                    return
+            if path == "/v1/models":
                 ctx_max = int(os.environ.get("TQ_CTX", "262144"))
                 self._json(200, {"object": "list", "data": [{
                     "id": args.model_name, "object": "model", "created": int(time.time()),
@@ -1053,13 +1555,17 @@ def make_handler(eng, tok, args):
                                     "allow_search_indices": False, "allow_view": True,
                                     "allow_fine_tuning": False, "organization": "*",
                                     "group": None, "is_blocking": False}]}]})
-            elif self.path.startswith("/health") or self.path.startswith("/v1/healthz"):
+            elif path in ("/health", "/healthz", "/v1/healthz", "/livez", "/readyz"):
                 # Do not call into CUDA from the HTTP watchdog. A wedged engine
                 # stream must still yield an immediate 503 and a useful reason.
                 fb, tb = eng._cached_free_blocks, eng._cached_total_blocks
                 now = time.monotonic()
                 alive = eng.thread.is_alive()
-                busy = bool(eng.q or eng.active or eng.pref)
+                with eng.phase_lock:
+                    phase = eng.phase
+                    phase_age_s = max(0.0, now - eng.phase_since_mono)
+                    current_request_id = eng.current_request_id
+                busy = bool(eng.q or eng.active or eng.pref or phase != "idle")
                 checkpoints = list(eng.cks)
                 spec_rounds_by_n = dict(eng.spec_rounds_by_n)
                 bases = [x for x in (eng.last_progress_mono, eng.busy_since_mono)
@@ -1070,8 +1576,15 @@ def make_handler(eng, tok, args):
                     busy and last_wave_age_s > args.health_stall_seconds)
                 stalled_reason = ("engine-thread-dead" if not alive else
                                   "no-forward-progress" if stalled else None)
-                self._json(503 if stalled else 200,
-                           {"status": "stalled" if stalled else "ok",
+                ready = alive and eng.running and not stalled
+                unhealthy = (not alive) if path == "/livez" else (
+                    not ready if path == "/readyz" else stalled)
+                status = ("dead" if not alive else "live") if path == "/livez" else (
+                    "ready" if ready else "not_ready") if path == "/readyz" else (
+                    "stalled" if stalled else "ok")
+                self._json(503 if unhealthy else 200,
+                           {"status": status,
+                            "ready": ready, "live": alive,
                             "stalled_reason": stalled_reason,
                             "free_blocks": fb, "total_blocks": tb,
                             "free_blocks_sample_age_s":
@@ -1083,8 +1596,15 @@ def make_handler(eng, tok, args):
                             "engine_thread_alive": alive,
                             "last_wave_age_s": last_wave_age_s,
                             "last_engine_error": eng.last_engine_error,
+                            "engine_phase": phase,
+                            "engine_phase_age_s": phase_age_s,
+                            "current_request_id": current_request_id,
                             "admission_recoveries": eng.admission_recoveries,
                             "admission_failures": eng.admission_failures,
+                            "supervisor": {
+                                "restarts": eng.supervisor_restarts,
+                                "last_exit_code": eng.supervisor_last_exit_code,
+                                "last_exit_time_seconds": eng.supervisor_last_exit_unix},
                             "prefix_cache": {"enabled": eng.pc_enabled,
                                              "prefix_tokens": sum(c["pos"] for c in checkpoints),
                                              "checkpoints": len(checkpoints),
@@ -1098,53 +1618,218 @@ def make_handler(eng, tok, args):
                                      "rounds_by_n": spec_rounds_by_n,
                                      "tokens_per_round": (eng.spec_committed / eng.spec_rounds)
                                                          if eng.spec_rounds else 0.0}})
-            elif self.path.startswith("/waveprof"):
-                # Where a wave's wall time actually goes. `engine_inside` is measured by
-                # the engine itself; `engine` is what Python sees around the ctypes call,
-                # so their difference is interpreter cost (GIL re-acquisition) that no
-                # amount of scheduler tuning can remove.
+            elif path == "/metrics":
+                self._prometheus()
+            elif path == "/waveprof":
+                # Never enter the native library from an HTTP thread. The
+                # engine-thread ctypes interval is the authoritative call wall
+                # time; kernel-only profiling belongs in nsys, off production.
                 w = max(eng.prefill_waves, 1)
                 other = max(eng.t_loop - eng.t_marshal - eng.t_engine, 0.0)
-                try:
-                    eng.L.qwn_wave_ms.restype = ctypes.c_double
-                    eng.L.qwn_wave_count.restype = ctypes.c_long
-                    e_ms, e_n = eng.L.qwn_wave_ms(), max(eng.L.qwn_wave_count(), 1)
-                except Exception:
-                    e_ms, e_n = 0.0, 1
-                self._json(200, {"waves": eng.prefill_waves, "engine_waves": e_n,
+                self._json(200, {"waves": eng.prefill_waves,
+                                 "engine_waves": eng.prefill_waves,
                                  "ms_per_wave": {
                                      "marshal": 1000.0 * eng.t_marshal / w,
                                      "engine_seen_by_python": 1000.0 * eng.t_engine / w,
-                                     "engine_inside": e_ms / e_n,
+                                     "engine_inside": None,
                                      "scheduler_other": 1000.0 * other / w,
                                      "loop_total": 1000.0 * eng.t_loop / w}})
-            elif self.path.startswith("/v1/wavelog"):
+            elif path == "/v1/wavelog":
                 # Raw wave timeline. Host gap between consecutive engine calls is
                 # rec[i].t_end - rec[i-1].t_end - rec[i].engine_ms.
                 self._json(200, {"log": [list(r) for r in eng.wavelog]})
-            elif self.path.startswith("/v1/wavereset"):
+            elif path == "/v1/wavereset":
                 eng.wavelog = []
                 self._json(200, {"ok": True})
             else:
-                self._json(404, {"error": "not found"})
+                self._json(404, {"error": "not found"}, close=True)
 
         def do_POST(self):
-            if not self.path.startswith("/v1/chat/completions") and not self.path.startswith("/v1/completions"):
-                self._json(404, {"error": "not found"}); return
-            n = int(self.headers.get("Content-Length", "0"))
-            body = json.loads(self.rfile.read(n) or b"{}")
+            self._response_started = False
+            self._body_consumed = False
+            self._current_req = None
+            acquired = self._request_slots.acquire(blocking=False)
+            if not acquired:
+                self._json_error(429, "too many concurrent HTTP requests",
+                                 "server_overloaded", "http_concurrency_limit",
+                                 close=True)
+                return
+            try:
+                self._require_api_key()
+                self._do_POST()
+            except RequestError as e:
+                if not self._response_started:
+                    self._json_error(
+                        e.status, e.message, e.error_type, e.code, e.param,
+                        headers={"WWW-Authenticate": "Bearer"}
+                        if e.status == 401 else None,
+                        close=not self._body_consumed)
+            except (json.JSONDecodeError, UnicodeDecodeError,
+                    ValueError, TypeError) as e:
+                if not self._response_started:
+                    self._json_error(400, f"invalid request: {e}",
+                                     "invalid_request_error",
+                                     "invalid_request",
+                                     close=not self._body_consumed)
+            except socket.timeout:
+                if self._current_req is not None:
+                    eng.cancel(self._current_req, "HTTP connection timed out",
+                               408, "failed", "timeout_error",
+                               "http_io_timeout")
+                if not self._response_started:
+                    self._json_error(408, "HTTP connection timed out",
+                                     "timeout_error", "http_io_timeout",
+                                     close=True)
+            except (BrokenPipeError, ConnectionResetError):
+                if self._current_req is not None:
+                    eng.cancel(self._current_req, "client disconnected")
+            except Exception:
+                if self._current_req is not None:
+                    eng.cancel(self._current_req, "request handler failed",
+                               500, "failed", "server_error",
+                               "handler_failed")
+                traceback.print_exc()
+                if not self._response_started:
+                    self._json_error(500, "internal server error",
+                                     "server_error", "internal_error",
+                                     close=not self._body_consumed)
+            finally:
+                self._current_req = None
+                self._request_slots.release()
+
+        def _do_POST(self):
+            path = self.path.partition("?")[0]
+            if path not in ("/v1/chat/completions", "/v1/completions"):
+                self._json(404, {"error": "not found"}, close=True); return
+            transfer_encodings = self.headers.get_all("Transfer-Encoding") or []
+            if transfer_encodings:
+                raise RequestError(400, "Transfer-Encoding is not supported",
+                                   "invalid_request_error",
+                                   "unsupported_transfer_encoding",
+                                   "Transfer-Encoding")
+            content_lengths = self.headers.get_all("Content-Length") or []
+            if not content_lengths:
+                raise RequestError(411, "Content-Length is required",
+                                   "invalid_request_error",
+                                   "content_length_required")
+            if len(content_lengths) != 1:
+                raise RequestError(400, "exactly one Content-Length is required",
+                                   "invalid_request_error",
+                                   "ambiguous_content_length",
+                                   "Content-Length")
+            raw_length = content_lengths[0].strip()
+            if not raw_length.isascii() or not raw_length.isdecimal():
+                raise RequestError(400, "invalid Content-Length",
+                                   "invalid_request_error",
+                                   "invalid_content_length",
+                                   "Content-Length")
+            n = int(raw_length)
+            if n > args.max_request_bytes:
+                raise RequestError(413, "request body is too large",
+                                      "invalid_request_error",
+                                      "request_too_large")
+            raw_body = self.rfile.read(n)
+            self._body_consumed = len(raw_body) == n
+            if not self._body_consumed:
+                raise RequestError(400, "incomplete request body",
+                                   "invalid_request_error",
+                                   "incomplete_request_body")
+            body = json.loads(raw_body or b"{}")
+            if not isinstance(body, dict):
+                raise RequestError(400, "request body must be a JSON object",
+                                      "invalid_request_error", "invalid_json")
+            model = body.get("model")
+            aliases = {args.model_name, "ksl"}
+            aliases.update(x.strip() for x in
+                           os.environ.get("KSL_MODEL_ALIASES", "").split(",")
+                           if x.strip())
+            if not isinstance(model, str) or not model:
+                raise RequestError(400, "model is required",
+                                      "invalid_request_error",
+                                      "model_required", "model")
+            if model not in aliases:
+                raise RequestError(404, f"model {model!r} does not exist",
+                                      "invalid_request_error",
+                                      "model_not_found", "model")
+            stream_raw = body.get("stream", False)
+            if not isinstance(stream_raw, bool):
+                raise RequestError(400, "stream must be a boolean",
+                                      "invalid_request_error",
+                                      "invalid_stream", "stream")
+            count = body.get("n", 1)
+            if not isinstance(count, int) or isinstance(count, bool) or count != 1:
+                raise RequestError(400, "only n=1 is supported",
+                                      "invalid_request_error",
+                                      "unsupported_parameter", "n")
+            for key in ("logprobs", "prompt_logprobs", "top_logprobs"):
+                if body.get(key) not in (None, False, 0):
+                    raise RequestError(
+                        400, f"{key} is not supported by this server",
+                        "invalid_request_error", "unsupported_parameter", key)
+            response_format = body.get("response_format")
+            if response_format not in (None, {"type": "text"}):
+                raise RequestError(
+                    400, "structured response_format is not supported",
+                    "invalid_request_error", "unsupported_parameter",
+                    "response_format")
+            for key in ("guided_json", "guided_regex", "guided_choice",
+                        "guided_grammar", "guided_decoding_backend",
+                        "structured_outputs"):
+                if body.get(key) is not None:
+                    raise RequestError(
+                        400, f"{key} is not supported by this server",
+                        "invalid_request_error", "unsupported_parameter", key)
+            top_p = body.get("top_p", 1.0)
+            if (not isinstance(top_p, (int, float)) or
+                    isinstance(top_p, bool) or not math.isfinite(top_p) or
+                    float(top_p) != 1.0):
+                raise RequestError(
+                    400, "top_p sampling is not supported; use top_p=1",
+                    "invalid_request_error", "unsupported_parameter", "top_p")
+            top_k = body.get("top_k", -1)
+            if (not isinstance(top_k, int) or isinstance(top_k, bool) or
+                    top_k not in (-1, 0)):
+                raise RequestError(
+                    400, "top_k sampling is not supported; use top_k=-1",
+                    "invalid_request_error", "unsupported_parameter", "top_k")
+            for key, neutral in (("presence_penalty", 0),
+                                 ("frequency_penalty", 0),
+                                 ("repetition_penalty", 1)):
+                value = body.get(key, neutral)
+                if (not isinstance(value, (int, float)) or
+                        isinstance(value, bool) or not math.isfinite(value) or
+                        float(value) != neutral):
+                    raise RequestError(
+                        400, f"{key} is not supported",
+                        "invalid_request_error", "unsupported_parameter", key)
+            if body.get("logit_bias"):
+                raise RequestError(
+                    400, "logit_bias is not supported",
+                    "invalid_request_error", "unsupported_parameter",
+                    "logit_bias")
             # OpenAI chat sends max_completion_tokens (guidellm's chat handler does);
             # /v1/completions sends max_tokens; Responses-style clients send
             # max_output_tokens. Reading only one silently halves the requested length.
-            # No field at all -> vLLM semantics: generate into the remaining window
-            # (capped at 16k; the old default of 128 truncated every agent reply).
-            mt_raw = (body.get("max_tokens") or body.get("max_completion_tokens")
-                      or body.get("max_output_tokens"))
-            stream = bool(body.get("stream", False))
+            mt_raw = next((body[k] for k in (
+                "max_tokens", "max_completion_tokens", "max_output_tokens")
+                if body.get(k) is not None), None)
+            stream = stream_raw
             is_chat = self.path.startswith("/v1/chat")
-            tools = body.get("tools") or None
+            tools = body.get("tools")
+            if tools is not None and not isinstance(tools, list):
+                raise RequestError(400, "tools must be an array",
+                                      "invalid_request_error", "invalid_tools",
+                                      "tools")
             if is_chat:
                 msgs = body.get("messages", [])
+                if not isinstance(msgs, list) or not msgs:
+                    raise RequestError(400, "messages must be a non-empty array",
+                                          "invalid_request_error",
+                                          "invalid_messages", "messages")
+                if any(not isinstance(m, dict) for m in msgs):
+                    raise RequestError(400, "each message must be an object",
+                                          "invalid_request_error",
+                                          "invalid_messages", "messages")
                 # OpenAI carries tool_call arguments as a JSON string; the Qwen
                 # template iterates them as a mapping -> parse in place.
                 for m in msgs:
@@ -1158,7 +1843,15 @@ def make_handler(eng, tok, args):
                 # Default ON (TQ_THINK=0 to flip). vLLM's actual API for this is
                 # chat_template_kwargs={"enable_thinking": ...}; the bare top-level
                 # field is kept as a convenience alias.
-                ctk = body.get("chat_template_kwargs") or {}
+                ctk = body.get("chat_template_kwargs")
+                if ctk is not None and not isinstance(ctk, dict):
+                    raise RequestError(400,
+                                          "chat_template_kwargs must be an object",
+                                          "invalid_request_error",
+                                          "invalid_chat_template_kwargs",
+                                          "chat_template_kwargs")
+                if ctk is None:
+                    ctk = {}
                 think = bool(ctk.get("enable_thinking",
                                      body.get("enable_thinking",
                                               os.environ.get("TQ_THINK", "1") != "0")))
@@ -1170,50 +1863,131 @@ def make_handler(eng, tok, args):
                                                    tokenize=False)
                 ids = tok(tmpl, add_special_tokens=False).input_ids
             else:
-                ids = tok(body.get("prompt", ""), add_special_tokens=False).input_ids
+                prompt = body.get("prompt", "")
+                if isinstance(prompt, str):
+                    ids = tok(prompt, add_special_tokens=False).input_ids
+                elif isinstance(prompt, list) and prompt:
+                    vocab_size = len(tok)
+                    if not all(isinstance(x, int) and not isinstance(x, bool)
+                               and 0 <= x < vocab_size for x in prompt):
+                        raise RequestError(
+                            400, "prompt must be a string or a non-empty array of token IDs",
+                            "invalid_request_error", "invalid_prompt", "prompt")
+                    ids = list(prompt)
+                else:
+                    raise RequestError(
+                        400, "prompt must be a string or a non-empty array of token IDs",
+                        "invalid_request_error", "invalid_prompt", "prompt")
             ctx_max = int(os.environ.get("TQ_CTX", "262144"))
             win = ctx_max - len(ids) - 8
-            # Interactive floor (TQ_MIN_OUT, default 8192): coding CLIs compute
-            # max_tokens from THEIR configured window with THEIR tokenizer and
-            # routinely send tiny caps (observed: 36 on a 26K prompt) that cut
-            # replies mid-word with finish_reason=length. Lift explicit caps to
-            # the floor unless the client pinned length for benchmarking
-            # (ignore_eos + max_tokens) -- EOS still ends generation naturally,
-            # so the floor only removes artificial truncation. No field at all
-            # -> vLLM semantics: generate into the remaining window
-            # (TQ_DEF_OUT cap, default 16384; the old default of 128 truncated
-            # every agent reply).
-            ignore = bool(body.get("ignore_eos", False))
-            if mt_raw:
-                max_new = int(mt_raw)
-                if not ignore:
-                    max_new = max(max_new, int(os.environ.get("TQ_MIN_OUT", "8192")))
+            # An explicit OpenAI generation limit is a hard contract. When the
+            # field is absent, allow a useful agent response while staying
+            # inside the model context window.
+            ignore = body.get("ignore_eos", False)
+            if not isinstance(ignore, bool):
+                raise RequestError(400, "ignore_eos must be a boolean",
+                                      "invalid_request_error",
+                                      "invalid_ignore_eos", "ignore_eos")
+            if mt_raw is not None:
+                if not isinstance(mt_raw, int) or isinstance(mt_raw, bool):
+                    raise RequestError(400, "max_tokens must be an integer",
+                                          "invalid_request_error",
+                                          "invalid_max_tokens", "max_tokens")
+                max_new = mt_raw
+                if max_new < 1:
+                    raise RequestError(400, "max_tokens must be at least 1",
+                                          "invalid_request_error",
+                                          "invalid_max_tokens", "max_tokens")
+                # Preserve the caller's exact cap; benchmarks and interactive
+                # clients must observe the same API semantics.
             else:
                 max_new = int(os.environ.get("TQ_DEF_OUT", "16384"))
-            max_new = max(16, min(max_new, win))
+            if win < 1:
+                raise RequestError(
+                    400, f"prompt is too long: {len(ids)} tokens for context {ctx_max}",
+                    "invalid_request_error", "context_length_exceeded", "prompt")
+            max_new = max(1, min(max_new, win))
             # stop strings, vLLM semantics: applied to the RAW generation (thinking
             # included), earliest match truncates and finishes with "stop".
             stop_raw = body.get("stop")
+            if stop_raw is not None and not (
+                    isinstance(stop_raw, str) or
+                    (isinstance(stop_raw, list) and
+                     all(isinstance(s0, str) for s0 in stop_raw))):
+                raise RequestError(400, "stop must be a string or an array of strings",
+                                      "invalid_request_error", "invalid_stop", "stop")
             stops = ([stop_raw] if isinstance(stop_raw, str)
-                     else [s0 for s0 in (stop_raw or []) if isinstance(s0, str) and s0])
+                     else [s0 for s0 in (stop_raw or []) if s0])
             # ignore_eos: benchmark/eval harnesses (guidellm) pin the output length by
             # sending max_tokens + ignore_eos, so every request does equal work.
             req_eos = [] if ignore else eos
-            want_usage = bool((body.get("stream_options") or {}).get("include_usage"))
+            stream_options = body.get("stream_options")
+            if stream_options is not None and not isinstance(stream_options, dict):
+                raise RequestError(400, "stream_options must be an object",
+                                      "invalid_request_error",
+                                      "invalid_stream_options", "stream_options")
+            include_usage = (stream_options or {}).get("include_usage")
+            if include_usage is not None and not isinstance(include_usage, bool):
+                raise RequestError(400, "stream_options.include_usage must be a boolean",
+                                   "invalid_request_error",
+                                   "invalid_stream_options",
+                                   "stream_options.include_usage")
+            want_usage = bool(include_usage)
             # Sampling: an omitted temperature keeps the engine's greedy default
             # (agentic clients here want determinism + APC-friendly replays);
             # explicit temperature>0 samples engine-side with the spec-sampler
             # semantics (temp-scaled + TQ_MIN_P tail floor + replayable seed).
-            # top_p/top_k are not implemented by the v1 sampler (min-p governs the
-            # tail instead) and are accepted-but-ignored, like serve_openai.
-            temp = max(0.0, float(body.get("temperature") or 0.0))
-            seed = int(body.get("seed") or int.from_bytes(os.urandom(8), "little"))
-            req = eng.submit(list(ids), max_new, req_eos, temp, seed)
-            cid = f"chatcmpl-{int(time.time()*1000)}"
+            # The native sampler implements temperature plus a server-wide min-p
+            # floor. Unsupported per-request filters are rejected above rather
+            # than silently producing different distributions.
+            temp_raw = body.get("temperature", 0.0)
+            if (not isinstance(temp_raw, (int, float)) or
+                    isinstance(temp_raw, bool)):
+                raise RequestError(400, "temperature must be a number",
+                                      "invalid_request_error",
+                                      "invalid_temperature", "temperature")
+            temp = float(temp_raw)
+            if not math.isfinite(temp) or temp < 0.0:
+                raise RequestError(400, "temperature must be a finite non-negative number",
+                                      "invalid_request_error",
+                                      "invalid_temperature", "temperature")
+            seed_raw = body.get("seed")
+            if seed_raw is not None and (
+                    not isinstance(seed_raw, int) or isinstance(seed_raw, bool)):
+                raise RequestError(400, "seed must be an integer",
+                                      "invalid_request_error",
+                                      "invalid_seed", "seed")
+            seed = (seed_raw if seed_raw is not None else
+                    int.from_bytes(os.urandom(8), "little"))
+            priority_raw = body.get("priority", 0)
+            if (not isinstance(priority_raw, int) or
+                    isinstance(priority_raw, bool)):
+                raise RequestError(400, "priority must be an integer",
+                                      "invalid_request_error",
+                                      "invalid_priority", "priority")
+            priority = priority_raw
+            if abs(priority) > 1_000_000_000:
+                raise RequestError(400, "priority is outside the supported range",
+                                      "invalid_request_error",
+                                      "invalid_priority", "priority")
+            rid = self.headers.get("X-Request-ID")
+            if rid is not None and (not rid.strip() or len(rid) > 256):
+                raise RequestError(400, "X-Request-ID must contain 1 to 256 characters",
+                                      "invalid_request_error",
+                                      "invalid_request_id")
+            request_timeout = (args.timeout if args.request_timeout is None
+                               else args.request_timeout)
+            req = eng.submit(list(ids), max_new, req_eos, temp, seed,
+                             priority=priority, request_id=rid,
+                             request_timeout=request_timeout,
+                             queue_timeout=args.queue_timeout)
+            self._current_req = req
+            cid = req.id
 
             if stream:
                 # TRUE token streaming: the engine sets req.progress as each token
                 # commits, so deltas leave as they are produced (TTFT/ITL are real).
+                self._response_started = True
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
@@ -1238,9 +2012,15 @@ def make_handler(eng, tok, args):
                     in_think = is_chat and think
                     up, stopped, content_open = 0, False, not (is_chat and think)
                     tool_start = -1                     # index of first <tool_call> in full
-                    sent_txt, sent_tok, deadline = "", 0, time.time() + args.timeout
+                    sent_txt, sent_tok = "", 0
                     while True:
                         done = req.done.is_set()
+                        if done and req.err:
+                            _sse(_error_body(req.err, req.err_type,
+                                            req.err_code))
+                            self.wfile.write(b"data: [DONE]\n\n")
+                            self.wfile.flush()
+                            return
                         n_out = len(req.out)
                         # Process on new tokens AND on done-with-no-new-tokens: the
                         # last progress wake can land between the final token append
@@ -1253,7 +2033,11 @@ def make_handler(eng, tok, args):
                             for st0 in stops:
                                 i2 = full.find(st0)
                                 if i2 >= 0:
-                                    full = full[:i2]; stopped = True; req.cancel = True
+                                    full = full[:i2]
+                                    if not stopped:
+                                        stopped = True
+                                        eng.cancel(req, None, 200, "completed",
+                                                   None, None)
                             fin = done or stopped
                             if in_think:
                                 b = full.find("</think>")
@@ -1298,9 +2082,27 @@ def make_handler(eng, tok, args):
                             if done or stopped:
                                 break
                         else:
-                            if time.time() > deadline:
-                                break
-                            req.progress.wait(0.05)
+                            if self._peer_closed():
+                                eng.cancel(req, "client disconnected")
+                                return
+                            remaining = req.deadline_mono - time.monotonic()
+                            if remaining <= 0:
+                                if eng.cancel(req, "request deadline exceeded", 504,
+                                              "failed", "timeout_error",
+                                              "request_timeout"):
+                                    _sse(_error_body(
+                                        "request deadline exceeded", "timeout_error",
+                                        "request_timeout"))
+                                    self.wfile.write(b"data: [DONE]\n\n")
+                                    self.wfile.flush()
+                                    return
+                                # Completion or another cancellation won the
+                                # terminal lock. Re-read its outcome rather
+                                # than publishing a contradictory timeout.
+                                req.progress.wait(0.05)
+                                req.progress.clear()
+                                continue
+                            req.progress.wait(min(0.05, remaining))
                             req.progress.clear()
                     gen = len(req.out)
                     tcs = None
@@ -1321,15 +2123,36 @@ def make_handler(eng, tok, args):
                                         "total_tokens": req.n_prompt + gen}})
                     self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
-                    # client walked away: stop burning a slot on a dead socket
-                    req.cancel = True
+                    # Client walked away: stop burning a slot on a dead socket.
+                    eng.cancel(req, "client disconnected")
                 return
 
-            if not req.done.wait(timeout=args.timeout):
-                req.cancel = True
-                self._json(504, {"error": "generation timeout"}); return
-            if getattr(req, "err", None):
-                self._json(500, {"error": req.err}); return
+            if self._peer_closed():
+                eng.cancel(req, "client disconnected")
+                return
+
+            while not req.done.is_set():
+                if self._peer_closed():
+                    eng.cancel(req, "client disconnected")
+                    return
+                remaining = req.deadline_mono - time.monotonic()
+                if remaining <= 0:
+                    eng.cancel(req, "request deadline exceeded", 504, "failed",
+                               "timeout_error", "request_timeout")
+                    req.done.wait(timeout=1.0)
+                    break
+                if stops and req.out:
+                    partial = tok.decode(req.out, skip_special_tokens=True)
+                    if any(st0 in partial for st0 in stops):
+                        eng.cancel(req, None, 200, "completed", None, None)
+                        req.done.wait(timeout=1.0)
+                        break
+                req.progress.wait(timeout=min(0.05, remaining))
+                req.progress.clear()
+            if req.err:
+                self._json_error(req.err_status, req.err, req.err_type,
+                                 req.err_code)
+                return
             # include the full committed continuation (out[0] is the first generated token)
             text = tok.decode(req.out if len(req.out) else [], skip_special_tokens=True)
             gen = len(req.out)
@@ -1375,6 +2198,18 @@ def serve(args):
         faulthandler.register(signal.SIGUSR1, all_threads=True)
     except Exception:
         pass
+    startup_done = threading.Event()
+
+    def _watch_startup():
+        if startup_done.wait(args.startup_watchdog_seconds):
+            return
+        print(f"[engine] FATAL: startup made no progress for "
+              f"{args.startup_watchdog_seconds:.1f}s", flush=True)
+        faulthandler.dump_traceback(all_threads=True)
+        os._exit(70)
+
+    threading.Thread(target=_watch_startup, name="startup-watchdog",
+                     daemon=True).start()
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
     L = load_lib(args.lib)          # this also publishes the engine's wave cap
@@ -1389,14 +2224,21 @@ def serve(args):
         args.prefill_budget = WAVE_MAX
     print(f"batched server: engine wave cap={WAVE_MAX} "
           f"wave_cols={args.wave_cols} prefill_budget={args.prefill_budget}", flush=True)
-    eng = BatchedEngine(L, args.tqf, args.max_slots, args.num_blocks, args.page,
-                        wave_cols=args.wave_cols, max_prefill=args.max_prefill,
-                        fuse=args.fuse, fuse_ratio=args.fuse_ratio, fuse_idle_ms=args.fuse_idle_ms,
-                        decode_every=args.decode_every,
-                        prefix_cache=args.prefix_cache, prefix_cache_min=args.prefix_cache_min,
-                        decode_min_rows=args.decode_min_rows,
-                        decode_max_idle_ms=args.decode_max_idle_ms,
-                        prefill_budget=args.prefill_budget)
+    try:
+        eng = BatchedEngine(L, args.tqf, args.max_slots, args.num_blocks, args.page,
+                            wave_cols=args.wave_cols, max_prefill=args.max_prefill,
+                            fuse=args.fuse, fuse_ratio=args.fuse_ratio,
+                            fuse_idle_ms=args.fuse_idle_ms,
+                            decode_every=args.decode_every,
+                            prefix_cache=args.prefix_cache,
+                            prefix_cache_min=args.prefix_cache_min,
+                            decode_min_rows=args.decode_min_rows,
+                            decode_max_idle_ms=args.decode_max_idle_ms,
+                            prefill_budget=args.prefill_budget,
+                            max_queue=args.max_queue,
+                            queue_timeout=args.queue_timeout)
+    finally:
+        startup_done.set()
     def _watch_engine():
         # ctypes releases the GIL around native calls. This thread therefore
         # remains able to kill a process whose engine loop is blocked in CUDA,
@@ -1404,7 +2246,13 @@ def serve(args):
         interval = max(0.1, min(1.0, args.engine_watchdog_seconds / 4.0))
         while eng.running:
             time.sleep(interval)
-            if not (eng.q or eng.active or eng.pref):
+            if not eng.running:
+                return
+            with eng.phase_lock:
+                phase = eng.phase
+                phase_age = time.monotonic() - eng.phase_since_mono
+                current_request_id = eng.current_request_id
+            if not (eng.q or eng.active or eng.pref or phase != "idle"):
                 continue
             now = time.monotonic()
             bases = [x for x in (eng.last_progress_mono, eng.busy_since_mono)
@@ -1414,13 +2262,15 @@ def serve(args):
             if age <= args.engine_watchdog_seconds:
                 continue
             print(f"[engine] FATAL: no forward progress for {age:.1f}s; "
-                  f"queued={len(eng.q)} active={len(eng.active)} "
-                  f"prefilling={len(eng.pref)}", flush=True)
+                  f"phase={phase} phase_age={phase_age:.1f}s "
+                  f"request={current_request_id!r} queued={len(eng.q)} "
+                  f"active={len(eng.active)} prefilling={len(eng.pref)}",
+                  flush=True)
             faulthandler.dump_traceback(all_threads=True)
             os._exit(70)
 
     threading.Thread(target=_watch_engine, name="engine-watchdog", daemon=True).start()
-    fb, tb, pg, mb = eng._stats()
+    fb, tb, pg = (eng._cached_free_blocks, eng._cached_total_blocks, eng.page)
     print(f"batched server: pool blocks={tb} page={pg} max_slots={eng.max_slots} free={fb}", flush=True)
     # BaseHTTPServer's default backlog is 5: with N clients connecting at once the
     # kernel resets the surplus SYNs (ConnectionReset at the client) long before the
@@ -1428,14 +2278,74 @@ def serve(args):
     class _Server(ThreadingHTTPServer):
         daemon_threads = True
         request_queue_size = max(128, 4 * args.max_slots)
+
+        def __init__(self, *server_args, **server_kwargs):
+            self._connection_slots = threading.BoundedSemaphore(
+                args.max_http_concurrency)
+            super().__init__(*server_args, **server_kwargs)
+
+        def get_request(self):
+            request, client_address = super().get_request()
+            request.settimeout(args.http_io_timeout)
+            return request, client_address
+
+        def process_request(self, request, client_address):
+            if not self._connection_slots.acquire(blocking=False):
+                try:
+                    body = json.dumps(_error_body(
+                        "too many concurrent HTTP connections",
+                        "server_overloaded", "http_concurrency_limit")).encode()
+                    request.sendall(
+                        b"HTTP/1.1 429 Too Many Requests\r\n"
+                        b"Content-Type: application/json\r\n"
+                        b"Connection: close\r\n"
+                        + f"Content-Length: {len(body)}\r\n\r\n".encode()
+                        + body)
+                except OSError:
+                    pass
+                finally:
+                    self.shutdown_request(request)
+                eng._metric("requests_rejected")
+                return
+            try:
+                super().process_request(request, client_address)
+            except BaseException:
+                self._connection_slots.release()
+                raise
+
+        def process_request_thread(self, request, client_address):
+            try:
+                super().process_request_thread(request, client_address)
+            finally:
+                self._connection_slots.release()
     httpd = _Server((args.host, args.port), make_handler(eng, tok, args))
     print(f"listening on {args.host}:{args.port}  (model={args.model_name})", flush=True)
+    def _graceful_signal(_signum, _frame):
+        raise KeyboardInterrupt
+
+    old_term = signal.signal(signal.SIGTERM, _graceful_signal)
+    old_hup = signal.signal(signal.SIGHUP, _graceful_signal)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        eng.shutdown()
+        signal.signal(signal.SIGTERM, old_term)
+        signal.signal(signal.SIGHUP, old_hup)
+        shutdown_done = threading.Event()
+        def _watch_shutdown():
+            if shutdown_done.wait(args.engine_watchdog_seconds):
+                return
+            print("[Engine] FATAL: shutdown made no progress", flush=True)
+            faulthandler.dump_traceback(all_threads=True)
+            os._exit(70)
+        threading.Thread(target=_watch_shutdown, name="shutdown-watchdog",
+                         daemon=True).start()
+        try:
+            httpd.server_close()
+            eng.shutdown()
+        finally:
+            shutdown_done.set()
 
 
 # ----------------------------- steady-state throughput bench -----------------------------
@@ -1534,10 +2444,28 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8100)
     ap.add_argument("--timeout", type=float, default=300.0)
+    ap.add_argument("--request-timeout", type=float, default=None,
+                    help="generation deadline from enqueue; defaults to --timeout")
+    ap.add_argument("--queue-timeout", type=float, default=300.0,
+                    help="maximum seconds a request may wait before admission")
+    ap.add_argument("--max-queue", type=int, default=128,
+                    help="maximum queued requests before HTTP 429")
+    ap.add_argument("--max-request-bytes", type=int, default=16 * 1024 * 1024,
+                    help="maximum JSON request body bytes before HTTP 413")
+    ap.add_argument("--max-http-concurrency", type=int, default=256,
+                    help="maximum simultaneous HTTP request handlers")
+    ap.add_argument("--http-io-timeout", type=float, default=30.0,
+                    help="socket read/write timeout, including request headers and bodies")
+    ap.add_argument("--api-key", default=os.environ.get("KSL_API_KEY"),
+                    help="optional bearer token; defaults to KSL_API_KEY")
     ap.add_argument("--health-stall-seconds", type=float,
                     default=float(os.environ.get("TQ_HEALTH_STALL_S", "60")),
                     help="return 503 when queued/active work makes no wave progress for "
                          "this many seconds; the check never enters CUDA")
+    ap.add_argument("--startup-watchdog-seconds", type=float,
+                    default=float(os.environ.get("TQ_STARTUP_WATCHDOG_S", "120")),
+                    help="exit for supervisor restart if model/tokenizer initialization does "
+                         "not finish within this many seconds")
     ap.add_argument("--engine-watchdog-seconds", type=float,
                     default=float(os.environ.get("TQ_ENGINE_WATCHDOG_S", "120")),
                     help="exit for supervisor restart after this many seconds of queued/active "
@@ -1551,6 +2479,52 @@ def main():
     ap.add_argument("--gen", type=int, default=64)
     ap.add_argument("--stagger", type=float, default=0.15)
     args = ap.parse_args()
+    positive_floats = {
+        "--timeout": args.timeout,
+        "--queue-timeout": args.queue_timeout,
+        "--http-io-timeout": args.http_io_timeout,
+        "--health-stall-seconds": args.health_stall_seconds,
+        "--startup-watchdog-seconds": args.startup_watchdog_seconds,
+        "--engine-watchdog-seconds": args.engine_watchdog_seconds,
+    }
+    if args.request_timeout is not None:
+        positive_floats["--request-timeout"] = args.request_timeout
+    for option, value in positive_floats.items():
+        if not math.isfinite(value) or value <= 0:
+            ap.error(f"{option} must be a finite number greater than 0")
+    nonnegative_floats = {
+        "--fuse-ratio": args.fuse_ratio,
+        "--fuse-idle-ms": args.fuse_idle_ms,
+        "--decode-max-idle-ms": args.decode_max_idle_ms,
+    }
+    for option, value in nonnegative_floats.items():
+        if not math.isfinite(value) or value < 0:
+            ap.error(f"{option} must be a finite non-negative number")
+    if args.page < 1 or args.page & (args.page - 1):
+        ap.error("--page must be a positive power of two")
+    for option, value in {
+            "--max-slots": args.max_slots,
+            "--num-blocks": args.num_blocks,
+            "--max-prefill": args.max_prefill,
+            "--decode-min-rows": args.decode_min_rows,
+            "--prefix-cache-min": args.prefix_cache_min,
+    }.items():
+        if value < 1:
+            ap.error(f"{option} must be at least 1")
+    if args.wave_cols is not None and args.wave_cols < 1:
+        ap.error("--wave-cols must be at least 1")
+    if args.prefill_budget is not None and args.prefill_budget < 1:
+        ap.error("--prefill-budget must be at least 1")
+    if args.decode_every < 0:
+        ap.error("--decode-every must be non-negative")
+    if not 1 <= args.port <= 65535:
+        ap.error("--port must be between 1 and 65535")
+    if args.max_queue < 1:
+        ap.error("--max-queue must be at least 1")
+    if args.max_http_concurrency < 1:
+        ap.error("--max-http-concurrency must be at least 1")
+    if args.max_request_bytes < 2:
+        ap.error("--max-request-bytes must be at least 2")
     if args.bench:
         bench(args)
     elif args.selftest:
