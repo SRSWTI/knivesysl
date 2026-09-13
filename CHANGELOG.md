@@ -11,6 +11,20 @@ driven by the same client (`tools/bench_endpoint.py`).
 
 ## Unreleased
 
+### Unified vLLM Qwen tool and reasoning parsing
+
+The production batched endpoint now uses the installed vLLM 0.28 Qwen3 parser
+behind `qwen3_coder`/`qwen3_xml` and `qwen3`, replacing the local regex tool parser
+and separate reasoning split. A tool call can end reasoning implicitly without
+`</think>`, fixing XML tool calls appearing in Zed's Thinking section instead of
+executing. Arguments stream incrementally with stable call IDs and indices.
+
+The wire adapter retains `reasoning_content`, corrects nested schema coercion after
+string-to-container conversion, and preserves JSON-string tool arguments in request
+history while preparing separate mapping arguments for the chat template. The
+new regression runner uses the real tokenizer/parser and live HTTP server; it does
+not mock inference. Native CUDA inference and APC settings are unchanged.
+
 ### Production cache-capacity and liveness hardening
 
 Two production wedges at roughly 120k-token checkpoint churn exposed an unvalidated

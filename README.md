@@ -310,6 +310,9 @@ cmake --build build-qwen --target knivesysl-forward-qwen -j
 
 requires an sm120 blackwell part (rtx 5090 / rtx pro 6000), cuda 12.8+, and python 3.10+
 with `torch`, `transformers`, `numpy`, `safetensors` for the converter.
+The production batched server additionally requires `vllm==0.28.0` in its Python
+environment for the unified Qwen parser (`qwen3_coder` / `qwen3_xml` tool grammar
+and `qwen3` reasoning). vLLM supplies parsing only; knivesysl still owns inference.
 
 ## get the weights
 
@@ -389,7 +392,33 @@ tool output is that model's summary of the links and what it found (a non-stream
 completion on the same client, `enable_thinking` off). if the summarisation call fails,
 the raw scraped digest is returned instead.
 
+### production chat parsing
+
+`tools/serve_batched.py` uses the installed vLLM Qwen3 state machine through
+`tools/qwen_parser.py`, not the single-stream server's regex parser. It supports
+XML tool calls with thinking enabled or disabled, including `<tool_call>` as an
+implicit reasoning end without `</think>`. Tool names and JSON argument fragments
+stream as indexed `delta.tool_calls`; reasoning remains `reasoning_content` for
+OpenAI-compatible clients. The adapter corrects vLLM 0.28's early-return behavior
+for nested schema values in string-encoded object/array arguments. JSON inside
+`<tool_call>` is not the Qwen coder grammar and is no longer a parallel fallback.
+
+The regression suite uses the real tokenizer and installed parser plus live HTTP
+inference: `.venv/bin/python tools/test_qwen_parser.py` (server must be running).
+`KSL_TEST_MODEL_DIR`, `KSL_TEST_MODEL`, `KSL_TEST_URL`, and `KSL_API_KEY` select
+non-default assets, model ID, endpoint, and authentication.
+
+Tool parsing does not impose constrained generation: `parallel_tool_calls=false`
+does not force one call, and required/named `tool_choice` is not enforced. The
+parser suppresses tool calls for `tool_choice="none"`. Image inputs remain unsupported.
+
 ### reasoning effort
+
+The following effort aliases apply to `tools/serve_openai.py`, not the production
+batched endpoint. `serve_batched.py` currently honors `chat_template_kwargs.enable_thinking`
+(or `enable_thinking`, with `TQ_THINK` as the server default), but does not forward
+`reasoning_effort` or `preserve_thinking` overrides to the template. When thinking
+is enabled, the current local template therefore uses its default `xhigh` tier.
 
 qwen3.8's chat template owns it: `reasoning_effort` in `low | medium | xhigh` (default
 `xhigh`) selects a system-level instruction. we pass the tier through and fold `high`/`max`

@@ -26,6 +26,7 @@ Run (GPU7, prod Q4):
 from __future__ import annotations
 import argparse, ctypes, faulthandler, hmac, json, math, os, select, signal, socket, threading, time, traceback, queue, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from qwen_parser import QwenChatParser
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Prefill wave column cap. NEVER hardcode this: it is the engine's tiled-GEMM column
@@ -1312,79 +1313,6 @@ def selftest(args):
     eng.shutdown()
 
 
-# ----------------------------- tool-calling (ported from serve_openai.py) -----------------
-TOOL_OPEN, TOOL_CLOSE = "<tool_call>", "</tool_call>"
-
-
-def _coerce_arg(val, typ):
-    """Coerce an XML-ish <parameter> string to its JSON-schema type (Qwen3.6 template
-    serializes every value as text). With no declared type, best-effort JSON literal."""
-    s = val.strip() if isinstance(val, str) else val
-    if typ in ("integer", "number"):
-        try:
-            return int(s)
-        except (ValueError, TypeError):
-            try:
-                return float(s)
-            except (ValueError, TypeError):
-                return val
-    if typ == "boolean":
-        if isinstance(s, str) and s.lower() in ("true", "false"):
-            return s.lower() == "true"
-        return val
-    if typ in ("array", "object"):
-        try:
-            return json.loads(s)
-        except Exception:
-            return val
-    if typ == "string":
-        return val
-    try:
-        j = json.loads(s)
-        return j if isinstance(j, (int, float, bool, list, dict)) or j is None else val
-    except Exception:
-        return val
-
-
-def parse_tool_calls(text, tools=None):
-    """Qwen tool-call formats: (a) JSON <tool_call>{"name":..,"arguments":{..}}</tool_call>
-    (b) XML-ish <tool_call><function=NAME><parameter=KEY>VALUE</parameter>..</function></tool_call>.
-    Returns (clean_text, tool_calls_list_or_None)."""
-    import re as _re
-    types = {}
-    for t in (tools or []):
-        fn = t.get("function", t) if isinstance(t, dict) else {}
-        props = (((fn.get("parameters") or {}).get("properties")) or {})
-        types[fn.get("name", "")] = {k: (v or {}).get("type") for k, v in props.items()}
-    calls = []
-
-    def _emit(name, args):
-        calls.append({"id": "call_" + uuid.uuid4().hex[:16], "type": "function",
-                      "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
-
-    def _take(m):
-        raw = m.group(1).strip()
-        try:
-            obj = json.loads(raw)
-            _emit(obj.get("name", ""), obj.get("arguments", {}))
-            return ""
-        except Exception:
-            pass
-        fm = _re.search(r"<function=([^>\s]+)>(.*?)(?:</function>|$)", raw, _re.S)
-        if fm:
-            name = fm.group(1)
-            ptypes = types.get(name, {})
-            args = {}
-            for pm in _re.finditer(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>", fm.group(2), _re.S):
-                args[pm.group(1)] = _coerce_arg(pm.group(2), ptypes.get(pm.group(1)))
-            _emit(name, args)
-            return ""
-        return m.group(0)
-
-    clean = _re.sub(_re.escape(TOOL_OPEN) + r"(.*?)" + _re.escape(TOOL_CLOSE), _take, text, flags=_re.S)
-    return clean.strip(), (calls or None)
-
-
 # ----------------------------- OpenAI server (milestone 3.3) -----------------------------
 def make_handler(eng, tok, args):
     # EOS: eos_token_id + im_end/endoftext so tool-call turns terminate cleanly
@@ -1830,16 +1758,23 @@ def make_handler(eng, tok, args):
                     raise RequestError(400, "each message must be an object",
                                           "invalid_request_error",
                                           "invalid_messages", "messages")
-                # OpenAI carries tool_call arguments as a JSON string; the Qwen
-                # template iterates them as a mapping -> parse in place.
+                # The template needs mapping arguments; the protocol parser needs
+                # the original JSON strings. Copy only history entries we convert.
+                template_msgs = []
                 for m in msgs:
-                    for tc in (m.get("tool_calls") or []):
-                        fn = tc.get("function") or {}
-                        if isinstance(fn.get("arguments"), str):
-                            try:
-                                fn["arguments"] = json.loads(fn["arguments"])
-                            except Exception:
-                                pass
+                    if m.get("tool_calls"):
+                        converted = []
+                        for tc in m["tool_calls"]:
+                            fn = dict(tc.get("function") or {})
+                            if isinstance(fn.get("arguments"), str):
+                                try:
+                                    fn["arguments"] = json.loads(fn["arguments"])
+                                except ValueError:
+                                    pass
+                            converted.append({**tc, "function": fn})
+                        template_msgs.append({**m, "tool_calls": converted})
+                    else:
+                        template_msgs.append(m)
                 # Default ON (TQ_THINK=0 to flip). vLLM's actual API for this is
                 # chat_template_kwargs={"enable_thinking": ...}; the bare top-level
                 # field is kept as a convenience alias.
@@ -1856,10 +1791,10 @@ def make_handler(eng, tok, args):
                                      body.get("enable_thinking",
                                               os.environ.get("TQ_THINK", "1") != "0")))
                 try:
-                    tmpl = tok.apply_chat_template(msgs, tools=tools, add_generation_prompt=True,
+                    tmpl = tok.apply_chat_template(template_msgs, tools=tools, add_generation_prompt=True,
                                                    tokenize=False, enable_thinking=think)
                 except TypeError:
-                    tmpl = tok.apply_chat_template(msgs, tools=tools, add_generation_prompt=True,
+                    tmpl = tok.apply_chat_template(template_msgs, tools=tools, add_generation_prompt=True,
                                                    tokenize=False)
                 ids = tok(tmpl, add_special_tokens=False).input_ids
             else:
@@ -1977,6 +1912,14 @@ def make_handler(eng, tok, args):
                                       "invalid_request_id")
             request_timeout = (args.timeout if args.request_timeout is None
                                else args.request_timeout)
+            chat_parser = None
+            if is_chat:
+                try:
+                    chat_parser = QwenChatParser(
+                        tok, model, msgs, tools, think, body.get("tool_choice"))
+                except ValueError as exc:
+                    raise RequestError(400, str(exc), "invalid_request_error",
+                                       "invalid_chat_request") from exc
             req = eng.submit(list(ids), max_new, req_eos, temp, seed,
                              priority=priority, request_id=rid,
                              request_timeout=request_timeout,
@@ -2004,15 +1947,7 @@ def make_handler(eng, tok, args):
                     if is_chat:
                         _sse({**base, "choices": [{"index": 0, "delta": {"role": "assistant"},
                                                    "finish_reason": None}]})
-                    # The completion STARTS inside <think> (the template appends the
-                    # opener), so text up to </think> streams as delta.reasoning_content
-                    # and the rest as delta.content -- the split vLLM's qwen3 reasoning
-                    # parser performs. A 7-char holdback avoids emitting a partial
-                    # "</think"; stop strings get the same holdback treatment.
-                    in_think = is_chat and think
-                    up, stopped, content_open = 0, False, not (is_chat and think)
-                    tool_start = -1                     # index of first <tool_call> in full
-                    sent_txt, sent_tok = "", 0
+                    up, stopped, sent_tok = 0, False, 0
                     while True:
                         done = req.done.is_set()
                         if done and req.err:
@@ -2022,12 +1957,8 @@ def make_handler(eng, tok, args):
                             self.wfile.flush()
                             return
                         n_out = len(req.out)
-                        # Process on new tokens AND on done-with-no-new-tokens: the
-                        # last progress wake can land between the final token append
-                        # and done.set(), leaving that pass's holdback (up to
-                        # len(TOOL_OPEN)-1 chars for tool-sending clients) unflushed.
-                        # The old `elif done: break` skipped the tail flush entirely
-                        # and cut replies mid-word.
+                        # Flush the parser and stop holdback even when done arrives
+                        # after the last token notification.
                         if n_out > sent_tok or done:
                             full = tok.decode(req.out[:n_out], skip_special_tokens=True)
                             for st0 in stops:
@@ -2039,46 +1970,25 @@ def make_handler(eng, tok, args):
                                         eng.cancel(req, None, 200, "completed",
                                                    None, None)
                             fin = done or stopped
-                            if in_think:
-                                b = full.find("</think>")
-                                if b < 0:
-                                    safe = len(full) if fin else max(up, len(full) - 7)
-                                    if safe > up:
-                                        _sse({**base, "choices": [{"index": 0, "delta": {"reasoning_content": full[up:safe]}, "finish_reason": None}]})
-                                        up = safe
-                                else:
-                                    if b > up:
-                                        _sse({**base, "choices": [{"index": 0, "delta": {"reasoning_content": full[up:b]}, "finish_reason": None}]})
-                                    up = b + 8
-                                    in_think = False
-                            if not in_think:
-                                # swallow the newlines that follow </think> even when they
-                                # arrive in a LATER decode step than the tag itself
-                                if not content_open:
-                                    while up < len(full) and full[up] == "\n": up += 1
-                                # auto tool choice: content stops streaming at the first
-                                # <tool_call>; the XML buffers silently and is emitted as
-                                # a delta.tool_calls chunk when generation ends (the
-                                # qwen3_coder-parser behavior vLLM has).
-                                if is_chat and tools and tool_start < 0:
-                                    ti = full.find(TOOL_OPEN, up)
-                                    if ti >= 0:
-                                        tool_start = ti
-                                lim = tool_start if tool_start >= 0 else len(full)
-                                hb = 0
-                                if not fin:
-                                    if stops: hb = max(hb, max(len(s0) for s0 in stops) - 1)
-                                    if is_chat and tools and tool_start < 0:
-                                        hb = max(hb, len(TOOL_OPEN) - 1)
-                                safe = max(up, min(lim, len(full) - hb))
-                                if safe > up:
-                                    content_open = True
-                                    ch = ({"index": 0, "delta": {"content": full[up:safe]}, "finish_reason": None}
-                                          if is_chat else
-                                          {"index": 0, "text": full[up:safe], "finish_reason": None})
-                                    _sse({**base, "choices": [ch]})
-                                    up = safe
-                            sent_txt, sent_tok = full, n_out
+                            # vLLM buffers partial reasoning/tool delimiters itself.
+                            # Only stop strings and incomplete UTF-8 need holdback
+                            # before text is handed to the parser.
+                            safe = len(full)
+                            if not fin:
+                                safe = len(full.rstrip("\ufffd"))
+                                if stops:
+                                    safe = min(safe, len(full) - max(len(s) for s in stops) + 1)
+                            safe = max(up, safe)
+                            piece = full[up:safe]
+                            if is_chat:
+                                delta = chat_parser.feed(piece, finished=fin)
+                                if delta:
+                                    _sse({**base, "choices": [{"index": 0, "delta": delta,
+                                                              "finish_reason": None}]})
+                            elif piece:
+                                _sse({**base, "choices": [{"index": 0, "text": piece,
+                                                          "finish_reason": None}]})
+                            up, sent_tok = safe, n_out
                             if done or stopped:
                                 break
                         else:
@@ -2105,14 +2015,7 @@ def make_handler(eng, tok, args):
                             req.progress.wait(min(0.05, remaining))
                             req.progress.clear()
                     gen = len(req.out)
-                    tcs = None
-                    if is_chat and tools and tool_start >= 0:
-                        _clean, tcs = parse_tool_calls(sent_txt[tool_start:], tools)
-                        if tcs:
-                            _sse({**base, "choices": [{"index": 0, "delta": {"tool_calls": [
-                                dict(tc, index=i) for i, tc in enumerate(tcs)]},
-                                "finish_reason": None}]})
-                    finish = ("tool_calls" if tcs else
+                    finish = ("tool_calls" if chat_parser and chat_parser.has_tool_calls else
                               ("stop" if stopped else ("length" if gen >= max_new else "stop")))
                     ch = ({"index": 0, "delta": {}, "finish_reason": finish} if is_chat
                           else {"index": 0, "text": "", "finish_reason": finish})
@@ -2161,26 +2064,12 @@ def make_handler(eng, tok, args):
                 i2 = text.find(st0)
                 if i2 >= 0:
                     text = text[:i2]; stopped = True
-            reasoning = None
-            if is_chat and think:
-                j = text.find("</think>")
-                if j >= 0:
-                    reasoning, text = text[:j], text[j + 8:].lstrip("\n")
-                else:                       # budget exhausted inside the think block
-                    reasoning, text = text, ""
-            tool_calls = None
-            if is_chat and tools and TOOL_OPEN in text:
-                text, tool_calls = parse_tool_calls(text, tools)
-            finish = ("tool_calls" if tool_calls else
+            msg = chat_parser.parse(text) if is_chat else None
+            finish = ("tool_calls" if chat_parser and chat_parser.has_tool_calls else
                       ("stop" if stopped else ("length" if gen >= max_new else "stop")))
             usage = {"prompt_tokens": req.n_prompt, "completion_tokens": gen,
                      "total_tokens": req.n_prompt + gen}
             if is_chat:
-                msg = {"role": "assistant", "content": text or None}
-                if reasoning:
-                    msg["reasoning_content"] = reasoning
-                if tool_calls:
-                    msg["tool_calls"] = tool_calls
                 resp = {"id": cid, "object": "chat.completion", "model": args.model_name,
                         "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
                         "usage": usage}
