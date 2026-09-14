@@ -8,11 +8,24 @@
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <mma.h>
+#include "cuda_memory.h"
 
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <algorithm>
+
+// Headroom belongs to execution/runtime overhead and other GPU users, not caches.
+static size_t paged_memory_headroom(void) {
+    const char *e = getenv("TQ_VRAM_HEADROOM_MB");
+    if (!e) return 512u * 1048576u;
+    char *end = NULL;
+    long long mb = strtoll(e, &end, 10);
+    if (end == e || *end || mb < 0 || (unsigned long long)mb > SIZE_MAX / 1048576u)
+        return SIZE_MAX;  // invalid budget fails startup rather than wrapping
+    return (size_t)mb * 1048576u;
+}
 
 #define TQ_MAX_LAYERS 64
 #define TQ_LAYER_LINEAR_ATTENTION 1
@@ -4158,8 +4171,17 @@ static float *g_wide_attn_part = NULL;
 static size_t g_wide_attn_part_f = 0;
 static int ensure_wide_attn_part(size_t floats) {
     if (g_wide_attn_part_f >= floats) return 0;
-    if (g_wide_attn_part) { cudaFree(g_wide_attn_part); g_wide_attn_part = NULL; g_wide_attn_part_f = 0; }
-    if (cudaMalloc(&g_wide_attn_part, floats * sizeof(float)) != cudaSuccess) return -1;
+    float *replacement = NULL;
+    cudaError_t err = cudaMalloc(&replacement, floats * sizeof(float));
+    if (err != cudaSuccess) {
+        tq_cuda_check(err, "wide attention partials", floats * sizeof(float));
+        return tq_cuda_recover_oom(err) ? -1 : TQ_CUDA_FATAL;
+    }
+    if (g_wide_attn_part) {
+        err = cudaFree(g_wide_attn_part);
+        if (err != cudaSuccess) { cudaFree(replacement); return tq_cuda_check(err, "free wide attention partials"); }
+    }
+    g_wide_attn_part = replacement;
     g_wide_attn_part_f = floats;
     return 0;
 }
@@ -4252,8 +4274,11 @@ static int launch_wide_attn(float *out, const float *q_proj, const uint16_t *q_n
     if (wide_attn_mma_enabled()) {       // tensor-core prefill attention (compute-bound regime)
         int nqt = (N + 15) / 16;
         int S = wide_attn_split_S(max_pos);
-        if (S > 1 && ensure_wide_attn_part((size_t)nh * nqt * S * TQ_AMM_PART_F) != 0)
-            S = 1;
+        if (S > 1) {
+            int rc = ensure_wide_attn_part((size_t)nh * nqt * S * TQ_AMM_PART_F);
+            if (rc == -1) S = 1;
+            else if (rc != 0) return rc;
+        }
         k_tq_wide_attn_mma<1, 1><<<dim3(nh, nqt, S), 256, 0, st>>>(
             out, q_proj, q_norm_w, k_cache, v_cache, NULL, NULL, NULL, NULL, positions,
             0, NULL, 0, 0, 0, N, nh, nkv, hd, q_m, attn_m,
@@ -13996,22 +14021,22 @@ static int nvf4_quant_ensure(const float *d_x, int K, int N, cudaStream_t st,
     return 0;
 }
 
+static int nvf4_gemm_ks(const tq_qmma_weight_t *w, int nvar) {
+    int ks = w->nvf4_ks ? w->nvf4_ks
+                        : tq_nvf4_ksplits(w->Mt, w->Kt64, tq_nvf4_stages());
+    static int forced = -2;
+    if (forced == -2) { const char *e = getenv("TQ_NVF4_KS"); forced = (e && *e) ? atoi(e) : -1; }
+    if (forced > 0) return forced;
+    // Fat z-batched waves fill the device without split-K; tails do not.
+    return nvar >= 4 * TQ_NVF4_TILE ? 1 : ks;
+}
+
 // GEMM against the already-quantized activation, tiling columns at TQ_NVF4_TILE.
 static int nvf4_gemm_tiled(const tq_qmma_weight_t *w, float *out, int nvar,
                            cudaStream_t st) {
     if (!w->nvf4 || !w->d_nvf4_a) return -90;
     const int Kt64 = w->Kt64;
-    // Tuned config when available; the heuristic is only the pre-tune fallback.
-    int ks = w->nvf4_ks ? w->nvf4_ks
-                        : tq_nvf4_ksplits(w->Mt, Kt64, tq_nvf4_stages());
-    // The tuner measures at 256 columns, where split-K manufactures occupancy.
-    // A z-batched wide wave already fills the card, so ks>1 only buys the
-    // partials round-trip plus the reduce kernel. TQ_NVF4_KS overrides.
-    static int ks_env = -2;
-    if (ks_env < -1) { const char *e = getenv("TQ_NVF4_KS"); ks_env = (e && e[0]) ? atoi(e) : -1; }
-    if (ks_env > 0) ks = ks_env;
-    else if (nvar >= 4 * TQ_NVF4_TILE) ks = 1;         // measured: +4.5-4.7% at 1024/1536-col
-                                                       // waves; 512-col waves keep the tuned ks
+    const int ks = nvf4_gemm_ks(w, nvar);
     // Full 256-col tiles go up in ONE launch (blockIdx.z): tile 1's CTAs fill the
     // tail of tile 0's wave instead of waiting behind a host-serialized launch.
     const int full = nvar / TQ_NVF4_TILE;
@@ -24011,8 +24036,11 @@ static int launch_batched_attn_q4(float *out, const float *q_proj, const uint16_
             int nqt = (N + 15) / 16;
             int S = wide_attn_split_S(max_pos);
             const int part_f6 = 2 * 96 + 96 * 256;
-            if (S > 1 && ensure_wide_attn_part((size_t)nkv * nqt * S * part_f6) != 0)
-                S = 1;
+            if (S > 1) {
+                int rc = ensure_wide_attn_part((size_t)nkv * nqt * S * part_f6);
+                if (rc == -1) S = 1;
+                else if (rc != 0) return rc;
+            }
             static int primed6 = 0;
             const size_t wa6b = 25280u * 4u;
             if (!primed6) {
@@ -24054,8 +24082,11 @@ static int launch_batched_attn_q4(float *out, const float *q_proj, const uint16_
         int nqt = (N + qr - 1) / qr;
         int S = wide_attn_split_S(max_pos);
         int part_f = 2 * qr + qr * 256;
-        if (S > 1 && ensure_wide_attn_part((size_t)nh * nqt * S * part_f) != 0)
-            S = 1;
+        if (S > 1) {
+            int rc = ensure_wide_attn_part((size_t)nh * nqt * S * part_f);
+            if (rc == -1) S = 1;
+            else if (rc != 0) return rc;
+        }
         if (qr == 64) {
             static int primed3 = 0;
             const size_t wa4b = (13792u + 8192u) * 4u;
@@ -26019,16 +26050,17 @@ static int paged_split_S_gqa_v2(int N, int max_pos) {
 }
 
 static int ensure_attn_partials(size_t units) {        // units = nh*N*S
-    if (units > g_attn_pacc_n) {
-        if (g_attn_pacc) cudaFree(g_attn_pacc);
-        if (cudaMalloc(&g_attn_pacc, units * g_qwen.hd * sizeof(float)) != cudaSuccess) { g_attn_pacc = NULL; g_attn_pacc_n = 0; return -1; }
-        g_attn_pacc_n = units;
-    }
-    if (units > g_attn_pml_n) {
-        if (g_attn_pml) cudaFree(g_attn_pml);
-        if (cudaMalloc(&g_attn_pml, units * 2 * sizeof(float)) != cudaSuccess) { g_attn_pml = NULL; g_attn_pml_n = 0; return -2; }
-        g_attn_pml_n = units;
-    }
+    // Capacities stay in units here; reserve() works in elements.
+    size_t acc_floats = g_attn_pacc_n * g_qwen.hd;
+    int rc = tq_cuda_reserve(&g_attn_pacc, &acc_floats, units * g_qwen.hd,
+                             "paged attention accumulators");
+    if (rc != 0) return rc;
+    g_attn_pacc_n = acc_floats / g_qwen.hd;
+    size_t ml_floats = g_attn_pml_n * 2;
+    rc = tq_cuda_reserve(&g_attn_pml, &ml_floats, units * 2,
+                         "paged attention softmax partials");
+    if (rc != 0) return rc;
+    g_attn_pml_n = ml_floats / 2;
     return 0;
 }
 
@@ -26076,7 +26108,7 @@ static int launch_paged_attn_q4(float *out, const float *q_proj, const uint16_t 
                     g_attn_pacc, g_attn_pml);
                 k_tq_paged_attn_q4_merge<<<dim3(nh, N), hd, 0, st>>>(
                     out, q_proj, positions, nh, hd, q_m, attn_m, S, g_attn_pacc, g_attn_pml);
-                return cudaGetLastError() == cudaSuccess ? 0 : -1;
+                return tq_cuda_check(cudaGetLastError(), "paged attention v3 launch");
             }
         }
         if (paged_attn_v2()) {
@@ -26094,7 +26126,7 @@ static int launch_paged_attn_q4(float *out, const float *q_proj, const uint16_t 
                     g_attn_pacc, g_attn_pml);
                 k_tq_paged_attn_q4_merge<<<dim3(nh, N), hd, 0, st>>>(
                     out, q_proj, positions, nh, hd, q_m, attn_m, S, g_attn_pacc, g_attn_pml);
-                return cudaGetLastError() == cudaSuccess ? 0 : -1;
+                return tq_cuda_check(cudaGetLastError(), "paged attention v2 launch");
             }
         }
         k_tq_paged_attn_q4_split_gqa<6><<<dim3(nkv, N, S), hd, 0, st>>>(
@@ -26103,14 +26135,14 @@ static int launch_paged_attn_q4(float *out, const float *q_proj, const uint16_t 
             g_attn_pacc, g_attn_pml);
         k_tq_paged_attn_q4_merge<<<dim3(nh, N), hd, 0, st>>>(
             out, q_proj, positions, nh, hd, q_m, attn_m, S, g_attn_pacc, g_attn_pml);
-        return cudaGetLastError() == cudaSuccess ? 0 : -1;
+        return tq_cuda_check(cudaGetLastError(), "paged attention GQA launch");
     }
     int S = paged_split_S(N, max_pos);
     if (S <= 1) {
         k_tq_paged_attn_q4<<<dim3(nh, N), hd, 0, st>>>(
             out, q_proj, q_norm_w, k4_pool, kq4s_pool, v8_pool, vscale_pool, positions, slot_ids,
             block_table, max_blocks, page, page_log, nh, nkv, hd, q_m, attn_m, g_qwen.eps, g_qwen.rope_theta);
-        return cudaGetLastError() == cudaSuccess ? 0 : -1;
+        return tq_cuda_check(cudaGetLastError(), "paged attention scalar launch");
     }
     if (ensure_attn_partials((size_t)nh * N * S) != 0) return -2;
     k_tq_paged_attn_q4_split<<<dim3(nh, N, S), hd, 0, st>>>(
@@ -26119,7 +26151,7 @@ static int launch_paged_attn_q4(float *out, const float *q_proj, const uint16_t 
         g_attn_pacc, g_attn_pml);
     k_tq_paged_attn_q4_merge<<<dim3(nh, N), hd, 0, st>>>(
         out, q_proj, positions, nh, hd, q_m, attn_m, S, g_attn_pacc, g_attn_pml);
-    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+    return tq_cuda_check(cudaGetLastError(), "paged attention split launch");
 }
 
 // Chain-shared verify attention: seg_* live on device (copied per verify wave).
@@ -26168,7 +26200,7 @@ static int launch_paged_attn_q4_chain(float *out, const float *q_proj, const uin
         g_attn_pacc, g_attn_pml);
     k_tq_paged_attn_q4_merge<<<dim3(nh, T), hd, 0, st>>>(
         out, q_proj, positions_d, nh, hd, q_m, attn_m, S, g_attn_pacc, g_attn_pml);
-    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+    return tq_cuda_check(cudaGetLastError(), "paged speculative attention launch");
 }
 
 // Ragged-prefill MMA attention (step 2b): write all T columns' Q4 KV, then run the
@@ -26199,8 +26231,11 @@ static int launch_paged_attn_q4_mma_prefill(
             int nqt = (n + 15) / 16;
             int S = wide_attn_split_S(max_pos);
             const int part_f6 = 2 * 96 + 96 * 256;
-            if (S > 1 && ensure_wide_attn_part((size_t)nkv * nqt * S * part_f6) != 0)
-                S = 1;
+            if (S > 1) {
+                int rc = ensure_wide_attn_part((size_t)nkv * nqt * S * part_f6);
+                if (rc == -1) S = 1;
+                else if (rc != 0) return rc;
+            }
             static int primed6p = 0;
             const size_t wa6b = 25280u * 4u;
             if (!primed6p) {
@@ -26229,8 +26264,11 @@ static int launch_paged_attn_q4_mma_prefill(
         int nqt = (n + qr - 1) / qr;
         int S = wide_attn_split_S(max_pos);
         int part_f = 2 * qr + qr * 256;
-        if (S > 1 && ensure_wide_attn_part((size_t)nh * nqt * S * part_f) != 0)
-            S = 1;
+        if (S > 1) {
+            int rc = ensure_wide_attn_part((size_t)nh * nqt * S * part_f);
+            if (rc == -1) S = 1;
+            else if (rc != 0) return rc;
+        }
         if (qr == 64) {
             static int primed4 = 0;
             const size_t wa4b = (13792u + 8192u) * 4u;
@@ -26275,7 +26313,7 @@ static int launch_paged_attn_q4_mma_prefill(
                     n, nh, hd, q_m, attn_m, S, g_wide_attn_part);
         }
     }
-    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+    return tq_cuda_check(cudaGetLastError(), "paged prefill attention launch");
 }
 
 // --- paged pool host state (shared block pool + per-slot block table + DeltaNet) ---
@@ -26311,6 +26349,9 @@ static int      g_pg_nfree = 0;
 static int      g_pg_page = 0, g_pg_plog = 0, g_pg_nblocks = 0, g_pg_maxslots = 0, g_pg_maxblk = 0;
 static int      g_pg_ready = 0;
 
+static void paged_spec_free_archive(void);
+static int paged_reserve_workspace(int max_slots, int page);
+
 static void paged_free_all(void) {
     for (int L = 0; L < TQ_MAX_LAYERS; L++) {
         if (g_pool_k4[L]) { cudaFree(g_pool_k4[L]); g_pool_k4[L] = NULL; }
@@ -26341,6 +26382,7 @@ static void paged_free_all(void) {
     if (h_blk_ref) { free(h_blk_ref); h_blk_ref = NULL; }
     void paged_ckpt_drop_all(void);
     paged_ckpt_drop_all();
+    paged_spec_free_archive();
     g_pg_nfree = 0; g_pg_page = 0; g_pg_plog = 0; g_pg_nblocks = 0;
     g_pg_maxslots = 0; g_pg_maxblk = 0; g_pg_ready = 0;
 }
@@ -26383,6 +26425,9 @@ extern "C" int qwn_paged_init(int max_slots, int num_blocks, int page) {
     int plog = 0; while ((1 << plog) < page) plog++;
     g_pg_page = page; g_pg_plog = plog; g_pg_nblocks = num_blocks; g_pg_maxslots = max_slots;
     g_pg_maxblk = (g_qwen.max_seq + page - 1) / page;
+    // Reserve every execution shape before fixed KV blocks and optional caches.
+    int reserve_rc = paged_reserve_workspace(max_slots, page);
+    if (reserve_rc != 0) { paged_free_all(); return reserve_rc; }
     int kv_m = g_qwen.nkv * g_qwen.hd, nkv = g_qwen.nkv;
     size_t qe = batched_q4s_elem_bytes();
     size_t recur_f = (size_t)batched_recur_floats(), conv_f = (size_t)batched_conv_floats();
@@ -26436,13 +26481,21 @@ extern "C" int qwn_paged_init(int max_slots, int num_blocks, int page) {
     if (ensure_wide_prefill_buffers(max_slots) != 0) { free(hi); paged_free_all(); return -8; }
     cudaStreamSynchronize(g_qwen.stream);
     free(hi);
-    // Eager spec allocations (TQ_PAGED_SPEC): claim the node archive at init
-    // while VRAM is clean. A lazy first-round cudaMalloc lands AFTER the deep
-    // prefill transients, fails, and permanently disables spec (observed with a
-    // 26K-token client: "no VRAM for 1212 MB, paged spec disabled").
+    size_t available = 0, total = 0;
+    cudaError_t mem_rc = cudaMemGetInfo(&available, &total);
+    if (mem_rc != cudaSuccess) { paged_free_all(); return tq_cuda_check(mem_rc, "paged startup budget"); }
+    if (available < paged_memory_headroom()) {
+        fprintf(stderr, "[paged] insufficient execution headroom: free=%.1f MiB reserve=%.1f MiB; "
+                        "reduce --num-blocks or TQ_WAVE_MAX\n",
+                available / 1048576.0, paged_memory_headroom() / 1048576.0);
+        paged_free_all();
+        return -8;
+    }
     { const char *se = getenv("TQ_PAGED_SPEC");
-      if (se && atoi(se) != 0 && paged_spec_pool_init() > 0)
-          (void)paged_spec_ensure_archive(batched_recur_floats(), batched_conv_floats()); }
+      if (se && atoi(se) != 0 && paged_spec_pool_init() > 0) {
+          int rc = paged_spec_ensure_archive(batched_recur_floats(), batched_conv_floats());
+          if (rc == TQ_CUDA_FATAL) { paged_free_all(); return rc; }
+      } }
     g_pg_ready = 1;
     return 0;
 }
@@ -26552,12 +26605,9 @@ static int paged_ckpt_slab_alloc(int npool) {
     return -1;
 }
 
-// State slabs are pool-backed: ONE up-front allocation (first save, all-or-
-// nothing with halving fallback) instead of a ~145 MB cudaMalloc per save.
-// Unbudgeted per-save mallocs under fleet load ate VRAM until an in-wave
-// scratch alloc failed (the rc=-94 cascade). Lazy-at-first-save on purpose:
-// it orders the pool AFTER the first deep prefill's scratch high-water, so
-// wave scratch always wins the memory race and the pool shrinks instead.
+// State slabs are pool-backed and optional. Execution workspace is reserved at
+// paged init for the full configured shape range, BEFORE this pool can claim
+// memory. Leave the process headroom untouched and clear only handled OOMs.
 static float *g_pg_ck_pool = NULL;
 static int    g_pg_ck_pool_n = -1;   // usable ckpt ids; -1 = not yet allocated
 static size_t g_pg_ck_sf = 0;        // floats per slab at alloc time
@@ -26588,16 +26638,26 @@ static int paged_ckpt_pool_init(void) {
     int want = e ? atoi(e) : 6;
     if (want > TQ_PG_MAX_CKPT) want = TQ_PG_MAX_CKPT;
     g_pg_ck_sf = paged_state_floats();
-    for (int n = want; n > 0; n >>= 1) {
-        if (cudaMalloc(&g_pg_ck_pool, (size_t)n * g_pg_ck_sf * sizeof(float)) == cudaSuccess) {
+    size_t free_bytes = 0, total = 0;
+    cudaError_t err = cudaMemGetInfo(&free_bytes, &total);
+    if (err != cudaSuccess) return tq_cuda_check(err, "checkpoint memory budget");
+    size_t slab_bytes = g_pg_ck_sf * sizeof(float);
+    size_t budget = free_bytes > paged_memory_headroom() ? free_bytes - paged_memory_headroom() : 0;
+    if (slab_bytes && (size_t)(want > 0 ? want : 0) > budget / slab_bytes)
+        want = (int)(budget / slab_bytes);
+    for (int n = want; n > 0 && slab_bytes; n >>= 1) {
+        err = cudaMalloc(&g_pg_ck_pool, (size_t)n * slab_bytes);
+        if (err == cudaSuccess) {
             g_pg_ck_pool_n = n;
             fprintf(stderr, "[paged] ckpt state pool: %d slabs x %.1f MB\n",
-                    n, g_pg_ck_sf * sizeof(float) / 1048576.0);
+                    n, slab_bytes / 1048576.0);
             return n;
         }
+        tq_cuda_check(err, "checkpoint state pool", (size_t)n * slab_bytes);
+        if (!tq_cuda_recover_oom(err)) return TQ_CUDA_FATAL;
     }
     g_pg_ck_pool = NULL; g_pg_ck_pool_n = 0;
-    fprintf(stderr, "[paged] ckpt state pool: no VRAM, state saves disabled\n");
+    fprintf(stderr, "[paged] ckpt state pool: no spare budget, state saves disabled\n");
     return 0;
 }
 
@@ -26651,6 +26711,7 @@ extern "C" int qwn_paged_ckpt_save(int slot, int pos) {
     if (!g_pg_ready || slot < 0 || slot >= g_pg_maxslots) return -1;
     if (pos < 1 || ((pos - 1) >> g_pg_plog) + 1 > h_slot_nb[slot]) return -2;
     int npool = paged_ckpt_pool_init();
+    if (npool < 0) return npool;
     if (npool < 1) return -3;                    // no state pool: saves disabled
     int id = -1;
     for (int i = 0; i < TQ_PG_MAX_CKPT; i++) if (!g_pg_ck[i].used) { id = i; break; }
@@ -26784,8 +26845,8 @@ static void paged_ckpt_host_xfer(tq_pg_ckpt *c, uint8_t *img, cudaMemcpyKind dir
 }
 
 // 0 ok (or already demoted), -1 bad id, -2 unused, -3 over host budget,
-// -4 pinned alloc failed, -5 transfer failed. Every failure leaves the
-// checkpoint resident and usable, so the caller can fall back to free().
+// -4 pinned allocation OOM, TQ_CUDA_FATAL unexpected CUDA/transfer failure.
+// Recoverable failures leave the checkpoint resident and usable.
 extern "C" int qwn_paged_ckpt_demote(int id) {
     if (!g_pg_ready || id < 0 || id >= TQ_PG_MAX_CKPT) return -1;
     tq_pg_ckpt *c = &g_pg_ck[id];
@@ -26796,10 +26857,15 @@ extern "C" int qwn_paged_ckpt_demote(int id) {
     size_t bytes = state_b + rows * paged_ckpt_row_bytes();
     if (g_pg_ck_host_bytes + bytes > paged_ckpt_host_budget()) return -3;
     uint8_t *img = NULL;
-    if (cudaHostAlloc((void **)&img, bytes, cudaHostAllocDefault) != cudaSuccess) return -4;
+    cudaError_t err = cudaHostAlloc((void **)&img, bytes, cudaHostAllocDefault);
+    if (err != cudaSuccess) {
+        tq_cuda_check(err, "checkpoint host allocation", bytes);
+        return tq_cuda_recover_oom(err) ? -4 : TQ_CUDA_FATAL;
+    }
     cudaMemcpyAsync(img, c->state, state_b, cudaMemcpyDeviceToHost, g_qwen.stream);
     paged_ckpt_host_xfer(c, img, cudaMemcpyDeviceToHost);
-    if (cudaStreamSynchronize(g_qwen.stream) != cudaSuccess) { cudaFreeHost(img); return -5; }
+    err = cudaStreamSynchronize(g_qwen.stream);
+    if (err != cudaSuccess) { cudaFreeHost(img); return tq_cuda_check(err, "checkpoint demotion transfer"); }
     for (int lb = 0; lb < c->nfull; lb++) paged_block_unref(c->blocks[lb]);
     if (c->tail_blk >= 0) paged_block_unref(c->tail_blk);
     c->tail_blk = -1; c->state = NULL; c->slab = -1;
@@ -26809,13 +26875,14 @@ extern "C" int qwn_paged_ckpt_demote(int id) {
 }
 
 // 0 ok (or already resident), -3 no free slab (demote another first),
-// -4 block pool exhausted, -5 transfer failed. Failures leave it demoted.
+// -4 block pool exhausted, TQ_CUDA_FATAL transfer failure. Capacity failures leave it demoted.
 extern "C" int qwn_paged_ckpt_promote(int id) {
     if (!g_pg_ready || id < 0 || id >= TQ_PG_MAX_CKPT) return -1;
     tq_pg_ckpt *c = &g_pg_ck[id];
     if (!c->used) return -2;
     if (!c->host) return 0;
     int npool = paged_ckpt_pool_init();
+    if (npool < 0) return npool;
     if (npool < 1) return -3;
     int slab = paged_ckpt_slab_alloc(npool);
     if (slab < 0) return -3;
@@ -26834,11 +26901,12 @@ extern "C" int qwn_paged_ckpt_promote(int id) {
     cudaMemcpyAsync(c->state, c->host, g_pg_ck_sf * sizeof(float),
                     cudaMemcpyHostToDevice, g_qwen.stream);
     paged_ckpt_host_xfer(c, c->host, cudaMemcpyHostToDevice);
-    if (cudaStreamSynchronize(g_qwen.stream) != cudaSuccess) {
+    cudaError_t err = cudaStreamSynchronize(g_qwen.stream);
+    if (err != cudaSuccess) {
         for (int lb = 0; lb < c->nfull; lb++) paged_block_unref(c->blocks[lb]);
         if (tail_blk >= 0) paged_block_unref(tail_blk);
         c->tail_blk = -1; c->state = NULL;
-        return -5;
+        return tq_cuda_check(err, "checkpoint promotion transfer");
     }
     cudaFreeHost(c->host);
     g_pg_ck_host_bytes -= c->host_bytes;
@@ -27156,6 +27224,115 @@ static int ensure_pf_colslot(int T) {
     return 0;
 }
 
+// Allocation-only high-water pass: no tokens, KV, or recurrent state are touched.
+// In particular, a full 2048-column GEMM uses ks=1 while a shorter tail can need
+// MORE split-K scratch. Deep attention and spec shapes must also be covered.
+static int paged_reserve_workspace(int max_slots, int page) {
+    if (tq_cuda_check(cudaStreamSynchronize(g_qwen.stream), "workspace startup sync") != 0)
+        return TQ_CUDA_FATAL;
+    size_t before = 0, total = 0;
+    if (tq_cuda_check(cudaMemGetInfo(&before, &total), "workspace memory budget") != 0)
+        return TQ_CUDA_FATAL;
+    int emit_cols = std::max(max_slots, TQ_SPEC_MAX_N);
+    int cols = std::max(tq_wave_cap(), emit_cols);
+    if (ensure_wide_prefill_buffers(cols) != 0 || ensure_pf_colslot(cols) != 0 ||
+        ensure_wide_fac(cols) != 0 || ensure_seg_bufs() != 0 || ensure_dec_staging() != 0)
+        return TQ_CUDA_FATAL;
+
+    size_t nv_b = 0, nv_part = 0, fp_b = 0, fp_scale = 0, fp_part = 0;
+    auto weight = [&](const tq_qmma_weight_t *w, int n) {
+        if (w->K <= 0 || w->M <= 0) return;
+        if (w->nvf4) {
+            size_t groups = (size_t)((n + TQ_NVF4_TILE - 1) / TQ_NVF4_TILE) * (TQ_NVF4_TILE / 8);
+            nv_b = std::max(nv_b, groups * w->Kt64 * TQ_NVF4_BW);
+            for (int t = 1; t <= n; t++) {
+                int ks = nvf4_gemm_ks(w, t);
+                int full = t / TQ_NVF4_TILE;
+                int launch_cols = full > 1 ? full * TQ_NVF4_TILE : std::min(t, TQ_NVF4_TILE);
+                if (ks > 1) nv_part = std::max(nv_part, (size_t)ks * launch_cols * w->M);
+            }
+        } else if (tq_wide_fmt_ok(w)) {
+            int groups = std::max(wide_ng(n), 2);
+            fp_b = std::max(fp_b, (size_t)groups * ((w->K + 31) / 32) * 256);
+            fp_scale = std::max(fp_scale, (size_t)(w->K + 127) / 128);
+            bool tiled = !w->e2m1 && tq_wide_gemm_tiled();
+            int ks = tiled ? tq_wide_gemm_ksplits(w->Mt, w->Kt, tq_wide_gemm_stages())
+                           : qmma_sf_k_split_auto(w->Mt, w->Kt);
+            int nt = tiled ? std::min(n, TQ_WIDE_GEMM_TILE) : n;
+            if (ks > 1) fp_part = std::max(fp_part, (size_t)ks * nt * w->M * sizeof(float));
+        }
+    };
+    for (int L = 0; L < g_qwen.L; L++) {
+        tq_layer_t *l = &g_qwen.layers[L];
+        const tq_qmma_weight_t *ws[] = {&l->q_proj, &l->k_proj, &l->v_proj, &l->o_proj,
+            &l->linear_in_qkv, &l->linear_in_z, &l->linear_in_b, &l->linear_in_a,
+            &l->linear_out, &l->mlp_gate, &l->mlp_up, &l->mlp_down};
+        for (const auto *w : ws) weight(w, cols);
+    }
+    weight(&g_qwen.lm_head, emit_cols);
+    if (tq_cuda_reserve(&g_nvf4_b, &g_nvf4_b_words, nv_b, "NVFP4 activation workspace") != 0 ||
+        tq_cuda_reserve(&g_nvf4_part, &g_nvf4_part_floats, nv_part, "NVFP4 split-K workspace") != 0 ||
+        tq_cuda_reserve(&g_wproj_b, &g_wproj_b_bytes, fp_b, "FP6 activation workspace") != 0 ||
+        tq_cuda_reserve(&g_wproj_bscale, &g_wproj_bscale_n, fp_scale, "FP6 scale workspace") != 0)
+        return TQ_CUDA_FATAL;
+    size_t fp_floats = g_wproj_part_bytes / sizeof(float);
+    if (tq_cuda_reserve(&g_wproj_part, &fp_floats, fp_part / sizeof(float), "FP6 split-K workspace") != 0)
+        return TQ_CUDA_FATAL;
+    g_wproj_part_bytes = fp_floats * sizeof(float);
+
+    int heads = g_qwen.linear_num_value_heads, dim = g_qwen.linear_value_head_dim;
+    if (tq_dn_prep_enabled()) {
+        size_t need = (size_t)heads * (4 * (size_t)cols + ((cols + 7) / 8) * 128u);
+        if (ensure_float_buffer(&g_dn_prep, &g_dn_prep_floats, (int)need, "d_dn_prep") != 0)
+            return TQ_CUDA_FATAL;
+    }
+    if (tq_dn_mm_mode() > 0 && cols >= 128) {
+        size_t chunks = (cols + 63) / 64;
+        size_t need = heads * chunks * (4 * 64 * dim + 64 * 64 + 16);
+        if (ensure_float_buffer(&g_dnmm, &g_dnmm_floats, (int)need, "d_dnmm") != 0)
+            return TQ_CUDA_FATAL;
+        const char *split = getenv("TQ_DNMM_SPLIT");
+        if (tq_dn_mm_mode() == 3 && split && atoi(split)) {
+            size_t stripes = (size_t)heads * (dim / 32) * chunks;
+            if (ensure_float_buffer(&g_dnmm_spre, &g_dnmm_spre_floats, (int)(stripes * dim * 32), "d_dnmm_spre") != 0 ||
+                ensure_float_buffer(&g_dnmm_dl, &g_dnmm_dl_floats, (int)(stripes * 64 * 32), "d_dnmm_dl") != 0)
+                return TQ_CUDA_FATAL;
+        }
+    }
+    int max_pos = g_qwen.max_seq - 1;
+    bool mma = wide_attn_mma_enabled() && page >= 128;
+    int scalar_cols = mma ? emit_cols : cols;
+    size_t units = 0;
+    for (int n = 1; n <= scalar_cols; n++) {
+        int s = paged_attn_gqa() && g_qwen.nkv > 0 && g_qwen.nh / g_qwen.nkv == 6 && g_qwen.hd == 256
+              ? ((paged_attn_v2() || paged_attn_v3()) ? paged_split_S_gqa_v2(n, max_pos) : paged_split_S_gqa(n, max_pos))
+              : paged_split_S(n, max_pos);
+        units = std::max(units, (size_t)g_qwen.nh * n * s);
+    }
+    if (paged_attn_chain()) units = std::max(units, (size_t)g_qwen.nh * TQ_SPEC_MAX_N * 96);
+    if (ensure_attn_partials(units) != 0) return TQ_CUDA_FATAL;
+    if (mma) {
+        int splits = wide_attn_split_S(max_pos);
+        size_t need = 0;
+        if (splits > 1) {
+            if (wide_attn_gqa())
+                need = (size_t)g_qwen.nkv * ((cols + 15) / 16) * splits * (2 * 96 + 96 * 256);
+            else for (int qr : {16, 32, 64})
+                need = std::max(need, (size_t)g_qwen.nh * ((cols + qr - 1) / qr) * splits * (2 * qr + qr * 256));
+        }
+        if (tq_cuda_reserve(&g_wide_attn_part, &g_wide_attn_part_f, need, "prefill attention workspace") != 0)
+            return TQ_CUDA_FATAL;
+    }
+    wide_quant_reset();
+    size_t after = 0;
+    if (tq_cuda_check(cudaMemGetInfo(&after, &total), "reserved workspace memory") != 0)
+        return TQ_CUDA_FATAL;
+    fprintf(stderr, "[paged] execution workspace: cols=%d context=%d reserved=%.1f MiB free=%.1f MiB headroom=%.1f MiB\n",
+            cols, g_qwen.max_seq, (double)before / 1048576.0 - (double)after / 1048576.0,
+            after / 1048576.0, paged_memory_headroom() / 1048576.0);
+    return 0;
+}
+
 // Prefill K client segments in ONE wave: T concatenated columns (col j -> slot col_slot[j] at
 // intra-position col_pos[j]). Projections + paged attention run batched over ALL T columns (one
 // weight read); the conv + chunkwise DeltaNet run PER-CLIENT over each segment (advancing that
@@ -27445,34 +27622,52 @@ static int *g_pga_grp = NULL, *g_pga_par = NULL, *g_pga_off = NULL, *g_pga_done 
 static int g_pga_nodes = 0;
 static int g_pga_ready = 0;          // 1 ok, -1 failed permanently
 
+static void paged_spec_free_archive(void) {
+    if (g_pga_recur) cudaFree(g_pga_recur);
+    if (g_pga_conv) cudaFree(g_pga_conv);
+    for (int **p : {&g_pga_grp, &g_pga_par, &g_pga_off, &g_pga_done, &g_pga_root}) {
+        if (*p) cudaFree(*p);
+        *p = NULL;
+    }
+    g_pga_recur = g_pga_conv = NULL;
+    g_pga_nodes = 0; g_pga_ready = 0;
+}
+
 static int paged_spec_ensure_archive(int recur_f, int conv_f) {
-    if (g_pga_ready) return g_pga_ready > 0 ? 0 : -1;
+    if (g_pga_ready) return g_pga_ready > 0 ? 0 : g_pga_ready;
     const char *e = getenv("TQ_PG_SPEC_NODES");
-    g_pga_nodes = e ? atoi(e) : 8;
-    if (g_pga_nodes < 1) g_pga_nodes = 1;
-    if (g_pga_nodes > TQ_SPEC_MAX_N) g_pga_nodes = TQ_SPEC_MAX_N;
+    g_pga_nodes = std::max(1, std::min(e ? atoi(e) : 8, TQ_SPEC_MAX_N));
     int n_lin = 0;
     for (int i = 0; i < g_qwen.L; i++)
         if (g_qwen.layer_types[i] == TQ_LAYER_LINEAR_ATTENTION) n_lin++;
     size_t rb = (size_t)n_lin * g_pga_nodes * recur_f * sizeof(float);
     size_t cb = (size_t)n_lin * g_pga_nodes * conv_f * sizeof(float);
-    if (cudaMalloc(&g_pga_recur, rb) != cudaSuccess ||
-        cudaMalloc(&g_pga_conv, cb) != cudaSuccess ||
-        cudaMalloc(&g_pga_grp, TQ_SPEC_MAX_N * sizeof(int)) != cudaSuccess ||
-        cudaMalloc(&g_pga_par, TQ_SPEC_MAX_N * sizeof(int)) != cudaSuccess ||
-        cudaMalloc(&g_pga_off, (TQ_SPEC_MAX_N + 1) * sizeof(int)) != cudaSuccess ||
-        cudaMalloc(&g_pga_done, sizeof(int)) != cudaSuccess ||
-        cudaMalloc(&g_pga_root, TQ_SPEC_MAX_N * sizeof(int)) != cudaSuccess) {
-        if (g_pga_recur) { cudaFree(g_pga_recur); g_pga_recur = NULL; }
-        if (g_pga_conv) { cudaFree(g_pga_conv); g_pga_conv = NULL; }
-        if (g_pga_grp) { cudaFree(g_pga_grp); g_pga_grp = NULL; }
-        if (g_pga_par) { cudaFree(g_pga_par); g_pga_par = NULL; }
-        if (g_pga_off) { cudaFree(g_pga_off); g_pga_off = NULL; }
-        if (g_pga_done) { cudaFree(g_pga_done); g_pga_done = NULL; }
+    size_t needed = rb + cb + (4 * TQ_SPEC_MAX_N + 2) * sizeof(int);
+    size_t available = 0, total = 0;
+    cudaError_t err = cudaMemGetInfo(&available, &total);
+    if (err != cudaSuccess) return tq_cuda_check(err, "spec archive budget");
+    if (available < needed || available - needed < paged_memory_headroom()) {
         g_pga_ready = -1;
-        fprintf(stderr, "[paged] spec archive: no VRAM for %.0f MB, paged spec disabled\n",
-                (rb + cb) / 1048576.0);
+        fprintf(stderr, "[paged] spec archive: insufficient spare budget for %.0f MB; plain decode\n", needed / 1048576.0);
         return -1;
+    }
+    if ((err = cudaMalloc(&g_pga_recur, rb)) != cudaSuccess ||
+        (err = cudaMalloc(&g_pga_conv, cb)) != cudaSuccess ||
+        (err = cudaMalloc(&g_pga_grp, TQ_SPEC_MAX_N * sizeof(int))) != cudaSuccess ||
+        (err = cudaMalloc(&g_pga_par, TQ_SPEC_MAX_N * sizeof(int))) != cudaSuccess ||
+        (err = cudaMalloc(&g_pga_off, (TQ_SPEC_MAX_N + 1) * sizeof(int))) != cudaSuccess ||
+        (err = cudaMalloc(&g_pga_done, sizeof(int))) != cudaSuccess ||
+        (err = cudaMalloc(&g_pga_root, TQ_SPEC_MAX_N * sizeof(int))) != cudaSuccess) {
+        tq_cuda_check(err, "spec archive allocation", needed);
+        bool recovered = tq_cuda_recover_oom(err);
+        paged_spec_free_archive();
+        cudaError_t cleanup_err = cudaPeekAtLastError();
+        if (cleanup_err != cudaSuccess) {
+            tq_cuda_check(cleanup_err, "spec archive cleanup");
+            recovered = false;
+        }
+        g_pga_ready = recovered ? -1 : TQ_CUDA_FATAL;
+        return g_pga_ready;
     }
     g_pga_ready = 1;
     fprintf(stderr, "[paged] spec archive: %.0f MB (%d nodes x %d linear layers)\n",
@@ -27505,7 +27700,8 @@ static int run_paged_spec_verify_core(const int *tokens, const int *col_slot, co
     int recur_f = batched_recur_floats(), conv_f = batched_conv_floats();
     int ret;
     if (T < 1) return -110;
-    if (paged_spec_ensure_archive(recur_f, conv_f) != 0) return -111;
+    ret = paged_spec_ensure_archive(recur_f, conv_f);
+    if (ret != 0) return ret == TQ_CUDA_FATAL ? ret : -111;
     if (T > g_pga_nodes) return -110;             // archive-node cap (TQ_PG_SPEC_NODES)
     if (ensure_wide_prefill_buffers(T) != 0) return -90;
     if (ensure_pf_colslot(T) != 0) return -90;

@@ -12,10 +12,10 @@ ulimit -c unlimited
 export CUDA_VISIBLE_DEVICES=0 TQ_KV_Q4=1 TQ_CTX=262144 TQ_EMBED_FP8=2 TQ_W_NVFP4=all
 # n-gram verify archive: the agentic/coding workload is its measured win zone
 # (+37-60% single-stream through 32k, cost-gated at depth). 4-node archive
-# (606 MB): 8 nodes left too little headroom for deep-prefill transients
-# (26K clients hit rc=-94 at the tail wave with only 4.1 GB free). The engine
-# now claims the archive eagerly at init; TQ_PAGED_ATTN_V3 rides its in-code
-# auto default.
+# (606 MiB). The engine reserves execution workspace before KV blocks, then
+# admits optional spec/checkpoint storage above TQ_VRAM_HEADROOM_MB (512 MiB).
+# Keep the full wave/context limits; constrained machines can lower TQ_WAVE_MAX
+# or --num-blocks if startup cannot reserve that budget.
 export TQ_PAGED_SPEC=${TQ_PAGED_SPEC:-1} TQ_PG_SPEC_NODES=${TQ_PG_SPEC_NODES:-4}
 # Host-tier checkpoint demotion is opt-in only until Track D validates it under
 # long-context concurrency. The 2026-09-03 prod wedge hit this untested path.

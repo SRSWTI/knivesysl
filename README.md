@@ -225,12 +225,33 @@ admission adopts the deepest match and prefills only the suffix. same-prefix req
 arriving during a donor's prefill can wait briefly and adopt its checkpoint rather
 than racing another full prefill.
 
-the resident state slabs are allocated as one pool (`TQ_CKPT_POOL`, default six
-151.5 mb slabs). admission reserves the full prompt-plus-output footprint, subtracts
-active/prefilling reservations and resident checkpoint blocks, evicts only optional
-cache entries when capacity is short, and rejects an impossible request without
-poisoning later requests. allocation, save, evict, promote, and adopt failures all
-degrade to a plain full prefill.
+the resident state slabs are allocated as one pool (`TQ_CKPT_POOL`, default ceiling
+six 151.5 mib slabs). paged initialization first reserves execution workspace for
+the configured wave cap, deep attention splits, speculative verification, and
+short-tail gemm shapes. kv blocks are allocated next; the speculative archive and
+checkpoint slabs may use only the remaining budget above `TQ_VRAM_HEADROOM_MB`
+(default 512 mib). fewer checkpoint slabs are normal on a shared desktop gpu.
+`free_blocks` counts reusable slots inside an already allocated kv pool, not free
+vram; evicting a checkpoint does not shrink the backing pool.
+
+admission reserves the full prompt-plus-output footprint, subtracts active and
+prefilling reservations and resident checkpoint blocks, and evicts optional cache
+entries when capacity is short. known optional allocation failures degrade safely;
+only an explicitly handled cuda allocation oom is cleared. unexpected cuda errors
+remain fatal because recurrent state may already have changed. native attention
+diagnostics include the cuda error and operation instead of only `rc=-94`.
+
+if startup cannot leave the required headroom, reduce `--num-blocks` or
+`TQ_WAVE_MAX` (for example, 512). lowering the wave cap reduces prefill throughput,
+not the context limit. lowering the block count reduces aggregate kv capacity.
+lowering only `--prefill-budget` does not reduce the native workspace reservation;
+that reservation covers the engine's accepted `TQ_WAVE_MAX`.
+
+regressions: `tools/test_cuda_memory.cu` checks real cuda allocation/error recovery;
+`tools/paged_memory_smoke.py --tqf /path/to/model.tqf` uses the real model with the
+production quantization flags and `TQ_CTX=262144`. it covers the 51k checkpoint/tail
+failure, mixed waves, checkpoint churn, spec/plain parity through 65k, and denied
+optional-cache budgets. run it with the production server stopped.
 
 measured 2026-08-31 on the production build, with `--no-prefix-cache` as the control:
 
@@ -439,6 +460,8 @@ turns.
 | `TQ_WIDE_GEMM=0` | revert the wide fp6 projection gemm to the 1-warp/cta kernel |
 | `TQ_GEMM_STAGES` | wide-gemm `cp.async` pipeline depth (2..4, default 2) |
 | `TQ_WAVE_MAX` | max wave columns the engine accepts (default 2048; builders pick 512 shallow / 2048 past 16k depth) |
+| `TQ_VRAM_HEADROOM_MB` | vram left outside kv/spec/checkpoint allocations after execution workspace reservation (default 512 mib) |
+| `TQ_CKPT_POOL` | maximum resident checkpoint slabs; actual count is bounded by the remaining memory budget |
 | `TQ_W_E2M1=1` | opt-in 4-bit weight tier (k32 mma: memory win only, no compute win) |
 | `TQ_W_NVFP4=all` | nvfp4 w4a4 tier, every projection (k64 mma: 2.05x instruction roof) |
 | `TQ_W_NVFP4=mlp` | nvfp4 for the mlp only; attention + deltanet stay fp6 |

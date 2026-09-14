@@ -11,6 +11,40 @@ driven by the same client (`tools/bench_endpoint.py`).
 
 ## Unreleased
 
+### Paged execution memory budget and recovered CUDA OOMs
+
+Reproduced the production crash with the original library: save a checkpoint at
+51,581 tokens, fall back from six state slabs to three, then fail the eight-token
+tail with `rc=-94`. Successful CUDA operations do not clear a prior allocation
+error; the attention helper was reporting that recovered OOM as a new failure.
+
+- Explicitly handled optional-allocation OOMs are cleared at their recovery site.
+  Unrelated CUDA errors propagate as fatal, including across optional checkpoint
+  operations; attention diagnostics now print the underlying CUDA error.
+- Paged initialization reserves execution workspace before KV/cache allocation:
+  full-width prefills, deep attention splits, smaller split-K GEMM tails, decode,
+  and speculative verification. This is an allocation-only pass, not a model run.
+- Optional archives and checkpoint slabs preserve `TQ_VRAM_HEADROOM_MB` (512 MiB
+  by default). Startup rejects a fixed KV pool that cannot leave that headroom.
+  Spec archives are reclaimed on paged teardown/reinitialization.
+- Added real CUDA allocation regressions and a real-model memory smoke runner.
+
+The fixed-library smoke run kept 2,100 blocks, two slots, a 2,048-column wave cap,
+262,144-token context limit, and the four-node speculative archive. The 51k tail
+and restored continuation passed; checkpoint churn and speculative/plain decode
+matched through 65,537 tokens, and all KV blocks returned after cleanup. This is
+correctness evidence, not a new throughput benchmark.
+
+Live HTTP verification on the rebuilt production library also passed: a
+60,029-token cold chat plus three follow-up turns; a new chat growing from
+12,630 to 18,264 to 29,498 prompt tokens; and a 60,130-token streaming
+continuation after switching conversations. Final health was ready/idle with
+zero supervisor restarts, no engine error, five APC hits, and six successful
+speculative rounds. CUDA unit checks covered stale OOM recovery, failed-growth
+pointer preservation, and refusal to clear an unrelated CUDA error. The model
+runner also verified mixed waves, denied optional-cache budgets, and rejection
+of impossible startup headroom.
+
 ### Unified vLLM Qwen tool and reasoning parsing
 
 The production batched endpoint now uses the installed vLLM 0.28 Qwen3 parser

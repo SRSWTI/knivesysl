@@ -300,6 +300,8 @@ class BatchedEngine:
         self._set_phase(phase, req)
         try:
             result = fn(*args)
+            if result == -121:  # native TQ_CUDA_FATAL; not an optional cache miss
+                raise EngineFatal(f"{phase}: unrecoverable CUDA error (see native diagnostic)")
         except BaseException as exc:
             self.last_engine_error = f"{phase}: {type(exc).__name__}: {exc}"
             self._metric("native_failures")
