@@ -53,6 +53,132 @@ larger gap: about 24-25% at 2k/8k, 20% at 32k, 16% at 64k, and 10% near 128k.
 this is not a different performance class. it is also not small enough to fix with one
 more tile-size sweep.
 
+## hardware attribution — 2026-09-14, rtx 5090 plain-path experiments
+
+this dated experiment record supplements, rather than replaces, the september 2–3
+campaign measurements below. the target is sm120 with 170 sms. the profiler's
+`TARGET_INFO_GPU.l2CacheSize` reports **100,663,296 bytes = 96 mib of l2**; use that
+measured device attribute, not a 128-mib assumption. device capacity and resource limits
+are metadata, not measurements of cache hit rate or achieved bandwidth.
+
+the unprofiled screens use the production model/quantization baseline, speculation off,
+four slots, 2,100 kv blocks, 128-token pages, a fixed corpus, and two repeats of 96 decode
+steps. this is not the historical gen-512 multi-engine scoreboard protocol. it is also
+not the complete `serve_prod.sh` supervisor footprint: that uses two slots and
+now defaults to plain decoding. nvml process-use samples are taken every 50 ms, exclude identified
+desktop contexts, include the benchmark's cuda context, and need not catch a transient peak.
+
+### trace ownership and the short-context split screen
+
+the early current-build decode captures each contain 120 steps. kernel sums normalized
+by those steps give the following attribution; these are **profiled kernel times**, not
+unprofiled wall-clock throughput:
+
+| owner | 2k x1 ms/step | 128k x1 ms/step |
+|---|---:|---:|
+| nvfp4 gemm mainloops | 10.4878 | 9.5991 |
+| paged attention history | 1.3281 (gqa v2) | 4.3374 (gqa v3) |
+| nvfp4 activation quantizers | 1.8131 | — |
+| nvfp4 reductions | 0.2662 | — |
+
+the short-context work is still dominated by nvfp4 gemms, not their reducer. attention
+grows substantially with history; the table names the different v2/v3 paths rather than
+pretending it is a same-kernel scaling measurement. dashes mean not reported here, not zero.
+
+at n=1 and 2k, the default attention split policy supplies four splits for four kv heads:
+only **16 ctas for 170 sms**. [INFERENCE] that launch cannot fill the device even if each
+cta has excellent local efficiency. this is a grid-parallelism bound, not an achieved-
+occupancy counter. the forced-split screen tested `TQ_PAGED_SPLIT` values 8, 16, 32, 64,
+85, 128 and auto; its result motivated a narrower n1-only control rather than a global
+forced split. `TQ_PAGED_N1_ROWS=64` lowers the work-per-split bound, while the native default
+remains 512 and the n>=2 policy and deep split caps remain unchanged.
+the production wrapper now selects 64 unless overridden.
+
+in the early paired screen, the n1-only control changed 2k x1 from 15.0078 to 14.0026
+ms/step (66.63 to 71.42 tok/s) and 32k x1 from 15.6452 to 15.2934 ms/step (63.92 to
+65.39 tok/s). this is measured motivation for an opt-in, not a claim about every context
+or a recommendation to combine every speed setting for an accuracy-first user.
+
+**counter boundary:** nsight compute failed with `ERR_NVGPUCTRPERM`. there are no measured
+achieved-occupancy, dram/l2-throughput, tensor-pipe-utilization, or stall-counter results
+from these attempts. launch dimensions, registers/thread, static/dynamic shared memory,
+compiler stack frames, and device limits can bound residency; they cannot establish those
+missing counters. in particular, cuTe's configured `occupancy=1` is a launch/resource
+choice, not measured achieved occupancy.
+
+### the tma memory cost was a compiled callee, not a kv pool
+
+the production source's `shared::cluster` tensor-copy form compiles on this target with
+an external `__cuda_syscall_cp_async_bulk_tensor_2d_tile_unicast` fallback. the original
+g32/s2 machine code contains `CALL.ABS.NOINC`; its elf metadata names the external callee.
+the cuda stack-limit probe starts at 1,024 bytes and rises to **14,608 bytes** after model
+initialization, remaining there after model free. do not confuse that context stack limit
+with the much smaller per-kernel stack frame in compiler resource output.
+
+`TQ_NVFP4_TMA_CTA=1` selects a compile-time `shared::cta` specialization for local-cta
+tma. the inspected g32/s2 specialization has no `CALL`, reduces registers/thread from
+208 to 206 and its compiler stack frame from 8 bytes to zero. the corresponding context
+stack limit stays **1,024 bytes** throughout the probe. **no stack-limit workaround was
+used**: the change removes the callee from the selected kernel instead of forcing a lower
+runtime stack limit. native `TQ_NVFP4_TMA_CTA=0` retains the cluster path; the production wrapper now selects `1` unless overridden.
+
+the paired plain benchmark measured **29,556 to 26,170 mib**, a **3,386-mib saving**, with
+only cta-local tma selected. that is the sampled process-use result under the fixed pool
+above, not a promise about the full supervisor. later-epoch 2k x1 decode was 60.35 versus
+60.38 tok/s for the paired default/cta-only controls: the clear result here is memory
+recovery, not a large decode-speed claim. the native packed-byte gate passed all 135 checks
+against an fp64 decode of the same packed inputs (worst normalized error `1.088e-7`).
+
+### what the cuTe sweep does, and does not, establish
+
+the standalone cuTe sweep passed **96 configurations**, with worst absolute error
+`0.00030517578125`, against an independently decoded packed-input reference. it exercises
+packed fp4 operands and e4m3 block scales, with fp32 accumulation and output. the local
+epilogue adapter uses a float16 *layout seed* to preserve the native sm120 fragment shape;
+it does not change the actual output store or accumulator to float16.
+
+these are cuda-event timings of graph replays over **warm, reused inputs in one workspace**.
+individual matrices can fit the measured 96-mib l2. packing, reference computation,
+compilation, allocation, and the host launch loop are outside the timed region. the cuTe
+packed layout differs from the native model layout, and its effective global alpha is one;
+it does not implement production's per-128-output-row global-scale epilogue, activation
+quantizer, fused gate/silu, or the rest of inference. therefore the sweep is neither a
+drop-in production gemm replacement nor an end-to-end win, and its apparent bandwidth
+must not be described as cold full-model dram bandwidth. packed-input arithmetic agreement
+also says nothing by itself about coding-task accuracy or bf16 equivalence.
+
+### evidence paths and timing epochs
+
+all artifact paths in this list are relative to `results/5090-20260914/`:
+
+- trace ownership/device attributes: `plain-2k-n1.sqlite`, `plain-128k-n1.sqlite`, and
+  `plain-32k-n4.sqlite`, with matching `.nsys-rep` captures; valid prefill attribution uses
+  `prefill-8k-n4-nvtx.sqlite` and `prefill-8k-n4-nvtx.nsys-rep`.
+- split screen: `attention-split-auto.json`, `attention-split-8.json`,
+  `attention-split-16.json`, `attention-split-32.json`, `attention-split-64.json`,
+  `attention-split-85.json`, `attention-split-128.json`; accepted-control measurements:
+  `final-default-control.json` and `attention-n1-64.json`. matching `.run.json` records
+  retain commands, environment and memory sampling, and `.log` files retain execution output.
+- native resources/code: `native-resources.txt`, `native-cta-resources.txt`,
+  `native-tma-g32-s2-elf-sass.txt`, `native-tma-g32-s2.sass`, `native-cta-g32-s2.sass`;
+  stack probes: `cta-stack-control.log`, `cta-stack.log`; numerical gate:
+  `cta-native-numerics.log`; paired memory/timing: `cta-default-control.json`, `cta-only.json`
+  and their `.run.json` records.
+- cuTe: `cute-sweep-fp32-layout.json`, its `.run.json` and `.log`, and the exact generated
+  mlir/ptx paths and hashes recorded there under `cute-ir/`; unavailable counters:
+  `native-gemm-ncu.log` and `cute-gemm-ncu.log`.
+- source: `src/forward_qwen.cu` (`tq_tma_2d` and `paged_split_S_gqa_v2`),
+  `tools/bench_decode.py`, and `tools/bench_cute_nvfp4.py`; the latter records vendored
+  cooperative/pingpong example hashes and the example-local epilogue adaptation.
+
+**compare only within a timing epoch.** the early screen and later cta screen have different
+absolute speeds. `bridge-old-a.json`, `bridge-new-control.json`, and `bridge-old-b.json`
+record an old/new/old crossover: 2k x1 was 60.97/60.76/60.64 tok/s, reproducing the later
+slowdown on both binaries. this does not establish its hardware cause; it does prevent
+attributing the early-to-late gap to the new default path. use each candidate's same-epoch
+paired control, not an early baseline against a later cta run, and never substitute a
+profiled kernel-time sum for the benchmark's wall-clock result.
+
 ## rules for the campaign
 
 1. **plain means plain.** no n-gram, mtp, apc hit, or cached prefix may enter a plain

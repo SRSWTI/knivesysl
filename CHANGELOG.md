@@ -1,7 +1,7 @@
 # Changelog
 
 All performance numbers are measured on this machine: RTX 5090 (GB202, SM120, 170 SM,
-32 GB, 128 MB L2), CUDA 13.3, driver 595, Qwen3.8-27B FP6 (E2M3) + Q4 KV, greedy,
+32 GB, 96 MiB L2), CUDA 13.3, driver 595, Qwen3.8-27B FP6 (E2M3) + Q4 KV, greedy,
 thinking off unless stated. vLLM comparisons are vLLM 0.27.1 serving
 `unsloth/Qwen3.8-27B-NVFP4` (mixed W8A8 + W4A4, 22.5 GB), this session at
 `--max-model-len 116032 --gpu-memory-utilization 0.92 --kv-cache-dtype fp8
@@ -10,6 +10,118 @@ thinking off unless stated. vLLM comparisons are vLLM 0.27.1 serving
 driven by the same client (`tools/bench_endpoint.py`).
 
 ## Unreleased
+
+### Three-profile runtime verification (2026-09-15 UTC)
+
+- Ran optimized NVFP4, mixed FP6/NVFP4, and FP6 serially on the real model with
+  the two-slot / 2,100-block production geometry. Single-user 2k decode measured
+  **70.14 / 68.16 / 62.01 tok/s**; observed HTTP/cache process peaks were
+  **25,966 / 27,246 / 30,182 MiB**, respectively. These compare profiles, not an
+  additional before/after optimization campaign.
+- Each profile exercised native KV position **262,144** and two simultaneous
+  128k contexts. Synthetic retrieval passed at 8k, 32k, 128k, and 261,888 prompt
+  tokens. The menu now explicitly distinguishes **268,800 configured shared token
+  slots** from the earlier, separately tested **425,984-token / 3,328-block pool**.
+- Added `tools/bench_variant_answers.py`: eight exact-answer tasks and eight
+  generated Python functions graded in real, network-isolated bubblewrap. All
+  profiles scored **11/16 strict tasks** and **8/8 coding tasks (37/37 cases)**.
+  Wrong-content / format-only misses were **4/1, 3/2, 2/3**. Supplemental format
+  classification does not alter the primary scores or establish broad accuracy.
+- Existing 32k prefix reuse reduced first-content latency to **72 / 73 / 76 ms**,
+  with eight suffix tokens prefilled rather than the full 32,768. The startup menu
+  contains the fresh profile numbers and their limits, not mixed timing epochs.
+- **23 launcher/grader regression tests passed**, including real PTY behavior and
+  sandbox isolation; Bash and Python syntax checks passed. Production was restored
+  to optimized NVFP4 with its effective child environment and readiness verified.
+  Evidence: `results/5090-profiles-20260915-025945/summary.json` and adjacent raw
+  answers, fixtures, native measurements, server logs, and restoration metadata.
+
+### Production profile menu and optimized launcher defaults (2026-09-14)
+
+- `tools/serve_prod.sh` now defaults to plain NVFP4 serving with CTA-local TMA,
+  the unused MTP head disabled, and N1 attention rows=64. Additional decode GEMM
+  tuning remains disabled. Native-library defaults are unchanged; explicit tuning
+  environment overrides remain supported and are printed at startup.
+- Terminal launches offer NVFP4, mixed MLP-NVFP4/rest-FP6, and FP6. The menu
+  includes hardcoded measured memory, speed, reference agreement, benefits, and
+  drawbacks, explicitly separating timing batches and benchmark pool geometry
+  from the two-slot production launcher. FP6 is labelled highest tested weight
+  precision, not proven best coding-task accuracy.
+- `--variant nvfp4|mixed|fp6` bypasses the prompt and overrides `TQ_W_NVFP4`.
+  Without it, the environment selects the default; non-interactive input never
+  waits for a menu. `--list-variants`, `--help`, and `--dry-run` exit before the
+  production lock or model initialization. Invalid arguments fail explicitly.
+- Selection happens once, outside the restart loop. The preview and supervisor
+  share the same command array. Pool geometry remains two slots / 2,100 blocks;
+  no running production process is changed by editing the launcher.
+- Focused regression command: `.venv/bin/python -m unittest tools/test_serve_prod.py`.
+  Tests execute the real Bash CLI and PTY menu, including selection precedence,
+  tuning overrides, invalid arguments, reprompting, and EOF cancellation, without
+  starting another model process.
+
+### RTX 5090 plain-inference controls and resource fixes (2026-09-14)
+
+- **Opt-in CTA-local TMA:** `TQ_NVFP4_TMA_CTA=1` corrects the TMA/barrier
+  scope for the local-CTA NVFP4 kernel, removing a driver fallback. Observed
+  stack demand fell from 14,608 to 1,024 bytes; paired initialization and
+  active-pool comparisons saved **3,386 MiB**. Default `0` retains the cluster
+  path. A 64-position self-comparison had zero logit error; this is scoped
+  numerical evidence, not a general accuracy claim.
+- **Optional unused head:** `TQ_LOAD_MTP=0` skips device materialization of the
+  optional MTP head for plain inference, saving **810 MiB**. Loading remains
+  the default; this is not a quantization change.
+- **Selectable numerical tradeoffs:** `TQ_PAGED_N1_ROWS=64` changes only N1
+  attention work splitting (default `512`; N>=2 and deep split caps unchanged).
+  `TQ_NVF4_DECODE_AUTOTUNE_COLS=2` opts into small-N decode tuning, with different
+  rounding/results; it remains disabled by default. These controls are not a
+  blanket accuracy-first recommendation. `tools/serve_prod.sh` still defaults
+  to NVFP4-all, but now honors an explicit `TQ_W_NVFP4` selection.
+- **Accounting and ownership fixes:** subtract the freed BF16 embedding from
+  reported device bytes after embedding conversion; release NVFP4 weight and
+  runtime allocations on model teardown; invalidate/destroy paged decode graphs
+  before freeing captured pool/model pointers or replacing staging buffers.
+  Repeated model-teardown allocation tracing ended with **zero tracked owned
+  allocations**, rather than the pre-fix 13,842,423,168-byte leak. This does not
+  assert that all driver/context memory is released.
+
+Verification: **135 native packed-weight numerical checks** passed (FP64
+reference decoding the same packed bytes; worst normalized error `1.088e-7`),
+**96 standalone CuTe configurations** passed against independently decoded packed
+inputs, and **15 CPU measurement/reference-file tests** passed. References:
+`tools/nvfp4_check.py`, `tools/bench_cute_nvfp4.py`,
+`tools/test_bench_precision.py`; artifacts in `results/5090-20260914/`, notably
+`cta-native-numerics.log`, `cute-sweep-fp32-layout.json`,
+`cta-allocation-cycles.log`, `native-cta-resources.txt`, and paired
+`cta-default-control.run.json` / `cta-only.run.json`.
+
+Final gates additionally passed **45 CTA producer-warp numerical checks**
+(`TQ_NVF4_WS=1`, N=1/32/256). The permanent model-ownership test passed two
+init/free cycles in each of default and CTA modes. The original 51,581-token
+checkpoint plus eight-token tail and checkpoint-churn/memory regression passed
+in default and CTA+MTP-skip modes. A private HTTP server on port 18080 completed
+two ready-state turns with one prefix hit and exited successfully. Evidence:
+`ownership-default.log`, `ownership-cta.log`, `memory-regression-default.log`,
+`memory-regression-cta.log`, and `http-integration.json` in the same artifact
+directory; these are the exercised scenarios, not a broader coverage claim.
+
+Larger-pool execution on the rebuilt production library also passed: 3,328
+blocks (425,984 raw KV token slots), four 96k contexts, at 29,328 MiB sampled
+peak; and mixed precision with 2,928 blocks (374,784 raw KV token slots), four
+80k contexts, at 29,296 MiB, versus the fixed-2,100-block baseline's 29,556 MiB.
+See `capacity-cta-all.json` / `.run.json` and `capacity-cta-quality.json` /
+`.run.json`. Raw pool capacity is shared across slots, not a per-request context
+limit. These runs demonstrate execution capacity, **not retrieval accuracy**.
+
+The paired CTA/MTP memory comparisons use production-matched model/quantization
+with speculation off, **four slots, 2,100 blocks, and 128-token pages**, not the complete footprint
+of the usual two-slot supervisor with optional speculation. Process memory was
+NVML-sampled every 50 ms, including CUDA context and excluding identified desktop
+contexts; it is not a guaranteed transient maximum. Compare timings only within
+their epoch: an old/new/old crossover reproduced the later slowdown on both
+binaries. CuTe warm-cache GEMM timings are not native end-to-end speedups.
+Model numerical comparisons cover 448 fixed-corpus positions against FP6, not
+BF16 equivalence or coding-task accuracy. All tuning defaults remain unchanged;
+the production library was rebuilt, but the production server was not restarted.
 
 ### Paged execution memory budget and recovered CUDA OOMs
 

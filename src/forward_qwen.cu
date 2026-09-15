@@ -152,6 +152,8 @@ typedef struct {
     // over nvar*M floats, so it over-split every large-M shape (it chose k2 for
     // mlp_gate/up and q_proj where k1 is measurably faster).
     int nvf4_ks, nvf4_stages;
+    // Optional small-N tuning; never applied to a tail of a wider projection.
+    int nvf4_decode_ks, nvf4_decode_stages;
     int Kt64;
 } tq_qmma_weight_t;
 
@@ -265,7 +267,7 @@ typedef struct {
     int text_only;
     int has_vision_config;
     int has_mtp;
-    int has_mtp_section;  // MTP head weights present in this TQF (TQ_FLAG_HAS_MTP)
+    int has_mtp_section;  // MTP section enabled for use (file flag, unless loading disabled)
     uint8_t layer_types[TQ_MAX_LAYERS];
 
     uint16_t *d_embed;
@@ -11600,13 +11602,22 @@ static __device__ __forceinline__ void tq_mbar_wait(uint64_t *b, uint32_t phase)
                  "  @!p bra TMAW;\n }"
                  :: "r"((uint32_t)__cvta_generic_to_shared(b)), "r"(phase) : "memory");
 }
+template <bool LOCAL_CTA>
 static __device__ __forceinline__ void tq_tma_2d(void *smem, const CUtensorMap *map,
                                               int c0, int c1, uint64_t *bar) {
-    asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global"
-                 ".mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
-                 :: "r"((uint32_t)__cvta_generic_to_shared(smem)), "l"(map),
-                    "r"(c0), "r"(c1), "r"((uint32_t)__cvta_generic_to_shared(bar))
-                 : "memory");
+    if constexpr (LOCAL_CTA) {
+        asm volatile("cp.async.bulk.tensor.2d.shared::cta.global"
+                     ".mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
+                     :: "r"((uint32_t)__cvta_generic_to_shared(smem)), "l"(map),
+                        "r"(c0), "r"(c1), "r"((uint32_t)__cvta_generic_to_shared(bar))
+                     : "memory");
+    } else {
+        asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global"
+                     ".mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
+                     :: "r"((uint32_t)__cvta_generic_to_shared(smem)), "l"(map),
+                        "r"(c0), "r"(c1), "r"((uint32_t)__cvta_generic_to_shared(bar))
+                     : "memory");
+    }
 }
 
 // ---------------------------------------------------------------- the GEMM (TMA)
@@ -11620,7 +11631,7 @@ static __device__ __forceinline__ void tq_tma_2d(void *smem, const CUtensorMap *
 // A 9th warp (threads 256-287) runs the refill loop against the SAME barriers:
 // full[s] completed by the TMA transfer (count 1), empty[s] armed by the 8
 // consumer warps. Math order identical -> bit-identical output.
-template <int NG, int STAGES, int WM, int WS = 0>
+template <int NG, int STAGES, int WM, int WS = 0, bool LOCAL_CTA = false>
 __global__ __launch_bounds__(WS ? 288 : 256, 1)
 void k_tq_nvf4_gemm_tma(const __grid_constant__ CUtensorMap mapA,
                      const __grid_constant__ CUtensorMap mapB,
@@ -11676,10 +11687,10 @@ void k_tq_nvf4_gemm_tma(const __grid_constant__ CUtensorMap mapA,
     auto issue = [&](int buf, int stg) {
         const int kb = kt_begin + stg * 2;
         tq_mbar_expect(&full[buf], TXB);
-        tq_tma_2d(sA + (size_t)buf * AW,          &mapA, (kb + 0) * TQ_NVF4_AW, mblk * 8, &full[buf]);
-        tq_tma_2d(sA + (size_t)buf * AW + AHALF,  &mapA, (kb + 1) * TQ_NVF4_AW, mblk * 8, &full[buf]);
-        tq_tma_2d(sB + (size_t)buf * BW,          &mapB, (kb + 0) * TQ_NVF4_BW, b_row,    &full[buf]);
-        tq_tma_2d(sB + (size_t)buf * BW + BHALF,  &mapB, (kb + 1) * TQ_NVF4_BW, b_row,    &full[buf]);
+        tq_tma_2d<LOCAL_CTA>(sA + (size_t)buf * AW,          &mapA, (kb + 0) * TQ_NVF4_AW, mblk * 8, &full[buf]);
+        tq_tma_2d<LOCAL_CTA>(sA + (size_t)buf * AW + AHALF,  &mapA, (kb + 1) * TQ_NVF4_AW, mblk * 8, &full[buf]);
+        tq_tma_2d<LOCAL_CTA>(sB + (size_t)buf * BW,          &mapB, (kb + 0) * TQ_NVF4_BW, b_row,    &full[buf]);
+        tq_tma_2d<LOCAL_CTA>(sB + (size_t)buf * BW + BHALF,  &mapB, (kb + 1) * TQ_NVF4_BW, b_row,    &full[buf]);
     };
 
     float c[MA][NA][4];
@@ -12729,6 +12740,9 @@ static void free_qmma(tq_qmma_weight_t *w) {
     if (w->d_block_scale_inv) cudaFree(w->d_block_scale_inv);
     if (w->d_sparse_a) cudaFree(w->d_sparse_a);
     if (w->d_sparse_meta) cudaFree(w->d_sparse_meta);
+    if (w->d_nvf4_a) cudaFree(w->d_nvf4_a);
+    if (w->d_nvf4_global) cudaFree(w->d_nvf4_global);
+    if (w->nvf4_map) free(w->nvf4_map);
     memset(w, 0, sizeof(*w));
 }
 
@@ -12880,12 +12894,17 @@ extern "C" int qwn_ot_apply_debug(int layer, int rows, float *io) {
     return 0;
 }
 
+static int paged_free_all(void);
+static void nvf4_free_runtime(void);
+
 extern "C" void qwn_free(void) {
+    paged_free_all();  // graphs must release pool/model pointers before their owners
     ot_hooks_free();
     destroy_forward_graph();
     destroy_decode_graph();
     destroy_spec_graph();
     if (g_qwen.stream) cudaStreamSynchronize(g_qwen.stream);
+    nvf4_free_runtime();
     if (g_qwen.d_debug_x) cudaFree(g_qwen.d_debug_x);
     if (g_qwen.d_debug_norm) cudaFree(g_qwen.d_debug_norm);
     if (g_qwen.d_debug_proj) cudaFree(g_qwen.d_debug_proj);
@@ -13170,6 +13189,7 @@ static int parse_tqf(const char *path, int upload) {
                     cudaFree(d_q); cudaFree(d_sc);
                 } else {
                     cudaFree(g_qwen.d_embed);
+                    g_qwen.device_bytes -= rows * Hh * sizeof(uint16_t);
                     g_qwen.d_embed = nullptr;
                     g_qwen.d_embed8 = d_q;
                     g_qwen.d_embed_scale = d_sc;
@@ -13249,6 +13269,10 @@ static int parse_tqf(const char *path, int upload) {
     // ran with TQ_EMIT_MTP=1). Read order MUST match mtp_tensor_specs() in
     // tools/convert_qwen_tqf.py. The MTP layer is one full_attention decoder layer.
     if (g_qwen.has_mtp_section) {
+        const char *mtp_env = getenv("TQ_LOAD_MTP");
+        const int load_mtp = !mtp_env || strcmp(mtp_env, "0") != 0;
+        const int mtp_upload = upload && load_mtp;
+        g_qwen.has_mtp_section = load_mtp;
         tq_layer_t *m = &g_qwen.mtp_layer;
         int q_m = g_qwen.nh * g_qwen.hd * 2;
         int kv_m = g_qwen.nkv * g_qwen.hd;
@@ -13257,15 +13281,15 @@ static int parse_tqf(const char *path, int upload) {
         // mtp_tensor_specs() in tools/convert_qwen_tqf.py.
         #define TQ_READ_MTP_BF16(W, MM, KK, NAME)                                              \
             do { (W).M = (MM); (W).K = (KK);                                                   \
-                 if (read_non_quant(f, &(W).d_w, (size_t)(MM) * (KK), NAME, upload) != 0) {     \
+                 if (read_non_quant(f, &(W).d_w, (size_t)(MM) * (KK), NAME, mtp_upload) != 0) { \
                      fclose(f); return -1; } } while (0)
-        if (read_non_quant(f, &g_qwen.d_mtp_pre_fc_norm_emb, g_qwen.H, "mtp.pre_fc_norm_emb", upload) != 0) { fclose(f); return -1; }
-        if (read_non_quant(f, &g_qwen.d_mtp_pre_fc_norm_hidden, g_qwen.H, "mtp.pre_fc_norm_hidden", upload) != 0) { fclose(f); return -1; }
+        if (read_non_quant(f, &g_qwen.d_mtp_pre_fc_norm_emb, g_qwen.H, "mtp.pre_fc_norm_emb", mtp_upload) != 0) { fclose(f); return -1; }
+        if (read_non_quant(f, &g_qwen.d_mtp_pre_fc_norm_hidden, g_qwen.H, "mtp.pre_fc_norm_hidden", mtp_upload) != 0) { fclose(f); return -1; }
         TQ_READ_MTP_BF16(g_qwen.mtp_fc, g_qwen.H, 2 * g_qwen.H, "mtp.fc");
-        if (read_non_quant(f, &m->d_input_ln, g_qwen.H, "mtp.input_ln", upload) != 0) { fclose(f); return -1; }
-        if (read_non_quant(f, &m->d_post_ln, g_qwen.H, "mtp.post_ln", upload) != 0) { fclose(f); return -1; }
-        if (read_non_quant(f, &m->d_q_norm, g_qwen.hd, "mtp.q_norm", upload) != 0) { fclose(f); return -1; }
-        if (read_non_quant(f, &m->d_k_norm, g_qwen.hd, "mtp.k_norm", upload) != 0) { fclose(f); return -1; }
+        if (read_non_quant(f, &m->d_input_ln, g_qwen.H, "mtp.input_ln", mtp_upload) != 0) { fclose(f); return -1; }
+        if (read_non_quant(f, &m->d_post_ln, g_qwen.H, "mtp.post_ln", mtp_upload) != 0) { fclose(f); return -1; }
+        if (read_non_quant(f, &m->d_q_norm, g_qwen.hd, "mtp.q_norm", mtp_upload) != 0) { fclose(f); return -1; }
+        if (read_non_quant(f, &m->d_k_norm, g_qwen.hd, "mtp.k_norm", mtp_upload) != 0) { fclose(f); return -1; }
         TQ_READ_MTP_BF16(g_qwen.mtp_q_proj, q_m, g_qwen.H, "mtp.q_proj");
         TQ_READ_MTP_BF16(g_qwen.mtp_k_proj, kv_m, g_qwen.H, "mtp.k_proj");
         TQ_READ_MTP_BF16(g_qwen.mtp_v_proj, kv_m, g_qwen.H, "mtp.v_proj");
@@ -13273,15 +13297,18 @@ static int parse_tqf(const char *path, int upload) {
         TQ_READ_MTP_BF16(g_qwen.mtp_gate, g_qwen.I, g_qwen.H, "mtp.mlp_gate");
         TQ_READ_MTP_BF16(g_qwen.mtp_up, g_qwen.I, g_qwen.H, "mtp.mlp_up");
         TQ_READ_MTP_BF16(g_qwen.mtp_down, g_qwen.H, g_qwen.I, "mtp.mlp_down");
-        if (read_non_quant(f, &g_qwen.d_mtp_norm, g_qwen.H, "mtp.norm", upload) != 0) { fclose(f); return -1; }
+        if (read_non_quant(f, &g_qwen.d_mtp_norm, g_qwen.H, "mtp.norm", mtp_upload) != 0) { fclose(f); return -1; }
         #undef TQ_READ_MTP_BF16
-        printf("  MTP head section loaded (BF16 projections)\n");
+        if (load_mtp)
+            printf("  MTP head section loaded (BF16 projections)\n");
+        else
+            printf("  TQ_LOAD_MTP=0: MTP head loading disabled (payload validated, no device weights; MTP unavailable)\n");
         // Calibrated-head side-load (TQ_MTP_WEIGHTS=<dir>): overwrite the MTP
         // buffers from raw BF16 .bin files named by HF tensor (the output of
         // tools/mtp_calib_train.py). Happens before the lazy E2M3 repack, so the
         // quantized wave path automatically uses the calibrated weights.
         const char *mwd = getenv("TQ_MTP_WEIGHTS");
-        if (mwd && *mwd) {
+        if (load_mtp && mwd && *mwd) {
             int bad = 0;
             #define TQ_MTP_SIDELOAD(NAME, DST, COUNT)                                            \
                 do {                                                                             \
@@ -13854,15 +13881,23 @@ static int tq_nvf4_use_tma(void) {
     return c;
 }
 
+// Opt-in: all TMA destinations/barriers are local to the executing CTA. The
+// narrower instruction avoids a driver syscall for remote-cluster fallback.
+static int tq_nvf4_tma_cta(void) {
+    static int c = -1;
+    if (c < 0) { const char *e = getenv("TQ_NVFP4_TMA_CTA"); c = (e && e[0]) ? !!atoi(e) : 0; }
+    return c;
+}
+
 #define TQ_NVF4_TARGS *w->nvf4_map, g_nvf4_bmap, dst, w->d_nvf4_global, M, Mt, Kt64, \
                       nvar, per, ks, brow
-#define TQ_NVF4_DISPATCH_T(S, WSV) switch (G) {                                                \
-    case 1:  k_tq_nvf4_gemm_tma<1, S,8,WSV><<<gr,256+32*WSV,tbytes,st>>>(TQ_NVF4_TARGS); break; \
-    case 2:  k_tq_nvf4_gemm_tma<2, S,4,WSV><<<gr,256+32*WSV,tbytes,st>>>(TQ_NVF4_TARGS); break; \
-    case 4:  k_tq_nvf4_gemm_tma<4, S,2,WSV><<<gr,256+32*WSV,tbytes,st>>>(TQ_NVF4_TARGS); break; \
-    case 8:  k_tq_nvf4_gemm_tma<8, S,2,WSV><<<gr,256+32*WSV,tbytes,st>>>(TQ_NVF4_TARGS); break; \
-    case 16: k_tq_nvf4_gemm_tma<16,S,2,WSV><<<gr,256+32*WSV,tbytes,st>>>(TQ_NVF4_TARGS); break; \
-    default: k_tq_nvf4_gemm_tma<32,S,2,WSV><<<gr,256+32*WSV,tbytes,st>>>(TQ_NVF4_TARGS); break; }
+#define TQ_NVF4_DISPATCH_T(S, WSV, CTA) switch (G) {                                              \
+    case 1:  k_tq_nvf4_gemm_tma<1, S,8,WSV,CTA><<<gr,256+32*WSV,tbytes,st>>>(TQ_NVF4_TARGS); break; \
+    case 2:  k_tq_nvf4_gemm_tma<2, S,4,WSV,CTA><<<gr,256+32*WSV,tbytes,st>>>(TQ_NVF4_TARGS); break; \
+    case 4:  k_tq_nvf4_gemm_tma<4, S,2,WSV,CTA><<<gr,256+32*WSV,tbytes,st>>>(TQ_NVF4_TARGS); break; \
+    case 8:  k_tq_nvf4_gemm_tma<8, S,2,WSV,CTA><<<gr,256+32*WSV,tbytes,st>>>(TQ_NVF4_TARGS); break; \
+    case 16: k_tq_nvf4_gemm_tma<16,S,2,WSV,CTA><<<gr,256+32*WSV,tbytes,st>>>(TQ_NVF4_TARGS); break; \
+    default: k_tq_nvf4_gemm_tma<32,S,2,WSV,CTA><<<gr,256+32*WSV,tbytes,st>>>(TQ_NVF4_TARGS); break; }
 
 #define TQ_NVF4_ARGS dst, w->d_nvf4_a, b, w->d_nvf4_global, M, Mt, Kt64, nvar, per, ks
 #define TQ_NVF4_DISPATCH_G(S) switch (G) {                                                    \
@@ -13904,26 +13939,32 @@ static int launch_nvf4_gemm_cfg(float *out, const tq_qmma_weight_t *w, const uin
     // dispatch can launch. The NG=32 budget dominates, so one size covers all. The TMA
     // kernel needs 2*STAGES extra mbarriers (8 B each) on top of the tiles.
     const size_t tbytes = bytes + (size_t)stages * 2 * 8;
+    const int tma_cta = tq_nvf4_use_tma() && tq_nvf4_tma_cta();
     static int primed[6] = {0, 0, 0, 0, 0, 0};
     if (!primed[stages]) {
         size_t mx = (size_t)stages * (8 * 2 * TQ_NVF4_AW + 32 * 2 * TQ_NVF4_BW) * 4;
         size_t mt = mx + (size_t)stages * 2 * 8;
-        #define TQ_NVF4_PRIME(NGV, WMV) do {                                              \
+        #define TQ_NVF4_PRIME(NGV, WMV, CTA) do {                                         \
             cudaFuncSetAttribute(k_tq_nvf4_gemm<NGV, 2, WMV>,                             \
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)mx);   \
             cudaFuncSetAttribute(k_tq_nvf4_gemm<NGV, 3, WMV>,                             \
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)mx);   \
-            cudaFuncSetAttribute(k_tq_nvf4_gemm_tma<NGV, 2, WMV>,                         \
+            cudaFuncSetAttribute(k_tq_nvf4_gemm_tma<NGV, 2, WMV, 0, CTA>,                 \
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)mt);   \
-            cudaFuncSetAttribute(k_tq_nvf4_gemm_tma<NGV, 3, WMV>,                         \
+            cudaFuncSetAttribute(k_tq_nvf4_gemm_tma<NGV, 3, WMV, 0, CTA>,                 \
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)mt);   \
-            cudaFuncSetAttribute(k_tq_nvf4_gemm_tma<NGV, 2, WMV, 1>,                      \
+            cudaFuncSetAttribute(k_tq_nvf4_gemm_tma<NGV, 2, WMV, 1, CTA>,                 \
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)mt);   \
-            cudaFuncSetAttribute(k_tq_nvf4_gemm_tma<NGV, 3, WMV, 1>,                      \
+            cudaFuncSetAttribute(k_tq_nvf4_gemm_tma<NGV, 3, WMV, 1, CTA>,                 \
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)mt);   \
         } while (0)
-        TQ_NVF4_PRIME(1, 8); TQ_NVF4_PRIME(2, 4); TQ_NVF4_PRIME(4, 2);
-        TQ_NVF4_PRIME(8, 2); TQ_NVF4_PRIME(16, 2); TQ_NVF4_PRIME(32, 2);
+        if (tma_cta) {
+            TQ_NVF4_PRIME(1, 8, true); TQ_NVF4_PRIME(2, 4, true); TQ_NVF4_PRIME(4, 2, true);
+            TQ_NVF4_PRIME(8, 2, true); TQ_NVF4_PRIME(16, 2, true); TQ_NVF4_PRIME(32, 2, true);
+        } else {
+            TQ_NVF4_PRIME(1, 8, false); TQ_NVF4_PRIME(2, 4, false); TQ_NVF4_PRIME(4, 2, false);
+            TQ_NVF4_PRIME(8, 2, false); TQ_NVF4_PRIME(16, 2, false); TQ_NVF4_PRIME(32, 2, false);
+        }
         #undef TQ_NVF4_PRIME
         cudaGetLastError();
         primed[stages] = 1;
@@ -13938,8 +13979,13 @@ static int launch_nvf4_gemm_cfg(float *out, const tq_qmma_weight_t *w, const uin
                  && tq_nvf4_bmap_ensure(g_nvf4_b, g_nvf4_b_groups, Kt64, G);
     if (tma) {
         const int wsv = tq_nvf4_ws();
-        if (stages == 2)  { if (wsv) { TQ_NVF4_DISPATCH_T(2, 1) } else { TQ_NVF4_DISPATCH_T(2, 0) } }
-        else              { if (wsv) { TQ_NVF4_DISPATCH_T(3, 1) } else { TQ_NVF4_DISPATCH_T(3, 0) } }
+        if (tma_cta) {
+            if (stages == 2) { if (wsv) { TQ_NVF4_DISPATCH_T(2, 1, true) } else { TQ_NVF4_DISPATCH_T(2, 0, true) } }
+            else            { if (wsv) { TQ_NVF4_DISPATCH_T(3, 1, true) } else { TQ_NVF4_DISPATCH_T(3, 0, true) } }
+        } else {
+            if (stages == 2) { if (wsv) { TQ_NVF4_DISPATCH_T(2, 1, false) } else { TQ_NVF4_DISPATCH_T(2, 0, false) } }
+            else            { if (wsv) { TQ_NVF4_DISPATCH_T(3, 1, false) } else { TQ_NVF4_DISPATCH_T(3, 0, false) } }
+        }
     } else {
         if (stages == 2) { TQ_NVF4_DISPATCH_G(2) }
         else             { TQ_NVF4_DISPATCH_G(3) }
@@ -13949,13 +13995,6 @@ static int launch_nvf4_gemm_cfg(float *out, const tq_qmma_weight_t *w, const uin
         k_tq_nvf4_reduce<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(out, g_nvf4_part, (int)n, ks);
     }
     return 0;
-}
-
-// Config comes from the per-weight autotune once it has run, else the fallback.
-static int launch_nvf4_gemm(float *out, const tq_qmma_weight_t *w, const uint32_t *b,
-                            int nvar, int ks, cudaStream_t st) {
-    const int stages = w->nvf4_stages ? w->nvf4_stages : tq_nvf4_stages();
-    return launch_nvf4_gemm_cfg(out, w, b, nvar, ks, stages, st);
 }
 
 // Deterministic synthetic activations for the gate (no host transfer, reproducible).
@@ -14021,12 +14060,18 @@ static int nvf4_quant_ensure(const float *d_x, int K, int N, cudaStream_t st,
     return 0;
 }
 
+static int nvf4_gemm_stages(const tq_qmma_weight_t *w, int nvar) {
+    if (nvar <= 8 && w->nvf4_decode_stages) return w->nvf4_decode_stages;
+    return w->nvf4_stages ? w->nvf4_stages : tq_nvf4_stages();
+}
+
 static int nvf4_gemm_ks(const tq_qmma_weight_t *w, int nvar) {
     int ks = w->nvf4_ks ? w->nvf4_ks
                         : tq_nvf4_ksplits(w->Mt, w->Kt64, tq_nvf4_stages());
     static int forced = -2;
     if (forced == -2) { const char *e = getenv("TQ_NVF4_KS"); forced = (e && *e) ? atoi(e) : -1; }
     if (forced > 0) return forced;
+    if (nvar <= 8 && w->nvf4_decode_ks) return w->nvf4_decode_ks;
     // Fat z-batched waves fill the device without split-K; tails do not.
     return nvar >= 4 * TQ_NVF4_TILE ? 1 : ks;
 }
@@ -14040,37 +14085,38 @@ static int nvf4_gemm_tiled(const tq_qmma_weight_t *w, float *out, int nvar,
     // Full 256-col tiles go up in ONE launch (blockIdx.z): tile 1's CTAs fill the
     // tail of tile 0's wave instead of waiting behind a host-serialized launch.
     const int full = nvar / TQ_NVF4_TILE;
-    const int stages = w->nvf4_stages ? w->nvf4_stages : tq_nvf4_stages();
+    const int stages = nvf4_gemm_stages(w, nvar);
     if (full > 1) {
         int rc = launch_nvf4_gemm_cfg(out, w, g_nvf4_b, TQ_NVF4_TILE, ks, stages, st, full);
         if (rc != 0) return rc;
     }
     for (int off = full > 1 ? full * TQ_NVF4_TILE : 0; off < nvar; off += TQ_NVF4_TILE) {
         const int nt = (nvar - off < TQ_NVF4_TILE) ? (nvar - off) : TQ_NVF4_TILE;
-        int rc = launch_nvf4_gemm(out + (size_t)off * w->M, w,
-                                  g_nvf4_b + (size_t)(off / 8) * Kt64 * TQ_NVF4_BW,
-                                  nt, ks, st);
+        int rc = launch_nvf4_gemm_cfg(out + (size_t)off * w->M, w,
+                                      g_nvf4_b + (size_t)(off / 8) * Kt64 * TQ_NVF4_BW,
+                                      nt, ks, stages, st);
         if (rc != 0) return rc;
     }
     return 0;
 }
 
 // Autotune (ks, stages) per weight by MEASUREMENT, once at load. Configs are cached by
-// (M,K) because the model has only ~7 distinct projection shapes, so this is a handful of
+// (M,K,N) because the model has only ~7 distinct projection shapes, so this is a handful of
 // timed launches, not one per weight. Replaces a heuristic that mispriced split-K: it
 // counted SM occupancy but not the reduce pass over nvar*M floats that split-K adds.
-static int nvf4_autotune(tq_qmma_weight_t *w, int nvar, cudaStream_t st) {
+static int nvf4_autotune(const tq_qmma_weight_t *w, int nvar, cudaStream_t st,
+                         int *out_ks, int *out_stages) {
     // Own synthetic activation: the tuner runs at load, before any real one exists, and
     // K differs per shape so the quantized buffer must be built for this weight's K.
     // Cache FIRST: the check used to sit after the synthetic-activation malloc and
     // the early return leaked d_x for every cached shape -- 489 of 496 weights at
     // 5-18 MB each, the bulk of the ~7 GB the autotuner was retaining.
-    struct Ent { int M, K, ks, stages; };
+    struct Ent { int M, K, N, ks, stages; };
     static Ent cache[16];
     static int ncache = 0;
     for (int i = 0; i < ncache; i++)
-        if (cache[i].M == w->M && cache[i].K == w->K) {
-            w->nvf4_ks = cache[i].ks; w->nvf4_stages = cache[i].stages; return 0;
+        if (cache[i].M == w->M && cache[i].K == w->K && cache[i].N == nvar) {
+            *out_ks = cache[i].ks; *out_stages = cache[i].stages; return 0;
         }
     float *d_x = NULL;
     if (cudaMalloc(&d_x, (size_t)nvar * w->K * sizeof(float)) != cudaSuccess) return -1;
@@ -14094,7 +14140,9 @@ static int nvf4_autotune(tq_qmma_weight_t *w, int nvar, cudaStream_t st) {
     size_t smem_cap = 101376;
     { int v = 0; if (cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0)
                      == cudaSuccess && v > 0) smem_cap = (size_t)v; }
-    for (int stages = 2; stages <= 4; stages++) {
+    // Only stage 2/3 kernels exist. A stage-4 label runs stage 3 with extra
+    // shared memory and cannot be reused safely for a 256-column prefill.
+    for (int stages = 2; stages <= 3; stages++) {
         const size_t need = (size_t)stages * (8 * 2 * TQ_NVF4_AW + 2 * bh) * 4
                           + (size_t)stages * 2 * 8;
         if (need > smem_cap) continue;
@@ -14120,18 +14168,56 @@ static int nvf4_autotune(tq_qmma_weight_t *w, int nvar, cudaStream_t st) {
     nvf4_quant_invalidate();
     if (getenv("TQ_MEM_TRACE")) {
         size_t mf = 0, mt = 0; cudaMemGetInfo(&mf, &mt);
-        fprintf(stderr, "TQ_MEM_TRACE tuned M=%d K=%d ks=%d st=%d: free %zu MiB\n",
-                w->M, w->K, best_ks, best_st, mf >> 20);
+        fprintf(stderr, "TQ_MEM_TRACE tuned M=%d K=%d N=%d ks=%d st=%d: free %zu MiB\n",
+                w->M, w->K, nvar, best_ks, best_st, mf >> 20);
     }
-    w->nvf4_ks = best_ks; w->nvf4_stages = best_st;
-    if (ncache < 16) { cache[ncache++] = { w->M, w->K, best_ks, best_st }; }
+    *out_ks = best_ks; *out_stages = best_st;
+    if (ncache < 16) { cache[ncache++] = { w->M, w->K, nvar, best_ks, best_st }; }
     return 0;
 }
 
-// Tune every converted weight once. Cached per (M,K), so this is a few dozen timed
+// Experimental load-time tuning width; this does not change serving wave widths.
+static int nvf4_autotune_cols(void) {
+    static int cached = 0;
+    if (!cached) {
+        cached = TQ_NVF4_TILE;
+        const char *e = getenv("TQ_NVF4_AUTOTUNE_COLS");
+        if (e && *e) {
+            if (!strcmp(e, "1") || !strcmp(e, "2") || !strcmp(e, "4") ||
+                !strcmp(e, "8") || !strcmp(e, "256"))
+                cached = atoi(e);
+            else
+                fprintf(stderr, "TQ_NVF4_AUTOTUNE_COLS: expected 1,2,4,8,256; using %d\n", cached);
+        }
+    }
+    return cached;
+}
+
+// Separate small-N experiment: keep the prefill policy and its workspace peak.
+static int nvf4_decode_autotune_cols(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = 0;
+        const char *e = getenv("TQ_NVF4_DECODE_AUTOTUNE_COLS");
+        if (e && *e && strcmp(e, "0")) {
+            if (!strcmp(e, "1") || !strcmp(e, "2") || !strcmp(e, "4") || !strcmp(e, "8"))
+                cached = atoi(e);
+            else
+                fprintf(stderr, "TQ_NVF4_DECODE_AUTOTUNE_COLS: expected 0,1,2,4,8; disabled\n");
+        }
+    }
+    return cached;
+}
+
+// Tune every converted weight once. Cached per (M,K,N), so this is a few dozen timed
 // launches for the whole model, not one per weight.
 static void nvf4_autotune_all(void) {
     if (!g_nvf4_any) return;
+    const int decode_cols = nvf4_decode_autotune_cols();
+    const int requested_cols = nvf4_autotune_cols();
+    const int tune_cols = decode_cols ? TQ_NVF4_TILE : requested_cols;
+    if (decode_cols && requested_cols != TQ_NVF4_TILE)
+        fprintf(stderr, "TQ_NVF4_DECODE_AUTOTUNE_COLS: keeping prefill tuning at %d; ignoring TQ_NVF4_AUTOTUNE_COLS\n", TQ_NVF4_TILE);
     size_t mfree0 = 0, mtot = 0;
     cudaMemGetInfo(&mfree0, &mtot);
     for (int i = 0; i < g_qwen.L; i++) {
@@ -14140,16 +14226,33 @@ static void nvf4_autotune_all(void) {
                                      &l->q_proj, &l->k_proj, &l->v_proj, &l->o_proj,
                                      &l->linear_in_qkv, &l->linear_in_z,
                                      &l->linear_in_b, &l->linear_in_a, &l->linear_out };
-        for (int j = 0; j < 12; j++)
-            if (ws[j]->nvf4 && ws[j]->d_nvf4_a && !ws[j]->nvf4_ks)
-                nvf4_autotune(ws[j], TQ_NVF4_TILE, g_qwen.stream);
+        for (int j = 0; j < 12; j++) {
+            tq_qmma_weight_t *w = ws[j];
+            if (!w->nvf4 || !w->d_nvf4_a) continue;
+            if (!w->nvf4_ks)
+                nvf4_autotune(w, tune_cols, g_qwen.stream, &w->nvf4_ks, &w->nvf4_stages);
+            if (decode_cols && !w->nvf4_decode_ks) {
+                int rc = nvf4_autotune(w, decode_cols, g_qwen.stream,
+                                       &w->nvf4_decode_ks, &w->nvf4_decode_stages);
+                if (rc != 0)
+                    fprintf(stderr, "TQ_NVF4_DECODE_AUTOTUNE_COLS: tuning failed M=%d K=%d N=%d rc=%d; keeping prefill config\n",
+                            w->M, w->K, decode_cols, rc);
+            }
+        }
     }
     tq_layer_t *l0 = &g_qwen.layers[0];
-    fprintf(stderr, "TQ_W_NVFP4: autotuned launch config @%d cols:", TQ_NVF4_TILE);
+    fprintf(stderr, "TQ_W_NVFP4: autotuned launch config @%d cols:", tune_cols);
     if (l0->mlp_gate.nvf4) fprintf(stderr, " gate=k%ds%d", l0->mlp_gate.nvf4_ks, l0->mlp_gate.nvf4_stages);
     if (l0->mlp_down.nvf4) fprintf(stderr, " down=k%ds%d", l0->mlp_down.nvf4_ks, l0->mlp_down.nvf4_stages);
     if (l0->linear_in_qkv.nvf4) fprintf(stderr, " lqkv=k%ds%d", l0->linear_in_qkv.nvf4_ks, l0->linear_in_qkv.nvf4_stages);
     fprintf(stderr, "\n");
+    if (decode_cols) {
+        fprintf(stderr, "TQ_W_NVFP4: decode-only launch config @%d cols (used for N<=8):", decode_cols);
+        if (l0->mlp_gate.nvf4) fprintf(stderr, " gate=k%ds%d", l0->mlp_gate.nvf4_decode_ks, l0->mlp_gate.nvf4_decode_stages);
+        if (l0->mlp_down.nvf4) fprintf(stderr, " down=k%ds%d", l0->mlp_down.nvf4_decode_ks, l0->mlp_down.nvf4_decode_stages);
+        if (l0->linear_in_qkv.nvf4) fprintf(stderr, " lqkv=k%ds%d", l0->linear_in_qkv.nvf4_decode_ks, l0->linear_in_qkv.nvf4_decode_stages);
+        fprintf(stderr, "\n");
+    }
     if (getenv("TQ_MEM_TRACE")) {
         size_t mfree1 = 0, mtot1 = 0;
         cudaMemGetInfo(&mfree1, &mtot1);
@@ -23305,6 +23408,28 @@ static void wide_quant_reset(void) {
     nvf4_quant_invalidate();
 }
 
+// qwn_free calls this only after graph teardown and stream completion. Cached
+// launch choices contain no model pointers; allocation/activation state does.
+static void nvf4_free_runtime(void) {
+    wide_quant_reset();
+    if (g_nvf4_b) cudaFree(g_nvf4_b);
+    g_nvf4_b = NULL;
+    g_nvf4_b_words = 0;
+    g_nvf4_b_groups = 0;
+    if (g_nvf4_part) cudaFree(g_nvf4_part);
+    g_nvf4_part = NULL;
+    g_nvf4_part_floats = 0;
+    if (g_wide_fac) cudaFree(g_wide_fac);
+    g_wide_fac = NULL;
+    g_wide_fac_n = 0;
+    memset(&g_nvf4_bmap, 0, sizeof(g_nvf4_bmap));
+    g_nvf4_bmap_base = NULL;
+    g_nvf4_bmap_g = g_nvf4_bmap_kt = g_nvf4_bmap_ng = g_nvf4_bmap_ok = 0;
+    g_nvf4_qsrc = NULL;
+    g_nvf4_qK = g_nvf4_qN = g_nvf4_qvalid = 0;
+    g_nvf4_any = 0;
+}
+
 // run one wide projection from the prepared activation (call wide_quant_input first).
 // Weight format decides which activation quantization is materialised here.
 // TQ_NVFP4_DEBUG=1 syncs after every wide projection and names the one that faults.
@@ -26042,7 +26167,19 @@ static int paged_split_S_gqa_v2(int N, int max_pos) {
         if (S > 192) S = 192;
         return S;
     }
-    int s_work = total / 512;
+    // Opt-in single-stream row floor; occupancy and maximum scratch stay capped.
+    static int n1_rows = 0;
+    if (!n1_rows) {
+        n1_rows = 512;
+        const char *e = getenv("TQ_PAGED_N1_ROWS");
+        if (e && *e) {
+            if (!strcmp(e, "64") || !strcmp(e, "128") || !strcmp(e, "256") || !strcmp(e, "512"))
+                n1_rows = atoi(e);
+            else
+                fprintf(stderr, "TQ_PAGED_N1_ROWS: expected 64,128,256,512; using 512\n");
+        }
+    }
+    int s_work = total / n1_rows;
     int S = s_occ < s_work ? s_occ : s_work;
     if (S < 1) S = 1;
     if (S > 96) S = 96;
@@ -26351,29 +26488,39 @@ static int      g_pg_ready = 0;
 
 static void paged_spec_free_archive(void);
 static int paged_reserve_workspace(int max_slots, int page);
+static int paged_decode_reset(void);
 
-static void paged_free_all(void) {
+static int paged_free_all(void) {
+    g_pg_ready = 0;
+    int ret = paged_decode_reset();
+    auto release = [&](auto &ptr, const char *name) {
+        if (ptr) {
+            int rc = tq_cuda_check(cudaFree(ptr), name);
+            if (rc != 0) ret = rc;
+            ptr = NULL;
+        }
+    };
     for (int L = 0; L < TQ_MAX_LAYERS; L++) {
-        if (g_pool_k4[L]) { cudaFree(g_pool_k4[L]); g_pool_k4[L] = NULL; }
-        if (g_pool_kq4s[L]) { cudaFree(g_pool_kq4s[L]); g_pool_kq4s[L] = NULL; }
-        if (g_pool_v8[L]) { cudaFree(g_pool_v8[L]); g_pool_v8[L] = NULL; }
-        if (g_pool_vscale[L]) { cudaFree(g_pool_vscale[L]); g_pool_vscale[L] = NULL; }
-        if (g_pg_recur[L]) { cudaFree(g_pg_recur[L]); g_pg_recur[L] = NULL; }
-        if (g_pg_conv[L]) { cudaFree(g_pg_conv[L]); g_pg_conv[L] = NULL; }
+        release(g_pool_k4[L], "free paged K4");
+        release(g_pool_kq4s[L], "free paged K4 scales");
+        release(g_pool_v8[L], "free paged V8");
+        release(g_pool_vscale[L], "free paged V scales");
+        release(g_pg_recur[L], "free paged recurrent state");
+        release(g_pg_conv[L], "free paged convolution state");
     }
-    if (g_block_table) { cudaFree(g_block_table); g_block_table = NULL; }
-    if (g_slot_ids) { cudaFree(g_slot_ids); g_slot_ids = NULL; }
-    if (g_iota) { cudaFree(g_iota); g_iota = NULL; }
-    if (g_samp_temp) { cudaFree(g_samp_temp); g_samp_temp = NULL; }
-    if (g_samp_seed) { cudaFree(g_samp_seed); g_samp_seed = NULL; }
-    if (g_samp_ctr) { cudaFree(g_samp_ctr); g_samp_ctr = NULL; }
-    if (g_pg_spec_state) { cudaFree(g_pg_spec_state); g_pg_spec_state = NULL; }
+    release(g_block_table, "free paged block table");
+    release(g_slot_ids, "free paged slot ids");
+    release(g_iota, "free paged iota");
+    release(g_samp_temp, "free paged sampling temperatures");
+    release(g_samp_seed, "free paged sampling seeds");
+    release(g_samp_ctr, "free paged sampling counters");
+    release(g_pg_spec_state, "free paged state snapshots");
     g_pg_spec_n = -1; g_pg_spec_sf = 0;
-    if (g_pf_colslot) { cudaFree(g_pf_colslot); g_pf_colslot = NULL; } g_pf_colslot_cap = 0;
-    if (g_attn_pacc) { cudaFree(g_attn_pacc); g_attn_pacc = NULL; } g_attn_pacc_n = 0;
-    if (g_attn_pml) { cudaFree(g_attn_pml); g_attn_pml = NULL; } g_attn_pml_n = 0;
-    if (g_pg_logits) { cudaFree(g_pg_logits); g_pg_logits = NULL; }
-    if (g_pg_argmax) { cudaFree(g_pg_argmax); g_pg_argmax = NULL; }
+    release(g_pf_colslot, "free paged prefill slots"); g_pf_colslot_cap = 0;
+    release(g_attn_pacc, "free paged attention accumulators"); g_attn_pacc_n = 0;
+    release(g_attn_pml, "free paged attention softmax partials"); g_attn_pml_n = 0;
+    release(g_pg_logits, "free paged logits");
+    release(g_pg_argmax, "free paged argmax");
     if (h_block_table) { free(h_block_table); h_block_table = NULL; }
     if (h_free) { free(h_free); h_free = NULL; }
     if (h_slot_nb) { free(h_slot_nb); h_slot_nb = NULL; }
@@ -26383,8 +26530,11 @@ static void paged_free_all(void) {
     void paged_ckpt_drop_all(void);
     paged_ckpt_drop_all();
     paged_spec_free_archive();
+    int cleanup_rc = tq_cuda_check(cudaPeekAtLastError(), "paged teardown");
+    if (cleanup_rc != 0) ret = cleanup_rc;
     g_pg_nfree = 0; g_pg_page = 0; g_pg_plog = 0; g_pg_nblocks = 0;
-    g_pg_maxslots = 0; g_pg_maxblk = 0; g_pg_ready = 0;
+    g_pg_maxslots = 0; g_pg_maxblk = 0;
+    return ret;
 }
 
 static int paged_alloc_block(void) {
@@ -26421,7 +26571,8 @@ extern "C" int qwn_paged_init(int max_slots, int num_blocks, int page) {
     if (!g_qwen.initialized) return -1;
     if (!g_qwen.kv_q4) return -2;                          // Q4(K)+E4M3(V) tier only
     if (max_slots < 1 || num_blocks < 1 || page < 1 || (page & (page - 1))) return -3;
-    paged_free_all();
+    int cleanup_rc = paged_free_all();
+    if (cleanup_rc != 0) return cleanup_rc;
     int plog = 0; while ((1 << plog) < page) plog++;
     g_pg_page = page; g_pg_plog = plog; g_pg_nblocks = num_blocks; g_pg_maxslots = max_slots;
     g_pg_maxblk = (g_qwen.max_seq + page - 1) / page;
@@ -26500,7 +26651,7 @@ extern "C" int qwn_paged_init(int max_slots, int num_blocks, int page) {
     return 0;
 }
 
-extern "C" int qwn_paged_free(void) { paged_free_all(); return 0; }
+extern "C" int qwn_paged_free(void) { return paged_free_all(); }
 
 // Per-slot sampling for the paged decode/seed path. temp 0 = greedy (bit-exact
 // default path untouched); temp > 0 = spec-sampler semantics (temp-scaled logits,
@@ -26973,21 +27124,57 @@ static int *hs_samp_c = NULL;
 #define TQ_DEC_GRAPHS 8
 static struct { int key_n, key_s, key_samp, valid; cudaGraphExec_t exec; } g_dec_graph[TQ_DEC_GRAPHS];
 static int g_dec_graph_n = 0, g_dec_graph_warm = 0, g_dec_graph_dead = 0;
+
+// A graph captures both host copy sources and device kernel arguments. Destroy
+// every executable before either pool teardown or staging replacement frees them.
+static int paged_decode_reset(void) {
+    int ret = 0;
+    auto check = [&](cudaError_t err, const char *name) {
+        int rc = tq_cuda_check(err, name);
+        if (rc != 0) ret = rc;
+    };
+    if (g_qwen.stream) check(cudaStreamSynchronize(g_qwen.stream), "paged decode teardown sync");
+    for (int i = 0; i < TQ_DEC_GRAPHS; i++) {
+        if (g_dec_graph[i].exec)
+            check(cudaGraphExecDestroy(g_dec_graph[i].exec), "destroy paged decode graph");
+        g_dec_graph[i] = {};
+    }
+    g_dec_graph_n = 0;
+    g_dec_graph_warm = 0;
+    g_paged_S_force = -1;
+    auto release_host = [&](auto &ptr) {
+        if (ptr) { check(cudaFreeHost(ptr), "free paged decode staging"); ptr = NULL; }
+    };
+    release_host(h_dec_tok); release_host(h_dec_slot); release_host(h_dec_pos);
+    release_host(hs_samp_t); release_host(hs_samp_s); release_host(hs_samp_c);
+    if (g_dec_tok) { check(cudaFree(g_dec_tok), "free paged decode tokens"); g_dec_tok = NULL; }
+    g_dec_graph_dead = (ret != 0);
+    return ret;
+}
 static int dec_graph_enabled(void) {
     static int en = -1;
     if (en < 0) { const char *e = getenv("TQ_DECODE_GRAPH"); en = (e && e[0]) ? !!atoi(e) : 0; }
     return en;
 }
 static int ensure_dec_staging(void) {
-    if (h_dec_tok) return 0;
+    if (h_dec_tok && h_dec_slot && h_dec_pos && hs_samp_t && hs_samp_s && hs_samp_c && g_dec_tok)
+        return 0;
     int cap = g_pg_maxslots < 256 ? 256 : g_pg_maxslots;
-    if (cudaMallocHost(&h_dec_tok, cap * sizeof(int)) != cudaSuccess) return -1;
-    if (cudaMallocHost(&h_dec_slot, cap * sizeof(int)) != cudaSuccess) return -1;
-    if (cudaMallocHost(&h_dec_pos, cap * sizeof(int)) != cudaSuccess) return -1;
-    if (cudaMallocHost(&hs_samp_t, cap * sizeof(float)) != cudaSuccess) return -1;
-    if (cudaMallocHost(&hs_samp_s, cap * sizeof(unsigned long long)) != cudaSuccess) return -1;
-    if (cudaMallocHost(&hs_samp_c, cap * sizeof(int)) != cudaSuccess) return -1;
-    if (cudaMalloc(&g_dec_tok, cap * sizeof(int)) != cudaSuccess) return -1;
+    auto allocate = [&](auto **ptr, size_t bytes, bool host) {
+        cudaError_t err = host ? cudaMallocHost((void **)ptr, bytes) : cudaMalloc((void **)ptr, bytes);
+        if (err == cudaSuccess) return 0;
+        int rc = tq_cuda_check(err, "allocate paged decode staging", bytes);
+        paged_decode_reset();
+        return rc;
+    };
+    if (allocate(&h_dec_tok, (size_t)cap * sizeof(int), true) != 0 ||
+        allocate(&h_dec_slot, (size_t)cap * sizeof(int), true) != 0 ||
+        allocate(&h_dec_pos, (size_t)cap * sizeof(int), true) != 0 ||
+        allocate(&hs_samp_t, (size_t)cap * sizeof(float), true) != 0 ||
+        allocate(&hs_samp_s, (size_t)cap * sizeof(unsigned long long), true) != 0 ||
+        allocate(&hs_samp_c, (size_t)cap * sizeof(int), true) != 0 ||
+        allocate(&g_dec_tok, (size_t)cap * sizeof(int), false) != 0)
+        return TQ_CUDA_FATAL;
     return 0;
 }
 
@@ -27099,7 +27286,8 @@ extern "C" int qwn_paged_decode_step(const int *tokens, const int *slot_ids, con
     if (N < 1 || N > g_pg_maxslots) return -2;
     wide_quant_reset();
     if (!g_qwen.kv_q4) return -3;
-    if (ensure_dec_staging() != 0) return -8;
+    int staging_rc = ensure_dec_staging();
+    if (staging_rc != 0) return staging_rc;
     // host pre-work (never captured): validation, block admission, staging fill
     int dec_maxpos = 0, any_samp = 0;
     for (int j = 0; j < N; j++) {
@@ -27117,6 +27305,9 @@ extern "C" int qwn_paged_decode_step(const int *tokens, const int *slot_ids, con
             hs_samp_t[j] = h_samp_temp[s]; hs_samp_s[j] = h_samp_seed[s]; hs_samp_c[j] = positions[j] + 1;
         }
     int ret;
+    auto capture_only_error = [](cudaError_t err) {
+        return err == cudaErrorStreamCaptureUnsupported || err == cudaErrorStreamCaptureInvalidated;
+    };
     // graph path: QMMA lm_head + v2 attention only; anything else runs eager.
     int graphable = dec_graph_enabled() && !g_dec_graph_dead && !g_qwen.tie_word_embeddings &&
                     g_qwen.lm_head.e2m3 && !g_qwen.lm_head.e2m3_byte && !g_qwen.lm_head.word_major &&
@@ -27131,7 +27322,7 @@ extern "C" int qwn_paged_decode_step(const int *tokens, const int *slot_ids, con
             if (g_dec_graph[i].valid && g_dec_graph[i].key_n == N &&
                 g_dec_graph[i].key_s == S && g_dec_graph[i].key_samp == any_samp) { hit = i; break; }
         if (hit >= 0) {
-            ret = cudaGraphLaunch(g_dec_graph[hit].exec, g_qwen.stream) == cudaSuccess ? 0 : -81;
+            ret = tq_cuda_check(cudaGraphLaunch(g_dec_graph[hit].exec, g_qwen.stream), "replay paged decode graph");
         } else if (!g_dec_graph_warm) {
             // first decode step sizes every lazy allocation at this exact shape
             g_paged_S_force = S;
@@ -27146,6 +27337,11 @@ extern "C" int qwn_paged_decode_step(const int *tokens, const int *slot_ids, con
                 fprintf(stderr, "TQ_DECODE_GRAPH: begin-capture failed (%s); eager this step\n",
                         cudaGetErrorString(cb));
                 g_paged_S_force = -1;
+                if (!capture_only_error(cb)) return tq_cuda_check(cb, "begin paged decode capture");
+                cudaError_t pending = cudaPeekAtLastError();
+                if (pending != cudaSuccess && !capture_only_error(pending))
+                    return tq_cuda_check(pending, "paged decode capture pending error");
+                if (capture_only_error(pending)) cudaGetLastError();
                 ret = run_paged_decode_step_core(N, any_samp);
             } else {
                 ret = run_paged_decode_step_core(N, any_samp);
@@ -27154,35 +27350,59 @@ extern "C" int qwn_paged_decode_step(const int *tokens, const int *slot_ids, con
                 if (ret != 0 || ce != cudaSuccess || !graph) {
                     // A capture-hostile op invalidates the capture and errors every
                     // later call in the core; nothing real executed. Exit capture,
-                    // clear the poison, disable further attempts, run the step for real.
-                    if (graph) cudaGraphDestroy(graph);
-                    cudaGetLastError();
+                    // clear only capture-specific errors; never retry a poisoned CUDA context.
+                    cudaError_t pending = cudaPeekAtLastError();
+                    if (graph) {
+                        int rc = tq_cuda_check(cudaGraphDestroy(graph), "destroy failed paged capture");
+                        if (rc != 0) return rc;
+                    }
+                    if (ce != cudaSuccess && !capture_only_error(ce))
+                        return tq_cuda_check(ce, "end paged decode capture");
+                    if (pending != cudaSuccess && !capture_only_error(pending))
+                        return tq_cuda_check(pending, "paged decode capture pending error");
+                    if (ret == TQ_CUDA_FATAL || (ret != 0 && ce == cudaSuccess && pending == cudaSuccess))
+                        return ret;
+                    if (capture_only_error(pending)) cudaGetLastError();
                     g_dec_graph_dead = 1;
                     fprintf(stderr, "TQ_DECODE_GRAPH: capture failed (core=%d cuda=%s); eager fallback locked\n",
                             ret, cudaGetErrorString(ce));
                     ret = run_paged_decode_step_core(N, any_samp);
                 } else {
                     cudaGraphExec_t exec = NULL;
-                    if (cudaGraphInstantiate(&exec, graph, NULL, NULL, 0) == cudaSuccess && exec) {
+                    cudaError_t ci = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
+                    if (ci == cudaSuccess && exec) {
                         int slot_i = g_dec_graph_n < TQ_DEC_GRAPHS ? g_dec_graph_n++ : 0;
-                        if (g_dec_graph[slot_i].valid) cudaGraphExecDestroy(g_dec_graph[slot_i].exec);
+                        if (g_dec_graph[slot_i].exec) {
+                            int rc = tq_cuda_check(cudaGraphExecDestroy(g_dec_graph[slot_i].exec), "replace paged decode graph");
+                            if (rc != 0) { cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); return rc; }
+                        }
                         g_dec_graph[slot_i].key_n = N; g_dec_graph[slot_i].key_s = S;
                         g_dec_graph[slot_i].key_samp = any_samp; g_dec_graph[slot_i].valid = 1;
                         g_dec_graph[slot_i].exec = exec;
                         fprintf(stderr, "TQ_DECODE_GRAPH: captured bucket N=%d S=%d samp=%d\n", N, S, any_samp);
-                        ret = cudaGraphLaunch(exec, g_qwen.stream) == cudaSuccess ? 0 : -81;
+                        ret = tq_cuda_check(cudaGraphLaunch(exec, g_qwen.stream), "launch new paged decode graph");
                     } else {
+                        if (!tq_cuda_recover_oom(ci)) {
+                            if (exec) cudaGraphExecDestroy(exec);
+                            cudaGraphDestroy(graph);
+                            return tq_cuda_check(ci == cudaSuccess ? cudaErrorInvalidResourceHandle : ci,
+                                                 "instantiate paged decode graph");
+                        }
                         ret = run_paged_decode_step_core(N, any_samp);   // capture ran nothing
                     }
-                    cudaGraphDestroy(graph);
+                    int destroy_rc = tq_cuda_check(cudaGraphDestroy(graph), "destroy paged capture graph");
+                    if (destroy_rc != 0) return destroy_rc;
                 }
             }
         }
     }
     if (ret != 0) return ret;
-    if (out_argmax)
-        cudaMemcpyAsync(out_argmax, g_pg_argmax, (size_t)N * sizeof(int), cudaMemcpyDeviceToHost, g_qwen.stream);
-    return cudaStreamSynchronize(g_qwen.stream) == cudaSuccess ? 0 : -9;
+    if (out_argmax) {
+        int rc = tq_cuda_check(cudaMemcpyAsync(out_argmax, g_pg_argmax, (size_t)N * sizeof(int),
+                                              cudaMemcpyDeviceToHost, g_qwen.stream), "copy paged decode results");
+        if (rc != 0) return rc;
+    }
+    return tq_cuda_check(cudaStreamSynchronize(g_qwen.stream), "complete paged decode step");
 }
 
 // Pool occupancy for capacity reporting: free blocks / total blocks / page / max blocks-per-seq.
@@ -27245,6 +27465,8 @@ static int paged_reserve_workspace(int max_slots, int page) {
         if (w->nvf4) {
             size_t groups = (size_t)((n + TQ_NVF4_TILE - 1) / TQ_NVF4_TILE) * (TQ_NVF4_TILE / 8);
             nv_b = std::max(nv_b, groups * w->Kt64 * TQ_NVF4_BW);
+            // Use the same TOTAL width as dispatch: decode-only ks contributes
+            // at most 8 columns, never a 256-column tile or a wide prefill tail.
             for (int t = 1; t <= n; t++) {
                 int ks = nvf4_gemm_ks(w, t);
                 int full = t / TQ_NVF4_TILE;
